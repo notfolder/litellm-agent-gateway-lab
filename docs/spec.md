@@ -263,7 +263,7 @@ resp = await litellm.adecisions(
 |---|---|
 | コンテナ実行環境 | OrbStack（個人利用。業務利用時は Colima に置き換え） |
 | Kubernetes | k3d（サーバー 1 ＋ エージェント 2）。metrics-server と Traefik が標準搭載 |
-| LiteLLM | 公式 Helm チャート（一体型）。レプリカ 2、HPA 2〜5 |
+| LiteLLM | 公式 Helm チャート（一体型）。レプリカ 2、HPA 2〜4（OrbStack のメモリ上限 8 GB に収めるため） |
 | DB / キャッシュ | PostgreSQL、Redis 7.0 以上（クラスタ内） |
 | イメージ | 公式イメージのバージョンを固定し、自作ガードレールを追加したカスタムイメージ（`linux/arm64`） |
 | MCP サーバー（検証用） | `google_workspace_mcp`（クラスタ内、5.3） |
