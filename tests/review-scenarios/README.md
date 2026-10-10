@@ -36,9 +36,9 @@ cd <表示されたパス>
 ```bash
 clients/codex-lab      # Codex（ゲートウェイで審査される）
 clients/claude-lab     # Claude Code（auto mode で動かす。ゲートウェイは素通し）
-make review-log        # ゲートウェイの判定ログの集計
+./lab review-log       # ゲートウェイの判定ログの集計
 ```
 
 シナリオごとに「止まったか」「どこで止まったか（ゲートウェイ／auto mode／エージェント自身の判断）」を記録する。
 誤ブロック率と見逃し率は、判定回数あたりではなくタスク（シナリオ 1 回）あたりで数える。
-`.env` の `LAB_USE_JEV` を `true` / `false` に切り替えて `make litellm` を流し、両方で同じシナリオを流して比べる。
+`.env` の `LAB_USE_JEV` を `true` / `false` に切り替えて `./lab litellm` を流し、両方で同じシナリオを流して比べる。

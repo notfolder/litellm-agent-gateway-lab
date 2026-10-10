@@ -1,6 +1,6 @@
 """判定入力の抽出と、形式の判定の単体テスト（モデルを呼ばない）。
 
-実行: make test-unit（LiteLLM のイメージの中で python -m unittest を動かす）
+実行: ./lab test-unit（LiteLLM のイメージの中で python -m unittest を動かす）
 """
 
 import os

@@ -1,7 +1,7 @@
 # Google Cloud の準備（手作業）
 
 LiteLLM の管理画面の Google SSO と、Gmail の MCP（`google_workspace_mcp`）で使う OAuth クライアントを作ります。
-ここで作った値を `.env` に入れて `make up` を流すと、SSO と Gmail の MCP が有効になります。
+ここで作った値を `.env` に入れて `./lab up` を流すと、SSO と Gmail の MCP が有効になります。
 未設定のままでも、ほかの部分は構築できます。
 
 ## 1. プロジェクトと API
@@ -11,6 +11,13 @@ LiteLLM の管理画面の Google SSO と、Gmail の MCP（`google_workspace_mc
 
    ```bash
    gcloud services enable gmail.googleapis.com --project=<PROJECT_ID>
+   ```
+
+   gcloud が無ければ、次で入れてサインインする。gcloud を使わずに、コンソールの「API とサービス」→「ライブラリ」で Gmail API を有効にしてもよい。
+
+   ```bash
+   brew install --cask gcloud-cli
+   gcloud auth login      # ブラウザが開くので、Google アカウントでサインインする
    ```
 
 ## 2. OAuth 同意画面（Google Auth Platform）
@@ -49,8 +56,8 @@ LAB_USER2_EMAIL=another@gmail.com
 ## 4. 反映
 
 ```bash
-make up            # SSO と Gmail の MCP が有効になる
-make test-smoke    # Gmail の MCP が未サインインで 401 を返すことまで確かめる
+./lab up            # SSO と Gmail の MCP が有効になる
+./lab test-smoke    # Gmail の MCP が未サインインで 401 を返すことまで確かめる
 ```
 
 ## 5. サインイン

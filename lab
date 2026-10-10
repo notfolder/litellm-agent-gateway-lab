@@ -1,0 +1,111 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["pyyaml>=6.0"]
+# ///
+"""検証環境の構築ツール。どのコマンドも何度実行しても同じ結果になる（docs/design.md 14 章）。
+
+使い方: ./lab <コマンド>（./lab -h で一覧）
+uv が Python と依存（PyYAML）を用意するので、事前の準備は uv のインストールだけ。
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+
+from labtool import checks, ops, stages
+from labtool.core import Env, LabError, ok
+
+
+def up() -> None:
+    env = stages.preflight()
+    stages.cluster(env)
+    stages.images(env)
+    stages.secrets_(env)
+    stages.datastores(env)
+    stages.mcp(env)
+    stages.litellm(env)
+    stages.bootstrap(env)
+    stages.clients(env)
+    ops.status(env)
+
+
+def rebuild() -> None:
+    start = time.monotonic()
+    ops.down()
+    up()
+    ok(f"作り直しの所要時間: {int(time.monotonic() - start)} 秒")
+
+
+def stage(fn):
+    """段階を単独で流す（.env を読んでから呼ぶ）。"""
+    return lambda: fn(Env.load())
+
+
+COMMANDS: dict[str, tuple[str, object]] = {
+    "up": ("全段階を順に流す（何度でも可）", up),
+    "down": ("クラスタを削除する（.env、ChatGPT のトークン、イメージの置き場は残す）", ops.down),
+    "rebuild": ("クラスタを削除して作り直す（所要時間を表示）", rebuild),
+    "status": ("状態を表示する", stage(ops.status)),
+    # 段階ごと
+    "preflight": ("[段階] 前提の確認", stages.preflight),
+    "cluster": ("[段階] イメージの置き場、k3d クラスタ、Traefik", stage(stages.cluster)),
+    "images": ("[段階] 検証用 LiteLLM イメージのビルドと push", stage(stages.images)),
+    "secrets": ("[段階] .env の生成と k8s の Secret", stage(stages.secrets_)),
+    "datastores": ("[段階] PostgreSQL と Redis", stage(stages.datastores)),
+    "mcp": ("[段階] 試験用の偽 LLM と google_workspace_mcp", stage(stages.mcp)),
+    "litellm": ("[段階] プロキシ設定、LiteLLM（Helm）、入口", stage(stages.litellm)),
+    "bootstrap": ("[段階] 検証ユーザーと固定値のキー", stage(stages.bootstrap)),
+    "clients": ("[段階] Claude Code と Codex の設定", stage(stages.clients)),
+    # 手作業・保守
+    "chatgpt-login": ("ChatGPT Plus にデバイスコードでログインする（手作業。初回だけ）", stage(stages.chatgpt_login)),
+    "upgrade": ("LiteLLM を別の版でローリング更新する（例: ./lab upgrade v1.104.3）", None),
+    "clean-all": ("クラスタ、生成したクライアント設定、ビルドしたイメージを消す（.env とトークンは残す）", None),
+    # 試験
+    "test-unit": ("単体テスト（構築ツールと、LiteLLM のイメージの中でガードレール）", stage(ops.test_unit)),
+    "test-smoke": ("疎通確認（入口、パススルーの遮断、審査の差し替え、Claude Code の素通し）", stage(checks.smoke)),
+    "test-idempotency": ("./lab up を 2 回流し、2 回目で何も変わらないことを確かめる", checks.idempotency),
+    "test-load": ("偽 LLM を相手にした負荷試験（k6、Docker で実行）", None),
+    "review-log": ("審査の判定ログを集計する", None),
+}
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="./lab", description=__doc__.splitlines()[0],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", metavar="<コマンド>", required=True)
+    parsers = {name: sub.add_parser(name, help=desc, description=desc) for name, (desc, _) in COMMANDS.items()}
+    parsers["upgrade"].add_argument("version", help="LiteLLM の版（例: v1.104.3）")
+    parsers["clean-all"].add_argument("-y", "--yes", action="store_true", help="確認を出さずに消す")
+    parsers["test-load"].add_argument("--vus", default="20", help="同時接続数（既定 20）")
+    parsers["test-load"].add_argument("--duration", default="2m", help="時間（既定 2m）")
+    parsers["test-load"].add_argument("--scenario", default="chat", choices=["chat", "review"])
+    parsers["review-log"].add_argument("--since", default="1h", help="集計する期間（既定 1h）")
+    parsers["review-log"].add_argument("--raw", action="store_true", help="集計せずに JSON の行を出す")
+    args = parser.parse_args(argv)
+
+    try:
+        match args.command:
+            case "upgrade":
+                ops.upgrade(Env.load(), args.version)
+            case "clean-all":
+                ops.clean_all(args.yes)
+            case "test-load":
+                checks.load(Env.load(), args.vus, args.duration, args.scenario)
+            case "review-log":
+                checks.review_log(args.since, args.raw)
+            case name:
+                COMMANDS[name][1]()
+    except LabError as e:
+        sys.stderr.write(f"\033[31m[{time.strftime('%H:%M:%S')}] エラー: {e}\033[0m\n")
+        return 1
+    except KeyboardInterrupt:
+        sys.stderr.write("\n中断しました（もう一度流せば、途中から続きます）\n")
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -13,10 +13,12 @@ LiteLLM を AI エージェント向けゲートウェイとして使うため�
 前提: macOS（Apple Silicon）、[OrbStack](https://orbstack.dev/)、Homebrew。
 
 ```bash
-brew install k3d kubectl helm jq gettext
-make up            # 何度実行しても同じ結果になる。初回は .env を .env.example から作る
-make test-smoke    # 疎通確認（偽 LLM を使うので、利用枠を使わない）
+brew install uv k3d kubectl helm
+./lab up            # 何度実行しても同じ結果になる。初回は .env を .env.example から作る
+./lab test-smoke    # 疎通確認（偽 LLM を使うので、利用枠を使わない）
 ```
+
+構築ツール `./lab` は Python で書いてあり、uv が Python 3.12 以上と依存を自動で用意します（`./lab -h` でコマンドの一覧）。
 
 手作業の準備（なくても構築は進み、該当する機能だけが無効になる）:
 
@@ -24,18 +26,18 @@ make test-smoke    # 疎通確認（偽 LLM を使うので、利用枠を使わ
 |---|---|---|
 | Google の OAuth クライアント | [docs/setup-google.md](docs/setup-google.md) | 管理画面の SSO、Gmail の MCP |
 | TypeSafe の API キー | `.env` の `TYPESAFE_API_KEY` | 審査の一次判定（Jev） |
-| ChatGPT Plus のログイン | `make chatgpt-login` の後に `make up` | Codex 用のモデル、審査の二次判定 |
+| ChatGPT Plus のログイン | `./lab chatgpt-login` の後に `./lab up` | Codex 用のモデル、審査の二次判定 |
 
 ## よく使うコマンド
 
 | コマンド | 内容 |
 |---|---|
-| `make up` | 全段階を順に流す |
-| `make rebuild` | クラスタを作り直す（DB は消える。`.env`、ChatGPT のトークン、イメージの置き場は残る） |
-| `make status` | 状態の表示 |
-| `make upgrade VERSION=v1.x.y` | LiteLLM のローリング更新 |
-| `make test-unit` / `test-smoke` / `test-idempotency` / `test-load` | 試験 |
-| `make review-log` | 審査の判定ログの集計 |
+| `./lab up` | 全段階を順に流す（段階ごとにも流せる。例: `./lab litellm`） |
+| `./lab rebuild` | クラスタを作り直す（DB は消える。`.env`、ChatGPT のトークン、イメージの置き場は残る） |
+| `./lab status` | 状態の表示 |
+| `./lab upgrade v1.x.y` | LiteLLM のローリング更新 |
+| `./lab test-unit` / `test-smoke` / `test-idempotency` / `test-load` | 試験 |
+| `./lab review-log` | 審査の判定ログの集計 |
 | `clients/claude-lab` / `clients/codex-lab` | 検証用の LiteLLM を通して Claude Code / Codex を起動（普段の設定は変えない） |
 
 ## ステータス

@@ -1,6 +1,6 @@
 # litellm-agent-gateway-lab 詳細設計（検証環境の構築）
 
-最終更新: 2026-10-11
+最終更新: 2026-10-11（構築ツールを Python に移行）
 
 [spec.md](spec.md) の検証環境（5 章）を、スクリプト一式で再現できるように構築するための設計です。対象は、Mac 1 台の OrbStack 上の k3d クラスタと、その上の LiteLLM、PostgreSQL、Redis、MCP サーバー、自作ガードレール、およびクライアント（Claude Code、Codex）の設定です。
 
@@ -90,23 +90,16 @@ flowchart LR
 
 ```
 litellm-agent-gateway-lab/
-├── Makefile                      # 入口。make up / down / rebuild / status / upgrade / test-*
+├── lab                           # 入口（Python。uv で動かす）。./lab up / down / rebuild / status / upgrade / test-*
+├── labtool/                      # 構築ツールの本体
+│   ├── core.py                   # 定数、ログ、.env、外部コマンド、待機、kapply、HTTP
+│   ├── stages.py                 # 構築の段階（preflight 〜 clients、chatgpt-login）
+│   ├── render.py                 # .env から設定を作る副作用のない関数（プロキシ設定、Secret、クライアント設定）
+│   ├── ops.py                    # down / status / upgrade / clean-all / test-unit
+│   ├── checks.py                 # 疎通確認、冪等性、負荷、判定ログの集計
+│   └── tests/                    # 構築ツールの単体テスト（unittest）
 ├── .env.example                  # 設定と秘密情報の一覧（値は空。.env にコピーして使う）
 ├── .env                          # 実際の値（.gitignore 対象）
-├── scripts/
-│   ├── lib.sh                    # 共通関数（ログ、待機、.env、kapply、イメージの置き場）
-│   ├── 00-preflight.sh           # 前提の確認（コマンド、OrbStack、SSD、手作業の準備の状況）
-│   ├── 10-cluster.sh             # イメージの置き場 2 つ、k3d クラスタ、Traefik の設定
-│   ├── 20-images.sh              # 検証用 LiteLLM イメージのビルドと push
-│   ├── 30-secrets.sh             # .env の生成と k8s Secret
-│   ├── 40-datastores.sh          # PostgreSQL、Redis
-│   ├── 50-mcp.sh                 # 試験用の偽 LLM、google_workspace_mcp（Google の準備があるとき）
-│   ├── 60-litellm.sh             # プロキシ設定の生成、LiteLLM（Helm）、入口
-│   ├── render-litellm-config.py  # .env からプロキシ設定（config.yaml）を作る
-│   ├── 70-bootstrap.sh           # ユーザーと固定値のキー
-│   ├── 80-chatgpt-login.sh       # chatgpt/ のデバイスコードログイン（手作業。初回のみ）
-│   ├── 90-clients.sh             # Claude Code / Codex の設定を生成
-│   ├── upgrade.sh / down.sh / clean-all.sh / status.sh / test-unit.sh
 ├── k8s/
 │   ├── k3d-config.yaml           # クラスタ定義（ノード数、ポート、k3s の版、ボリューム、レジストリ）
 │   ├── traefik-config.yaml       # HelmChartConfig（タイムアウト）
@@ -127,17 +120,15 @@ litellm-agent-gateway-lab/
 │   └── codex-lab                 # Codex の起動ラッパー（CODEX_HOME=.codex-lab）
 ├── tests/
 │   ├── fake-llm/server.py        # 試験用の偽 LLM（ツールコールと審査官の役）
-│   ├── smoke/smoke.sh            # 疎通確認（19 項目）
-│   ├── idempotency.sh            # 冪等性の試験
-│   ├── load/                     # k6 の負荷試験
-│   └── review-scenarios/         # spec 6.2 のシナリオ試験（使い捨てリポジトリ、判定ログの集計）
+│   ├── load/k6.js                # k6 の負荷試験のシナリオ（./lab test-load で流す）
+│   └── review-scenarios/         # spec 6.2 のシナリオ試験（手順と使い捨てリポジトリ）
 └── docs/
     ├── spec.md / design.md
     └── setup-google.md           # Google Cloud の手作業の手順
 ```
 
 - `.env`、クライアント設定の生成物（`.codex-lab/`、`clients/out/`）、`.build/` は `.gitignore` に入れる
-- スクリプトはすべて bash（`set -euo pipefail`）。追加の実行環境を要らなくするため
+- 構築ツールは Python で書く（2026-10-11 に Make + bash から移した。理由は 16 章）。`./lab` の先頭に必要な Python の版（3.12 以上）と依存（PyYAML）を書いてあり、uv が自動で用意する。前提の道具は uv、Docker（OrbStack）、k3d、kubectl、helm だけ
 
 ---
 
@@ -145,23 +136,21 @@ litellm-agent-gateway-lab/
 
 ```mermaid
 flowchart TB
-    A["make up"] --> P["00 preflight<br/>コマンド・OrbStack・SSD・.env の確認"]
-    P --> C["10 cluster<br/>k3d 作成（既にあれば飛ばす）<br/>Traefik のタイムアウト設定"]
-    C --> I["20 images<br/>LiteLLM カスタムイメージをビルド<br/>k3d image import"]
-    I --> S["30 secrets<br/>.env → Secret（kubectl apply で冪等）"]
-    S --> D["40 datastores<br/>PostgreSQL・Redis を起動し Ready 待ち"]
-    D --> M["50 mcp<br/>google_workspace_mcp を起動し /health 待ち"]
-    M --> L["60 litellm<br/>helm upgrade --install<br/>（DB 移行は pre-install / pre-upgrade フック）"]
-    L --> B["70 bootstrap<br/>MCP 権限付きのキー作成など"]
-    B --> G{"chatgpt の<br/>auth.json がある?"}
-    G -- ない --> GL["80 chatgpt-login<br/>デバイスコードでログイン（手作業）"]
-    G -- ある --> CL
-    GL --> CL["90 clients<br/>Claude Code / Codex の設定を生成"]
+    A["./lab up"] --> P["preflight<br/>コマンド・OrbStack・SSD・.env の確認"]
+    P --> C["cluster<br/>イメージの置き場 2 つ、k3d 作成（既にあれば飛ばす）<br/>Traefik のタイムアウト設定"]
+    C --> I["images<br/>LiteLLM カスタムイメージをビルド<br/>自作イメージの置き場に push"]
+    I --> S["secrets<br/>.env → Secret（差分だけ反映）"]
+    S --> D["datastores<br/>PostgreSQL・Redis を起動し Ready 待ち"]
+    D --> M["mcp<br/>偽 LLM、google_workspace_mcp を起動"]
+    M --> L["litellm<br/>helm upgrade --install<br/>（DB 移行は pre-install / pre-upgrade フック）"]
+    L --> B["bootstrap<br/>ユーザーと MCP 権限付きのキー"]
+    B --> CL["clients<br/>Claude Code / Codex の設定を生成"]
+    G["chatgpt-login（手作業。初回だけ）<br/>デバイスコードでログイン"] -. "後で ./lab up を流すと<br/>Codex 用のモデルが入る" .-> L
 ```
 
-- どのスクリプトも、何度実行しても同じ状態になるように書く（作成済みなら飛ばす、`kubectl apply`、`helm upgrade --install`）
-- 各段階は単独でも実行できる（`make litellm` で 60 だけなど）
-- `make down` はクラスタを消す。保持するデータは 9 章
+- どの段階も、何度実行しても同じ状態になるように書く（作成済みなら飛ばす、差分だけ反映、`helm upgrade --install`）
+- 各段階は単独でも実行できる（`./lab litellm` で LiteLLM の段階だけなど）
+- `./lab down` はクラスタを消す。保持するデータは 9 章
 
 ---
 
@@ -175,7 +164,7 @@ flowchart TB
 | k3s イメージ | `rancher/k3s:v1.35.5-k3s1` |
 | ポート | `8080:80@loadbalancer`（Traefik の HTTP） |
 | ボリューム | `${LAB_DATA_DIR}/chatgpt:/var/lib/lab/chatgpt@all`（chatgpt/ のトークン共有用。全ノードに同じホストのフォルダを見せる） |
-| イメージの置き場 | クラスタとは別に k3d のレジストリを 2 つ立てる（15 章）。自作イメージ用（`k3d-litellm-registry.localhost`）と、Docker Hub の中継キャッシュ（`k3d-dockerio-cache.localhost`）。`make down` では消さない |
+| イメージの置き場 | クラスタとは別に k3d のレジストリを 2 つ立てる（15 章）。自作イメージ用（`k3d-litellm-registry.localhost`）と、Docker Hub の中継キャッシュ（`k3d-dockerio-cache.localhost`）。`./lab down` では消さない |
 
 `LAB_DATA_DIR` の既定は `/Volumes/SSD/litellm-lab`。
 
@@ -212,7 +201,7 @@ COPY guardrails/ /app/guardrails/
 ENV PYTHONPATH=/app/guardrails
 ```
 
-`20-images.sh` で `litellm-lab:<中身のハッシュ>` としてビルドし、自作イメージ用のレジストリに push する。Helm の `image.repository` / `image.tag` にはクラスタ内から見た名前（`k3d-litellm-registry.localhost:5000/litellm-lab`）を渡す。
+`./lab images` で `litellm-lab:<中身のハッシュ>` としてビルドし、自作イメージ用のレジストリに push する。Helm の `image.repository` / `image.tag` にはクラスタ内から見た名前（`k3d-litellm-registry.localhost:5000/litellm-lab`）を渡す。
 
 ### 6.2 Helm の値（`litellm/values.yaml` の要点）
 
@@ -310,7 +299,7 @@ general_settings:
 
 | 変数 | 内容 | 出所 |
 |---|---|---|
-| `LITELLM_MASTER_KEY` | 管理用キー（`sk-` で始まる） | `30-secrets.sh` が未設定なら生成して `.env` に保存 |
+| `LITELLM_MASTER_KEY` | 管理用キー（`sk-` で始まる） | `./lab secrets` が未設定なら生成して `.env` に保存 |
 | `LITELLM_SALT_KEY` | DB 内の秘密の暗号化キー（後から変えない） | 同上 |
 | `DATABASE_URL` | PostgreSQL の接続先 | `.env` のパスワードから組み立て |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | Redis | 同上 |
@@ -333,7 +322,7 @@ OAuth クライアントは 1 つ（ウェブ アプリケーション）にし�
 | スコープ | `openid`、`userinfo.email`、`userinfo.profile`、`gmail.readonly` |
 | リダイレクト URI | `http://localhost:8080/sso/callback`（SSO）、`http://localhost:8080/callback`（MCP）、`http://localhost:8080/ui/mcp/oauth/callback`（管理画面から接続する場合） |
 
-この手順は手作業。`docs/` に手順書を置き、`00-preflight.sh` は `.env` に値があるかだけを確かめる。
+この手順は手作業。`docs/` に手順書を置き、`./lab preflight` は `.env` に値があるかだけを確かめる。
 
 ---
 
@@ -379,16 +368,16 @@ flowchart TB
 
 ## 9. データの保持
 
-| データ | 置き場所 | `make down`（クラスタ削除）で |
+| データ | 置き場所 | `./lab down`（クラスタ削除）で |
 |---|---|---|
 | Docker のイメージ・ボリューム | `/Volumes/SSD/OrbStack`（OrbStack） | 残る |
-| PostgreSQL（ユーザー、キー、MCP の OAuth トークン、利用量） | クラスタ内の PVC | **消える**（作り直すたびにまっさらから試すため）。ユーザーとキーは `70-bootstrap.sh` が同じ値で作り直す。Gmail のサインインだけはやり直す |
+| PostgreSQL（ユーザー、キー、MCP の OAuth トークン、利用量） | クラスタ内の PVC | **消える**（作り直すたびにまっさらから試すため）。ユーザーとキーは `./lab bootstrap` が同じ値で作り直す。Gmail のサインインだけはやり直す |
 | chatgpt/ のトークン（`auth.json`） | `${LAB_DATA_DIR}/chatgpt`（SSD） | 残る |
 | `.env`（秘密情報） | リポジトリ直下（Git 管理外） | 残る |
 
 ---
 
-## 10. クライアントの設定（`90-clients.sh`）
+## 10. クライアントの設定（`./lab clients`）
 
 利用者の普段の設定（`~/.claude`、`~/.codex`）は書き換えない。
 
@@ -397,7 +386,7 @@ flowchart TB
 | Claude Code | `clients/claude-lab` で `ANTHROPIC_BASE_URL=http://localhost:8080` と `ANTHROPIC_CUSTOM_HEADERS="x-litellm-api-key: Bearer <キー>"` を設定し、`--mcp-config clients/out/mcp.json` を付けて `claude` を起動する |
 | Codex | `CODEX_HOME=<repo>/.codex-lab` に `config.toml` を生成する（モデルプロバイダ `litellm`、`wire_api = "responses"`、MCP の `gmail`）。`codex mcp login gmail` で初回サインイン |
 
-キーは `70-bootstrap.sh` が利用者ごとに 2 本（Claude Code 用、Codex 用）作る。どちらも `object_permission.mcp_servers: ["gmail"]` を付ける。キーの値は `.env` に保存した固定値を使う（`/key/generate` の `key` 指定）ので、クラスタを作り直してもクライアントの設定は変わらない。
+キーは `./lab bootstrap` が利用者ごとに 2 本（Claude Code 用、Codex 用）作る。どちらも `object_permission.mcp_servers: ["gmail"]` を付ける。キーの値は `.env` に保存した固定値を使う（`/key/generate` の `key` 指定）ので、クラスタを作り直してもクライアントの設定は変わらない。
 
 ---
 
@@ -407,7 +396,7 @@ flowchart TB
 |---|---|
 | 6.1 認証・Copilot 連携 | `tests/smoke/`、2 アカウントでの手動確認 |
 | 6.2 ツールコール審査 | `tests/review-scenarios/`（使い捨てリポジトリとローカルの bare リポジトリを作り、シナリオを再現）、判定ログの集計スクリプト |
-| 6.3 スケール | `tests/load/`（k6）、`kubectl scale` と HPA の観察、`make upgrade`（バージョンを上げてローリング更新） |
+| 6.3 スケール | `tests/load/`（k6）、`kubectl scale` と HPA の観察、`./lab upgrade`（バージョンを上げてローリング更新） |
 
 ---
 
@@ -440,7 +429,7 @@ flowchart TB
 
 ## 14. 冪等性の設計
 
-検証では環境を何度も作り直すため、どのスクリプトも「何度流しても同じ結果になる」ことを最優先にする。
+検証では環境を何度も作り直すため、どのコマンドも「何度流しても同じ結果になる」ことを最優先にする。
 
 ### 14.1 原則
 
@@ -454,36 +443,36 @@ flowchart TB
 
 | 段階 | 「もうある」の判定 | 2 回目以降の動き |
 |---|---|---|
-| 00 preflight | — | 毎回確かめるだけ（変更しない） |
-| 10 cluster | `k3d cluster list -o json` にクラスタがあり、全ノードが Ready | 飛ばす。設定（ノード数、k3s の版、ポート）が `k3d-config.yaml` と違えば、作り直しを促して止まる |
-| 10 Traefik の設定 | `kubectl apply` | 差分だけ反映 |
-| 20 images | イメージのタグを `litellm/` 以下の内容のハッシュにし、同じタグがローカルにあればビルドを飛ばす。レジストリにそのタグのマニフェストがあれば push も飛ばす | 中身が変わったときだけビルドと push |
-| 30 secrets | `.env` の各値。空なら生成して `.env` に書き足す（既存の値は決して上書きしない） | `kubectl create secret … --dry-run=client -o yaml \| kubectl apply -f -` で差分だけ反映 |
-| 40 datastores | `kubectl apply` | 差分だけ反映。`rollout status` で Ready を待つ |
-| 50 mcp | `kubectl apply` | 同上。`/health` を待つ |
-| 60 litellm | `helm upgrade --install --atomic --wait` | 値が同じなら変化なし。DB 移行の Job はフックで毎回走るが、移行自体が冪等 |
-| 70 bootstrap | ユーザーは `/user/info`、キーは `/key/info` で存在を確かめる | なければ `.env` の固定値で作る。あれば権限（MCP サーバー）だけ `/key/update` で揃える |
-| 80 chatgpt-login | `${LAB_DATA_DIR}/chatgpt/auth.json` がある | 飛ばす（クラスタを作り直しても残る） |
-| 90 clients | 生成物を一時ファイルに書き、内容が変わったときだけ置き換える | 差分がなければ何もしない |
+| preflight | — | 毎回確かめるだけ（変更しない） |
+| cluster | `k3d cluster list -o json` にクラスタがあり、全ノードが Ready | 飛ばす。設定（ノード数、k3s の版、ポート）が `k3d-config.yaml` と違えば、作り直しを促して止まる |
+| cluster（Traefik の設定） | `kubectl apply` | 差分だけ反映 |
+| images | イメージのタグを `litellm/` 以下の内容のハッシュにし、同じタグがローカルにあればビルドを飛ばす。レジストリにそのタグのマニフェストがあれば push も飛ばす | 中身が変わったときだけビルドと push |
+| secrets | `.env` の各値。空なら生成して `.env` に書き足す（既存の値は決して上書きしない） | Secret のマニフェストを作り、`kubectl diff` で差分があるときだけ apply する |
+| datastores | `kubectl apply` | 差分だけ反映。`rollout status` で Ready を待つ |
+| mcp | `kubectl apply` | 同上。`/health` を待つ |
+| litellm | 渡す値のハッシュをリリースの値（`labValuesHash`）に入れておき、同じなら helm を流さない | 値が変わったときだけ `helm upgrade --install --wait`。DB 移行の Job はフックで毎回走るが、移行自体が冪等 |
+| bootstrap | ユーザーは `/user/info`、キーは `/key/info` で存在を確かめる | なければ `.env` の固定値で作る。あれば権限（MCP サーバー）だけ `/key/update` で揃える |
+| chatgpt-login | `${LAB_DATA_DIR}/chatgpt/auth.json` にトークンがある | 飛ばす（クラスタを作り直しても残る） |
+| clients | 生成物を一時ファイルに書き、内容が変わったときだけ置き換える | 差分がなければ何もしない |
 
 ### 14.3 作り直しの入口
 
 | コマンド | 動き | 残るもの |
 |---|---|---|
-| `make up` | 全段階を順に流す（何度でも可） | — |
-| `make down` | クラスタを削除する | `.env`、chatgpt のトークン、Docker のイメージ |
-| `make rebuild` | `make down` の後に `make up` | 同上 |
-| `make upgrade VERSION=<版>` | LiteLLM のイメージを指定の版で作り直し、`helm upgrade` でローリング更新する（spec 6.3 の無停止更新の試験用） | すべて |
-| `make clean-all` | `make down` に加えて、生成したクライアント設定とカスタムイメージを消す。確認のプロンプトを出す | `.env`、chatgpt のトークン |
+| `./lab up` | 全段階を順に流す（何度でも可） | — |
+| `./lab down` | クラスタを削除する | `.env`、chatgpt のトークン、Docker のイメージ |
+| `./lab rebuild` | `./lab down` の後に `./lab up` | 同上 |
+| `./lab upgrade <版>` | LiteLLM のイメージを指定の版で作り直し、`helm upgrade` でローリング更新する（spec 6.3 の無停止更新の試験用） | すべて |
+| `./lab clean-all` | `./lab down` に加えて、生成したクライアント設定とカスタムイメージを消す。確認のプロンプトを出す | `.env`、chatgpt のトークン |
 
 - `.env` と chatgpt のトークンは、どのコマンドでも消さない（消すと Google の再設定や ChatGPT の再ログインが要るため）。消したいときは手で消す
-- `make rebuild` の所要時間を計測して記録し、作り直しの負担を把握する
+- `./lab rebuild` の所要時間を計測して記録し、作り直しの負担を把握する
 
 ### 14.4 冪等性の試験
 
-- `make up` を 2 回続けて流し、2 回目で何も変わらないこと（Helm のリビジョンが増えない、Pod が再起動しない）を確かめる
-- 各段階の途中で止め（`Ctrl-C`）、もう一度 `make up` で最後まで進むことを確かめる
-- `make rebuild` の後、生成済みのクライアント設定のまま Claude Code と Codex がつながることを確かめる（キーの固定値の確認）
+- `./lab up` を 2 回続けて流し、2 回目で何も変わらないこと（Helm のリビジョンが増えない、Pod が再起動しない）を確かめる
+- 各段階の途中で止め（`Ctrl-C`）、もう一度 `./lab up` で最後まで進むことを確かめる
+- `./lab rebuild` の後、生成済みのクライアント設定のまま Claude Code と Codex がつながることを確かめる（キーの固定値の確認）
 
 ---
 
@@ -494,11 +483,11 @@ flowchart TB
 | 分かったこと | 対応 |
 |---|---|
 | `k3d image import` は、複数アーキテクチャのイメージ（`docker save` に arm64 以外の参照が残る）で「content digest not found」になる。しかも最後に「成功」と表示する | 取り込みをやめ、レジストリ方式にした。自作イメージは `docker push --platform linux/arm64` で入れ、外部イメージは Docker Hub の中継キャッシュ経由でノードが取る。キャッシュはクラスタを消しても残るので、作り直しの 2 回目以降が速い |
-| `chatgpt/` のモデルをトークン無しで設定に入れると、LiteLLM が起動の途中でデバイスコードのログインを始めて止まる（起動の確認に通らず、再起動を繰り返す）。途中で止まると、要求時刻だけの `auth.json` が書き残される | トークン（`refresh_token` か `access_token`）があるときだけ、Codex 用のモデルと二次判定の `chatgpt/` を設定に入れる。ログインは `make chatgpt-login` で、クラスタの外の 1 回限りのコンテナで行う |
+| `chatgpt/` のモデルをトークン無しで設定に入れると、LiteLLM が起動の途中でデバイスコードのログインを始めて止まる（起動の確認に通らず、再起動を繰り返す）。途中で止まると、要求時刻だけの `auth.json` が書き残される | トークン（`refresh_token` か `access_token`）があるときだけ、Codex 用のモデルと二次判定の `chatgpt/` を設定に入れる。ログインは `./lab chatgpt-login` で、クラスタの外の 1 回限りのコンテナで行う |
 | post_call のフックに渡る `data` には `call_type` が入っていない | 形式（Responses / Chat Completions / Anthropic Messages）は、`user_api_key_dict.request_route` などの経路から判定する |
 | ストリーミングでガードレールに届く形は形式ごとに違う。Responses はイベントのオブジェクト、Chat Completions は `ModelResponseStream`、Anthropic Messages は SSE のバイト列 | 形式ごとの処理（`ResponsesStream` / `ChatStream` / `AnthropicStream`）に分けた。ツールコールの始まりまでは素通しで流し、そこから先を溜めて判定する |
 | Helm チャートは、`migrationJob` を有効にすると本体の Pod に `DISABLE_SCHEMA_UPDATE=true` を自分で入れる。`envVars` で重ねて指定すると、重複でインストールが失敗する | `envVars` から外した |
-| `helm --wait` を途中で止めると、リリースが pending のまま残り、次の helm が失敗する | `60-litellm.sh` の冒頭で、pending-install なら削除、pending-upgrade なら直前の版に戻す（戻せなければ削除）、failed なら入れ直す |
+| `helm --wait` を途中で止めると、リリースが pending のまま残り、次の helm が失敗する | `./lab litellm` の冒頭で、pending-install なら削除、pending-upgrade なら直前の版に戻す（戻せなければ削除）、failed なら入れ直す |
 | `kubectl apply` は、中身が同じでも `configured` と出ることがある | `kubectl diff` で差分があるときだけ apply する（`kapply`）。冪等性の試験で「変化なし」を判定できるようにするため |
 | OrbStack が `~/Documents` 以下をコンテナに見せるには、macOS の「書類フォルダへのアクセス」の許可が要る。許可を求める画面が出ている間、`docker run` は止まる | 2026-10-11 に許可済み。構築スクリプトは `~/Documents` をコンテナに見せない（ビルドは Docker のビルドコンテキストで送る） |
 
@@ -514,4 +503,22 @@ ChatGPT や Claude の利用枠を使わずに審査を試すため、OpenAI 互
 
 3 形式 × ストリーミングあり・なしのすべてで、危険なツールコールは「拒否: 理由」に差し替わり、安全なものはそのまま通った。
 Claude Code の User-Agent の Anthropic 形式は審査されずに素通りし、User-Agent が空のものは審査された。
+
+---
+
+## 16. 構築ツールを Python にした理由（2026-10-11）
+
+最初は Make + bash で実装し、試験がすべて通った版をコミットした（`7880fa8`）。そのうえで、Python の 1 本の CLI（`./lab`）に書き直した。
+
+| 観点 | Make + bash | Python（`./lab`） |
+|---|---|---|
+| Make の依存関係の機能 | 作る対象がファイルではなくクラスタの状態なので、ほぼ使えない。各ターゲットは順に流すだけのメニューになる | 要らない |
+| 冪等性の判定（状態を読み、差だけを直す） | `kubectl -o json` や API の応答を jq で読む。文字列の比較が多い | JSON を辞書として扱える |
+| 待機、リトライ、エラー処理 | `set -e` の落とし穴（パイプやサブシェル）に注意し続ける | 例外で書ける |
+| 設定の生成 | envsubst のテンプレートと Python が混在 | Python だけ（副作用のない関数にして単体テストする） |
+| 前提の道具 | make（macOS は 2006 年の 3.81）、jq、gettext | uv（Python 3.12 以上と PyYAML を自動で用意する） |
+
+- k8s のマニフェスト（`k8s/`）は YAML のまま残し、`${名前}` の置き換えは Python の `string.Template` で行う。渡していない名前が残っていればエラーにする
+- 外部コマンド（k3d、kubectl、helm、docker）は `subprocess` で呼ぶ。ツールのログは標準エラーに流す
+- 移行の確認（2026-10-11）: 生成するプロキシ設定が bash 版と同じ内容であること、単体テスト（構築ツール 17 件、ガードレール 9 件）、疎通確認 19 項目、冪等性の試験（2 回目は 3 秒で変化なし）、まっさらからの作り直し（559 秒。bash 版は 514 秒で、差はイメージの展開など毎回ばらつく待ち時間の範囲）と、その後の疎通確認 19 項目
 

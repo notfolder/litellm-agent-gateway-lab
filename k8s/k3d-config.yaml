@@ -1,4 +1,4 @@
-# k3d のクラスタ定義。scripts/10-cluster.sh が ${...} を置き換えて使う。
+# k3d のクラスタ定義。./lab cluster が LAB_HTTP_PORT などの変数を置き換えて使う。
 apiVersion: k3d.io/v1alpha5
 kind: Simple
 metadata:

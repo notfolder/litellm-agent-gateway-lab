@@ -1,5 +1,5 @@
 # 審査ガードレールの試験用の偽 LLM（tests/fake-llm/server.py）。
-# スクリプト本体は ConfigMap fake-llm-server（scripts/50-mcp.sh が作る）から読む
+# スクリプト本体は ConfigMap fake-llm-server（./lab mcp が作る）から読む
 apiVersion: v1
 kind: Service
 metadata:

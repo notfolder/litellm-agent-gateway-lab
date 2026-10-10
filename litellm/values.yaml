@@ -1,5 +1,5 @@
 # LiteLLM 公式 Helm チャート（oci://ghcr.io/berriai/litellm-helm 1.104.2）の値。
-# image.repository / image.tag / podAnnotations.configHash は scripts/60-litellm.sh が --set で渡す。
+# image.repository / image.tag / podAnnotations は ./lab litellm が上書き用の値（.build/litellm-overrides.json）で渡す。
 
 replicaCount: 2
 numWorkers: 1            # Kubernetes では 1 Pod 1 ワーカーが推奨
