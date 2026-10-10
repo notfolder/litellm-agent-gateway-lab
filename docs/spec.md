@@ -26,20 +26,46 @@ LiteLLM を社内 AI ゲートウェイとして使い、次の 2 つを実現�
 
 ## 1. 全体構成
 
-```
-                 ┌──────────────────────── LiteLLM（k8s 上で複数レプリカ）────────────────────────┐
-Claude Code ──── │ /v1/messages ─────────────────────────────► Claude（Bedrock / Anthropic API）  │
- (auto mode)     │        └ 審査ガードレール: Anthropic 形式 かつ Claude Code UA → 素通し          │
-                 │                                                                                 │
-Codex ────────── │ /v1/responses ──► 審査ガードレール ───────► OpenAI 系モデル                      │
-                 │        ├ 一次判定: Jev（Decisions API）。全ツールコールが対象                     │
-                 │        └ 二次判定: LLM による理由付き再判定                                       │
-                 │                                                                                 │
-両ツール共通 ─── │ /{server}/mcp ──► MCP ゲートウェイ（ユーザーごとの OAuth トークンを DB に保存）    │
-                 │                     └──► Copilot Studio エージェント（MCP チャネル）              │
-                 └──────────────── PostgreSQL（キー・利用量・OAuth トークン） / Redis ──────────────┘
-                        ▲
-                 Entra ID SSO（LiteLLM へのログイン、ユーザー ID の発行）
+```mermaid
+flowchart LR
+    CC["Claude Code<br/>（auto mode）"]
+    CX["Codex"]
+    SSO["Entra ID SSO<br/>（LiteLLM へのログイン、ユーザー ID の発行）"]
+
+    subgraph LITELLM["LiteLLM（k8s 上で複数レプリカ）"]
+        MSG["/v1/messages"]
+        RESP["/v1/responses"]
+        PASS{"Anthropic 形式 かつ<br/>Claude Code の User-Agent?"}
+        subgraph GR["審査ガードレール"]
+            J1["一次判定: Jev（Decisions API）<br/>全ツールコールが対象"]
+            J2["二次判定: LLM による<br/>理由付き再判定"]
+            J1 -- 引っかかったものだけ --> J2
+        end
+        MCPGW["/{server}/mcp<br/>MCP ゲートウェイ<br/>（ユーザーごとの OAuth トークンを DB に保存）"]
+    end
+
+    CLAUDE["Claude<br/>（Bedrock / Anthropic API）"]
+    OAI["OpenAI 系モデル"]
+    COPILOT["Copilot Studio エージェント<br/>（MCP チャネル）"]
+    DB[("PostgreSQL<br/>キー・利用量・OAuth トークン")]
+    REDIS[("Redis")]
+
+    CC --> MSG
+    CX --> RESP
+    CC --> MCPGW
+    CX --> MCPGW
+
+    MSG --> PASS
+    PASS -- はい: 素通し --> CLAUDE
+    PASS -- いいえ --> GR
+    RESP --> GR
+    GR -- Responses 形式 --> OAI
+    GR -- Anthropic 形式 --> CLAUDE
+    MCPGW --> COPILOT
+
+    SSO --> LITELLM
+    LITELLM --- DB
+    LITELLM --- REDIS
 ```
 
 ---
