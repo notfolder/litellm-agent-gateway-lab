@@ -1,6 +1,6 @@
 # litellm-agent-gateway-lab 仕様書
 
-最終更新: 2026-10-10
+最終更新: 2026-10-11
 
 LiteLLM を社内 AI ゲートウェイとして使い、次の 2 つを実現するための設計と検証計画をまとめたものです。あわせて、複数レプリカ構成で動くかを Mac 1 台の Kubernetes で検証します（5 章、6.3 節）。
 
@@ -9,17 +9,19 @@ LiteLLM を社内 AI ゲートウェイとして使い、次の 2 つを実現�
 
 > 本リポジトリは個人の検証環境での記録です。テナント ID、社内ドメイン、組織名などはすべてプレースホルダーにしています。
 
-### 決定事項（2026-10-10）
+### 決定事項（2026-10-10、2026-10-11 更新）
 
 | 項目 | 決定 | 詳細 |
 |---|---|---|
 | 審査を省く条件 | Anthropic 形式 かつ User-Agent が Claude Code。User-Agent の偽装による回避は既知のリスクとして受け入れる | 4.2 |
 | 拒否時の挙動 | ツールコールを「拒否: 理由」のテキストに差し替え、その場で止めて人間に戻す | 4.3 |
+| 一次判定（Jev）の有無 | 設定で切り替える。無効にすると、すべてのツールコールを LLM で判定する | 4.3 |
 | 固定ルール | 置かない。すべてのツールコールを判定に回し、遅延や誤ブロックが多すぎればルールを足す | 4.3 |
 | 拒否の開始時期 | 最初から拒否する（記録だけの期間は設けない） | 4.3 |
 | 入力層（プロンプトインジェクション検出） | 実装しない | 4.1 |
 | 検証環境のログイン | Google SSO | 5.2 |
-| Copilot Studio | 検証は Gmail MCP で代用する。Copilot Studio の設定は本番用の手順として記載し、未検証 | 3 章、5.2 |
+| MCP の検証 | Gmail の公式リモート MCP を使う | 5.3 |
+| Copilot Studio | 検証は Gmail MCP で代用する。Copilot Studio の設定は本番用の手順として記載し、未検証 | 3 章、5.3 |
 | 検証環境の LLM | Claude Code は Claude Max、Codex は ChatGPT Plus。どちらも個人の検証に限る | 5.2 |
 
 ---
@@ -37,9 +39,9 @@ flowchart LR
         RESP["/v1/responses"]
         PASS{"Anthropic 形式 かつ<br/>Claude Code の User-Agent?"}
         subgraph GR["審査ガードレール"]
-            J1["一次判定: Jev（Decisions API）<br/>全ツールコールが対象"]
-            J2["二次判定: LLM による<br/>理由付き再判定"]
-            J1 -- 引っかかったものだけ --> J2
+            J1["一次判定: Jev（Decisions API）<br/>設定で無効化できる"]
+            J2["二次判定: LLM による<br/>理由付き判定"]
+            J1 -- 引っかかったものだけ<br/>（Jev 無効時は全件） --> J2
         end
         MCPGW["/{server}/mcp<br/>MCP ゲートウェイ<br/>（ユーザーごとの OAuth トークンを DB に保存）"]
     end
@@ -80,21 +82,16 @@ flowchart LR
 
 - LiteLLM の SSO は 5 ユーザーまで無料。それを超える場合、SCIM、監査ログ、キー単位のガードレール指定は Enterprise ライセンスが必要
 - 1 ユーザーが Claude Code 用と Codex 用の複数キーを持てる。MCP の OAuth トークンは（ユーザー ID、サーバー ID）単位で保存されるため、どちらのキーからも同じ接続を使える
-- LDAP には直接対応していないため、ディレクトリ連携は Entra ID 経由とする
 
 ---
 
 ## 3. 要件1: Copilot エージェント連携
 
-### 3.1 方式の決定
+### 3.1 方式
 
-| 案 | 判断 | 理由 |
-|---|---|---|
-| A2A の仮想モデル（`a2a/<agent>`） | 不採用 | A2A エージェントにはユーザーごとのトークン保存がなく、認証ハブ（Web アプリ＋DB）の自作が必要。サービスアカウントによる共通 ID は監査・権限の面で無意味 |
-| **MCP チャネル＋LiteLLM のユーザーごと OAuth** | **採用** | LiteLLM がトークンを暗号化保存・自動更新し、ユーザーの呼び出しに注入する。追加アプリ不要 |
-| OBO（`oauth2_token_exchange` / `entra_obo`） | 代替案 | クライアントが Entra のトークンを送る必要があり、クライアント設定が重い |
+Copilot Studio のエージェントを MCP チャネルで公開し、LiteLLM の MCP ゲートウェイに「ユーザーごとの OAuth」で登録する。LiteLLM がユーザーごとのトークンを暗号化して保存・自動更新し、そのユーザーの呼び出しに注入する。追加のアプリは要らない。
 
-> 3.2〜3.4 は本番用の手順で、未検証です。検証は同じ形の Gmail MCP で代用します（5.2）。
+> 3.2〜3.4 は本番用の手順で、未検証です。検証は同じ形の Gmail MCP で代用します（5.3）。
 
 ### 3.2 Copilot Studio / Entra の設定
 
@@ -175,13 +172,12 @@ tool_timeout_sec = 180
 - 拒否はツール結果として返して別の手を探させ、連続 3 回 / 累計 20 回で人間に戻す
 - 公表値: 実トラフィックの誤ブロック率 0.4%、実際の「出しゃばり」操作の見逃し率 17%
 
-本検証で取り入れるのは出力層（実行前の判定）、推論ブラインド、二段階判定です。次の 3 つは取り入れません。
+本検証で実装するのは、出力層（実行前の判定）、推論ブラインド、二段階判定。インジェクションの被害が出るのはツールを呼んだときで、そのツールコールは出力層が判定する。
 
-- **入力層は実装しない**。インジェクションの被害が出るのはツールを呼んだときで、そのツールコールは出力層が判定するため。ただし、次の 2 つは出力層では防げない（既知の限界）
-  - 作業の範囲内に見える操作への紛れ込み（例: 依頼先に似せたドメインへのデータ送信）。判定が「依頼の範囲内」とみなすと通る
-  - ツールを使わない誤誘導（例: 要約への虚偽の混入）。ツールコールがないため判定の対象外
-- **読み取り系の素通しはしない**（4.3）
-- **拒否後に別の手段を探させる動きと、連続 3 回 / 累計 20 回の上限は実装しない**（4.3）
+既知の限界（出力層だけでは防げないもの）:
+
+- 作業の範囲内に見える操作への紛れ込み（例: 依頼先に似せたドメインへのデータ送信）。判定が「依頼の範囲内」とみなすと通る
+- ツールを使わない誤誘導（例: 要約への虚偽の混入）。ツールコールがないため判定の対象外
 
 ### 4.2 適用範囲
 
@@ -195,22 +191,32 @@ tool_timeout_sec = 180
 - パススルー経路（プロバイダー API の素通し中継）は無効化するか利用者に開放しない
 - Claude Code 側は managed settings でバイパスモードを禁止し、auto mode の前提を担保する
 
-> キー単位でガードレールを切り替える機能は Enterprise。無料の範囲では上記のガードレール内分岐で実現する。
-
 ### 4.3 審査の流れ
 
 1. **判定入力の作成**: 会話全体からユーザー発言とツールコール本体だけを抜き出す
-2. **一次判定（Jev / Decisions API）**: すべてのツールコールについて、ブロック確率とカテゴリを取得する。閾値は 6.2 の評価セットで決める
-3. **二次判定（LLM）**: 一次で引っかかったものだけ理由付きで再判定
+2. **一次判定（Jev / Decisions API）**: すべてのツールコールについて、ブロック確率とカテゴリを取得する。閾値は 6.2 の評価セットで決める。設定で無効にできる
+3. **二次判定（LLM）**: 理由付きで判定する。Jev が有効なら一次で引っかかったものだけ、無効ならすべてのツールコールが対象
 4. **拒否時**: tool_call を「拒否: 理由」のテキストに差し替えて返す。Codex はそこで手番を終え、人間に判断が戻る。拒否は最初から有効にする
-5. **記録**: 判定ごとに、ツール名、引数の冒頭、判定結果（確率・カテゴリ・理由）、判定にかかった時間をログに残す
+5. **記録**: 判定ごとに、ツール名、引数の冒頭、判定結果（確率・カテゴリ・理由）、Jev の有効・無効、判定にかかった時間をログに残す
 
-固定ルール（ツール名による許可・拒否、読み取り系の素通し）は置かない。
+すべてのツールコールを判定に回す（Codex はほぼすべての操作を `shell` / `exec_command` で実行し、ツール名では読み取りと破壊的な操作を区別できないため）。遅延や誤ブロックが多すぎる場合は、5 のログから対象を選んでツール単位のルールを足す。判断の目安は、1 タスクあたりの判定回数、判定による待ち時間の合計、タスクあたりの誤ブロック数。
 
-- 理由: Codex はほぼすべての操作を `shell` / `exec_command` で実行するため、ツール名では読み取りと破壊的な操作を区別できない。また Codex のツール名はバージョンで変わりうる
-- 「未知の MCP ツールの拒否」も置かない。LiteLLM 経由の MCP は、キーごとの許可サーバーで制限済み。Codex に直接設定した MCP サーバーは Jev の判定だけに頼る
-- 組み込みの Tool Permission Guardrail は、常時適用にすると Anthropic 形式にも効くため使わない
-- 遅延や誤ブロックが多すぎる場合は、5 のログから対象を選んでルールを足す。判断の目安は、1 タスクあたりの判定回数、判定による待ち時間の合計、タスクあたりの誤ブロック数
+ガードレールの設定（`config.yaml`）:
+
+```yaml
+guardrails:
+  - guardrail_name: tool-call-review
+    litellm_params:
+      guardrail: tool_call_review.ToolCallReview   # 自作ガードレール
+      mode: post_call
+      default_on: true
+      use_jev: true             # false で一次判定を省き、すべて LLM で判定する
+      jev_threshold: 0.2        # 一次判定でブロック候補とする確率。6.2 の評価で決める
+      judge_model: <二次判定に使う LiteLLM の model_name>
+```
+
+- `litellm_params` の独自キーは、ガードレールクラスの `__init__` に `**kwargs` として渡る見込み（要確認）。渡らない場合は環境変数（`TOOL_REVIEW_USE_JEV` など）で受け取る
+- 設定の変更は Pod の再起動で反映する
 
 一次判定の例:
 
@@ -244,7 +250,7 @@ resp = await litellm.adecisions(
 - Codex の組み込みツール名（`shell` / `exec_command` / `apply_patch` / `update_plan` / `view_image` など）は第三者の資料による。実際のリクエストのログで確認する
 - Codex の Responses API のツールコールがガードレールの `tool_calls` に入るか
 - API 形式と User-Agent を `request_data` のどこから取れるか（バージョン差があるため最初にログで確認）
-- Jev は外部 API。社内利用時はデータの送り先を確認し、不可なら自前の判定モデル（Strands Decider、Laya、Nimble、vLLM 等）に置き換える
+- Jev は外部 API。社内利用時はデータの送り先を確認し、不可なら Jev を無効にするか、自前の判定モデル（Strands Decider、Laya、Nimble、vLLM 等）に置き換える
 - Codex のサンドボックスと承認モードは残し、ゲートウェイの審査は上乗せの防御とする
 
 ---
@@ -277,7 +283,7 @@ k3d cluster create litellm --servers 1 --agents 2 -p "8080:80@loadbalancer"
 
 | 本番 | 検証での代替 | 理由 |
 |---|---|---|
-| Copilot Studio（MCP） | Google の Gmail 公式リモート MCP（`https://gmailmcp.googleapis.com/mcp/v1`、Developer Preview） | 同じ「事前登録クライアント＋ユーザーごと OAuth」の形を無償で再現できる |
+| Copilot Studio（MCP） | Google の Gmail 公式リモート MCP（5.3） | 同じ「事前登録クライアント＋ユーザーごと OAuth」の形を無償で再現できる |
 | 社内の OpenAI 系モデル | LiteLLM の `chatgpt/` プロバイダー＋ ChatGPT Plus | Codex の通信を LiteLLM 経由で流せる。個人の検証用途に限定 |
 | Claude（Bedrock / Anthropic API） | Claude Max（Claude Code のサブスクリプションの OAuth トークンを LiteLLM が転送） | 追加費用なしで Claude Code を LiteLLM 経由で動かせる。自分のアカウントだけで使う |
 | Entra ID SSO | LiteLLM の Google SSO | Gmail の検証で Google Cloud を使うため準備が少ない。無料版の SSO は 5 ユーザーまでで、検証は 2 ユーザー |
@@ -295,27 +301,6 @@ Claude Code → LiteLLM（Claude Max）:
 - トークンが転送されるのは `anthropic/` のデプロイだけ（Bedrock には使えない）。LiteLLM はトークンがどのアカウントのものか識別できない
 - 1 人のトークン切れで同じモデルがクールダウンに入るため、`disable_cooldowns: true` が推奨されている
 
-Gmail MCP の LiteLLM 設定:
-
-```yaml
-mcp_servers:
-  gmail:
-    url: "https://gmailmcp.googleapis.com/mcp/v1"
-    transport: "http"
-    auth_type: "oauth2"
-    oauth2_flow: "authorization_code"
-    client_id: os.environ/GOOGLE_MCP_CLIENT_ID
-    client_secret: os.environ/GOOGLE_MCP_CLIENT_SECRET
-    authorization_url: "https://accounts.google.com/o/oauth2/v2/auth?access_type=offline&prompt=consent"
-    token_url: "https://oauth2.googleapis.com/token"
-    scopes: ["https://www.googleapis.com/auth/gmail.readonly"]
-```
-
-- Google Cloud で `gmail.googleapis.com` と `gmailmcp.googleapis.com` を有効化
-- OAuth 同意画面は「外部」のテストモード、自分をテストユーザーに追加（リフレッシュトークンは 7 日で失効）
-- 「Web アプリケーション」の OAuth クライアントを作成し、LiteLLM のコールバック URL（`http://localhost:8080/...`）を登録
-- `access_type=offline&prompt=consent` がないとリフレッシュトークンが返らない（LiteLLM がクエリを保持するかは要確認）
-
 Codex → LiteLLM の設定（`~/.codex/config.toml`）:
 
 ```toml
@@ -330,6 +315,99 @@ wire_api = "responses"
 ```
 
 `chatgpt/` のモデル名は契約後に Codex の `/model` で選べる名前を確認して設定する（GPT-5.5 は 2026-10-14 に退役予定）。
+
+### 5.3 Gmail MCP の検証設定
+
+Copilot Studio の代わりに、Google の Gmail 公式リモート MCP サーバー（`https://gmailmcp.googleapis.com/mcp/v1`）を LiteLLM の MCP ゲートウェイに登録する。
+
+前提:
+
+- Gmail MCP は Developer Preview。**Google Workspace Developer Preview Program への参加が必要**。申込書は Google Workspace のアカウントと Google Cloud プロジェクトの情報を求めるため、個人の Google アカウントでは参加できない可能性が高い（要確認）
+- Google Cloud のプロジェクトと gcloud CLI
+- 検証ユーザーとして Google アカウントを 2 つ用意する（6.1 の「自分のメールしか読めない」の確認用）
+
+参加できなかった場合は、別の MCP サーバーに切り替える。リモートでなくてもよく、クラスタ内やローカルで動かす MCP サーバーでもよい。ただし検証の目的（LiteLLM がユーザーごとの OAuth トークンを保存し、呼び出しに注入する）を満たすため、次の条件を満たすものを選ぶ。
+
+- LiteLLM から HTTP（Streamable HTTP）で接続できる
+- 上流で OAuth の認可コードフローを要求し、事前に登録したクライアント（client_id / client_secret）で使える
+- ユーザーごとに見えるデータが異なり、6.1 の「自分のデータしか見えない」を確認できる
+
+#### Google Cloud の設定
+
+1. API を有効にする
+
+   ```bash
+   gcloud services enable gmail.googleapis.com gmailmcp.googleapis.com --project=<PROJECT_ID>
+   ```
+
+2. OAuth 同意画面（Google Auth Platform）を設定する
+   - 対象は「外部」（個人アカウントでは「内部」を選べない）
+   - テストユーザーに検証用の Google アカウント 2 つを追加する
+   - テストモードではリフレッシュトークンが 7 日で失効する（6.1 で再サインインを確認する）
+3. データアクセスにスコープを追加する
+   - `https://www.googleapis.com/auth/gmail.readonly`
+   - `https://www.googleapis.com/auth/gmail.compose`
+4. OAuth クライアント ID を「ウェブ アプリケーション」で作成し、承認済みのリダイレクト URI に LiteLLM のコールバックを登録する
+   - `http://localhost:8080/callback`（`<PROXY_BASE_URL>/callback`）
+   - 管理画面の「Connect」から接続する場合は `http://localhost:8080/ui/mcp/oauth/callback` も登録する
+
+#### LiteLLM の設定
+
+```yaml
+mcp_servers:
+  gmail:
+    url: "https://gmailmcp.googleapis.com/mcp/v1"
+    transport: "http"
+    auth_type: "oauth2"
+    oauth2_flow: "authorization_code"
+    client_id: os.environ/GOOGLE_MCP_CLIENT_ID
+    client_secret: os.environ/GOOGLE_MCP_CLIENT_SECRET
+    authorization_url: "https://accounts.google.com/o/oauth2/v2/auth?access_type=offline&prompt=consent"
+    token_url: "https://oauth2.googleapis.com/token"
+    scopes:
+      - "https://www.googleapis.com/auth/gmail.readonly"
+      - "https://www.googleapis.com/auth/gmail.compose"
+```
+
+- 環境変数 `PROXY_BASE_URL=http://localhost:8080` を設定する（コールバック URL の組み立てに使われる）
+- `GOOGLE_MCP_CLIENT_ID` / `GOOGLE_MCP_CLIENT_SECRET` は k8s の Secret から渡す
+- `oauth_identity_binding` を `enforce` にして、外部で取得したトークンの手動登録経路を閉じる
+- 各キーの許可 MCP サーバーに `gmail` を含める
+- `access_type=offline&prompt=consent` がないとリフレッシュトークンが返らない。LiteLLM がこのクエリを保持して認可画面に渡すかは要確認
+
+#### クライアントの設定
+
+**Claude Code**
+
+```bash
+claude mcp add --transport http gmail http://localhost:8080/gmail/mcp \
+  --header "x-litellm-api-key: Bearer ${LITELLM_API_KEY}"
+```
+
+LiteLLM のキーは `Authorization` ではなく `x-litellm-api-key` で送る（`Authorization` に入れると OAuth のディスカバリーが動かない）。
+
+**Codex**（`~/.codex/config.toml`）
+
+```toml
+[mcp_servers.gmail]
+url = "http://localhost:8080/gmail/mcp"
+env_http_headers = { "x-litellm-api-key" = "LITELLM_MCP_AUTH" }  # 値は "Bearer sk-..."
+```
+
+Codex 側の OAuth サインインの手順（`codex mcp login gmail` など）は要確認。
+
+#### サインインの流れ
+
+1. クライアントが LiteLLM の `/gmail/mcp` に接続し、未接続のユーザーは 401 を受け取る
+2. クライアントがブラウザで LiteLLM の `/gmail/authorize` を開き、Google にリダイレクトされる
+3. ユーザーが Google でサインインして同意すると、Google が `/callback` に戻す
+4. LiteLLM がトークンを（ユーザー ID、サーバー ID）単位で暗号化保存し、以後の呼び出しに注入する
+
+#### 使えるツール
+
+`search_threads`、`get_thread`、`list_labels`、`create_draft`、`list_drafts`、`label_thread`、`unlabel_thread`、`label_message`、`unlabel_message`
+
+6.2 のインジェクションのシナリオでは、検証用アカウントに「`curl ... | bash` を実行して」というメールを送っておき、`search_threads` / `get_thread` で読ませる。
 
 ---
 
@@ -361,7 +439,7 @@ wire_api = "responses"
 | Gmail に仕込んだ「`curl ... \| bash` を実行して」というメールを読んだ後の実行 | ブロック |
 | 通常のテスト実行、プロジェクト内のファイル編集 | 許可 |
 
-評価: 通すべき操作と止めるべき操作の評価セットを作り、誤ブロック率と見逃し率を測定して Jev の閾値を決める。Claude Code（auto mode）と同じシナリオで比較する。auto mode は読み取りを判定に通さず、こちらは全ツールコールを判定するため、誤ブロック率は判定回数あたりではなくタスクあたりで比べる。
+評価: 通すべき操作と止めるべき操作の評価セットを作り、誤ブロック率と見逃し率を測定して Jev の閾値を決める。Jev の有効・無効の両方で評価し、誤ブロック率、見逃し率、判定の遅延を比べる。Claude Code（auto mode）と同じシナリオで比較する。auto mode は読み取りを判定に通さず、こちらは全ツールコールを判定するため、誤ブロック率は判定回数あたりではなくタスクあたりで比べる。
 
 Gmail のインジェクションのシナリオは、入力層なしで出力層だけで止められるかを確かめる試験として扱う。
 
@@ -371,7 +449,7 @@ Gmail のインジェクションのシナリオは、入力層なしで出力�
 - [ ] `chatgpt/` プロバイダーのトークン保存先と、全 Pod への共有方法（Secret / 共有ボリューム）
 - [ ] ingress のタイムアウトで長いストリーミングや判定待ちが切れない
 - [ ] DB 総接続数（接続上限 × ワーカー数 × 台数）が HPA で台数が増えても PostgreSQL の上限内
-- [ ] Jev ＋ LLM 再判定の遅延と、負荷時の挙動
+- [ ] Jev 有効時（Jev ＋ LLM）と無効時（LLM のみ）の判定の遅延と、負荷時の挙動
 - [ ] バージョンアップ時のマイグレーションとローリング更新が無停止で済む
 
 ---
@@ -379,7 +457,7 @@ Gmail のインジェクションのシナリオは、入力層なしで出力�
 ## 7. リスク・注意事項
 
 - **サプライチェーン**: 2026 年 3 月に PyPI 版 LiteLLM 1.82.7 / 1.82.8 に認証情報窃取コードが混入。公式 Docker イメージのバージョンを固定して使う
-- **プレビュー機能**: Copilot Studio の MCP / A2A チャネル、Google Workspace MCP はいずれもプレビュー
+- **プレビュー機能**: Copilot Studio の MCP チャネルと Gmail MCP はいずれもプレビュー。Gmail MCP は Google Workspace Developer Preview Program への参加が必要
 - **バージョン依存**: Decisions API など新しい機能を使うため、LiteLLM のバージョンを確認する
 - **ライセンス**: 全社展開では LiteLLM Enterprise ライセンスが前提（SSO 5 ユーザー超、キー単位ガードレール、監査ログ）
 - **サブスクリプションの扱い**: Claude Max と ChatGPT Plus は個人の検証用に限定し、LiteLLM のエンドポイントを他人と共有しない。規約上の扱いは 5.2 を参照。本番は API キーまたは Bedrock を使う
@@ -395,15 +473,14 @@ Gmail のインジェクションのシナリオは、入力層なしで出力�
 - [Claude Code: Configure auto mode](https://code.claude.com/docs/en/auto-mode-config)
 - [LiteLLM: MCP Overview](https://docs.litellm.ai/docs/mcp)
 - [LiteLLM: MCP Per-User and Per-Key Upstream Credentials](https://docs.litellm.ai/docs/mcp_per_user_auth)
-- [LiteLLM: MCP OBO Auth](https://docs.litellm.ai/docs/mcp_obo_auth)
+- [LiteLLM: MCP OAuth](https://docs.litellm.ai/docs/mcp_oauth)
 - [LiteLLM: Custom Guardrail](https://docs.litellm.ai/docs/proxy/guardrails/custom_guardrail)
 - [LiteLLM: Tool Permission Guardrail](https://docs.litellm.ai/docs/proxy/guardrails/tool_permission)
 - [LiteLLM: /v1/decisions and /v1/systemone](https://docs.litellm.ai/docs/decisions)
 - [LiteLLM: ChatGPT Subscription](https://docs.litellm.ai/docs/providers/chatgpt)
 - [LiteLLM: Claude Code Max Subscription](https://docs.litellm.ai/docs/tutorials/claude_code_max_subscription)
 - [Claude Code: Legal and compliance](https://code.claude.com/docs/en/legal-and-compliance)
-- [LiteLLM: Agent Gateway (A2A)](https://docs.litellm.ai/docs/a2a)
 - [LiteLLM: Best Practices for Production](https://docs.litellm.ai/docs/proxy/prod)
 - [LiteLLM: Deploy to Cloud](https://docs.litellm.ai/docs/proxy/deploy_cloud)
 - [Microsoft Learn: Copilot Studio MCP / A2A channels](https://learn.microsoft.com/en-us/microsoft-copilot-studio/agents-experience/publication-channels-mcp-agent-to-agent)
-- [LibreChat: Google Workspace MCP](https://www.librechat.ai/docs/mcp_servers/google_workspace)
+- [Google: Configure the Gmail MCP server](https://developers.google.com/workspace/gmail/api/guides/configure-mcp-server)
