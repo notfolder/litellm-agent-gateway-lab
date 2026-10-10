@@ -149,6 +149,8 @@ class ToolCallReview(CustomGuardrail):
         jev_threshold: Any = 0.2,
         judge_model: str = "review-judge",
         fail_open: Any = False,
+        test_model: str | None = None,
+        test_judge_model: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.use_jev = _as_bool(os.environ.get("TOOL_REVIEW_USE_JEV", use_jev), True)
@@ -156,6 +158,10 @@ class ToolCallReview(CustomGuardrail):
         self.jev_threshold = float(os.environ.get("TOOL_REVIEW_JEV_THRESHOLD", jev_threshold))
         self.judge_model = os.environ.get("TOOL_REVIEW_JUDGE_MODEL", judge_model)
         self.fail_open = _as_bool(fail_open, False)
+        # 試験用のモデル（偽 LLM）への要求は、試験用の審査官だけで判定する。本物の審査官の判定は揺れるので、
+        # 疎通確認の結果が決まらなくなるため（Jev も使わない）
+        self.test_model = test_model
+        self.test_judge_model = test_judge_model
         if self.use_jev and not os.environ.get("TYPESAFE_API_KEY"):
             self.use_jev = False
             print(f"{LOG_PREFIX}: TYPESAFE_API_KEY が無いので一次判定（Jev）を無効にしました", flush=True)
@@ -178,8 +184,10 @@ class ToolCallReview(CustomGuardrail):
         transcript = tr.transcript_from_request(call_type, data)
         verdict = Verdict(allowed=True)
         t0 = time.monotonic()
+        is_test = bool(self.test_model and self.test_judge_model and data.get("model") == self.test_model)
+        judge_model = self.test_judge_model if is_test else self.judge_model
         try:
-            if self.use_jev:
+            if self.use_jev and not is_test:
                 verdict.jev_probability, verdict.jev_category = await self._jev(transcript, pending)
                 verdict.timings_ms["jev"] = int((time.monotonic() - t0) * 1000)
                 if verdict.jev_probability < self.jev_threshold:
@@ -187,7 +195,7 @@ class ToolCallReview(CustomGuardrail):
                     return verdict
             t1 = time.monotonic()
             verdict.judge_used = True
-            verdict.allowed, verdict.reason = await self._judge(transcript, pending)
+            verdict.allowed, verdict.reason = await self._judge(transcript, pending, judge_model)
             verdict.timings_ms["judge"] = int((time.monotonic() - t1) * 1000)
             return verdict
         except Exception as e:  # 判定できなかった
@@ -208,7 +216,8 @@ class ToolCallReview(CustomGuardrail):
                 "user_id": getattr(user_api_key_dict, "user_id", None),
                 "tools": [e["tool_call"]["name"] for e in pending],
                 "args_head": [e["tool_call"]["arguments"][:200] for e in pending],
-                "use_jev": self.use_jev,
+                "use_jev": self.use_jev and not is_test,
+                "judge_model": judge_model,
                 "jev_probability": verdict.jev_probability,
                 "jev_category": verdict.jev_category,
                 "judge_used": verdict.judge_used,
@@ -230,13 +239,13 @@ class ToolCallReview(CustomGuardrail):
         prob = float(getattr(sb, "noul", 1.0))
         return prob, getattr(cat, "choice", None)
 
-    async def _judge(self, transcript: list[dict], pending: list[dict]) -> tuple[bool, str]:
+    async def _judge(self, transcript: list[dict], pending: list[dict], judge_model: str) -> tuple[bool, str]:
         from litellm.proxy.proxy_server import llm_router
 
         if llm_router is None:
             raise RuntimeError("llm_router が初期化されていません")
         resp = await llm_router.acompletion(
-            model=self.judge_model,
+            model=judge_model,
             messages=[
                 {"role": "system", "content": JUDGE_SYSTEM},
                 {"role": "user", "content": tr.render_for_judge(transcript, pending)},

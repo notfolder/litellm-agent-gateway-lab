@@ -12,6 +12,19 @@ spec:
     sourceRange:
       - 127.0.0.255/32
 ---
+# MCP の経路（/<サーバー名>/mcp）への GET を 405 にするため、POST だけを受ける経路に置き換える。
+# LiteLLM はセッション無しの GET に、終わらないイベントストリーム（200）を返す。Codex（0.162.1）は
+# 起動時にこの GET を送って応答を待ち続け、MCP サーバーを使えなくなる（2026-10-11 に確認）。
+# MCP の仕様では、サーバーはこの GET に 405 を返してよく、クライアントはそれを扱える
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: mcp-get-not-allowed
+  namespace: litellm-lab
+spec:
+  replacePath:
+    path: /v1/chat/completions
+---
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
@@ -27,6 +40,14 @@ spec:
         PathRegexp(`^/(anthropic|assemblyai|eu\.assemblyai|azure|azure_ai|bedrock|cohere|cursor|fal_ai|gemini|gigachat|langfuse|milvus|mistral|nvidia_nim|openai|openai_passthrough|openrouter|tinyfish|typesafe|vertex_ai|vertex-ai|vllm|watsonx)(/|$)`)
       middlewares:
         - name: deny-all
+      services:
+        - name: litellm
+          port: 4000
+    - kind: Rule
+      priority: 90
+      match: Method(`GET`) && PathRegexp(`^/[^/]+/mcp/?$`)
+      middlewares:
+        - name: mcp-get-not-allowed
       services:
         - name: litellm
           port: 4000

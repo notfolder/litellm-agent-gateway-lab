@@ -25,8 +25,8 @@ brew install uv k3d kubectl helm
 | 準備 | 手順 | 有効になるもの |
 |---|---|---|
 | Google の OAuth クライアント | [docs/setup-google.md](docs/setup-google.md) | 管理画面の SSO、Gmail の MCP |
-| TypeSafe の API キー | `.env` の `TYPESAFE_API_KEY` | 審査の一次判定（Jev） |
-| ChatGPT Plus のログイン | `./lab chatgpt-login` の後に `./lab up` | Codex 用のモデル、審査の二次判定 |
+| TypeSafe の API キー | [console.typesafe.ai](https://console.typesafe.ai) の Billing でクレジットを追加してから、API Keys でキーを作り、`.env` の `TYPESAFE_API_KEY` に入れる | 審査の一次判定（Jev） |
+| ChatGPT Plus のログイン | 先に ChatGPT の設定 →「セキュリティ」で、デバイスコードによるサインイン（Codex など）を有効にする。その後 `./lab chatgpt-login`、`./lab up` | Codex 用のモデル、審査の二次判定 |
 
 ## よく使うコマンド
 

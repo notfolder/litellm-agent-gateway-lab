@@ -268,8 +268,8 @@ def bootstrap(env: Env) -> None:
     キーの値は .env の固定値を使うので、DB を作り直しても同じキーが作り直される。
     既にあれば作らず、役割と MCP の権限だけを揃える。"""
     step("bootstrap 初期データ")
-    if not http_ok(f"{env.base_url}/health/liveliness"):
-        raise LabError(f"LiteLLM に接続できません（{env.base_url}）")
+    # ローリング更新の直後は、終了中の Pod に当たって一時的に失敗することがあるので、少し待つ
+    wait_until(60, f"LiteLLM への接続（{env.base_url}）", lambda: http_ok(f"{env.base_url}/health/liveliness"))
     if not env.has_users():
         warn("LAB_USER1_EMAIL が未設定なので、ユーザーとキーは作りません（試験はマスターキーで行えます）")
         return
@@ -317,7 +317,14 @@ def _q(**params: str) -> str:
 
 def chatgpt_login(env: Env) -> None:
     """chatgpt/ プロバイダのデバイスコードでのログイン（手作業。初回だけ）。
-    トークン（auth.json）は LAB_DATA_DIR/chatgpt に保存され、クラスタを作り直しても残る。"""
+    トークン（auth.json）は LAB_DATA_DIR/chatgpt に保存され、クラスタを作り直しても残る。
+
+    LiteLLM のログイン処理は、URL とコードを表示するだけでブラウザを開かない。ここで URL を拾って開く。
+    また、コードを要求した時刻だけが auth.json に残っていると、LiteLLM は 5 分間、新しいコードを出さずに
+    黙って待つ（2026-10-11 に確認）。トークンの無い auth.json は消してから始める。"""
+    import re
+    import subprocess
+
     step("chatgpt-login ChatGPT のログイン")
     token = env.chatgpt_token_file
     if env.has_chatgpt():
@@ -327,20 +334,36 @@ def chatgpt_login(env: Env) -> None:
         raise LabError("対話の操作が要ります。ターミナルで ./lab chatgpt-login を実行してください")
     image = load_image() if IMAGE_FILE.exists() else images(env)
     token.parent.mkdir(parents=True, exist_ok=True)
+    if token.exists():
+        token.unlink()  # トークンが入っていない（has_chatgpt が偽）ので、要求の時刻の記録だけ
+        info("前回のログインの途中の記録を消しました")
     sys.stderr.write(
-        "\nブラウザで表示された URL を開き、表示されたコードを入力して ChatGPT にサインインしてください。\n"
-        "（ChatGPT の設定の「セキュリティ」で、デバイスコードでのログインを有効にしておく必要があります）\n"
-        "コードは他人に見せないでください。\n\n")
+        "\nこの後ブラウザで ChatGPT のデバイスコードのページが開きます。ChatGPT Plus のアカウントで\n"
+        "サインインし、下に表示されるコード（XXXX-XXXXX の形）を入力してください。\n"
+        "（先に ChatGPT の設定 →「セキュリティ」で、Codex などのデバイスコードによるサインインを有効にしておく。\n"
+        " 無効のままだと、コードを入力した後に有効にするよう求められて止まります）\n"
+        "コードは他人に見せないでください。入力を待つ時間は最大 15 分です。\n\n")
     sys.stderr.flush()
-    # 端末をそのまま渡す（標準出力も端末に出す）
-    import subprocess
-    subprocess.run([
-        "docker", "run", "--rm", "-it", "-v", f"{token.parent}:/token", "-e", "CHATGPT_TOKEN_DIR=/token",
-        "--entrypoint", "python", image["local"], "-c",
+    proc = subprocess.Popen([
+        "docker", "run", "--rm", "-i", "-v", f"{token.parent}:/token", "-e", "CHATGPT_TOKEN_DIR=/token",
+        "-e", "PYTHONUNBUFFERED=1", "--entrypoint", "python", image["local"], "-c",
         "from litellm.llms.chatgpt.authenticator import Authenticator; Authenticator().get_access_token(); print('OK')",
-    ])
+    ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    opened = False
+    try:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            m = re.search(r"Visit (https://\S+)", line)
+            if m and not opened:
+                subprocess.run(["open", m.group(1)], check=False)
+                opened = True
+        proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+        raise
     if not env.has_chatgpt():
-        raise LabError("トークンが保存されませんでした")
+        raise LabError("トークンが保存されませんでした（もう一度 ./lab chatgpt-login を実行できます）")
     token.chmod(0o600)
     ok("ログインしました。./lab up を流すと、Codex 用のモデルと二次判定が有効になります")
 

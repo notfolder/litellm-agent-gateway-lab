@@ -57,7 +57,7 @@ class LitellmConfigTest(unittest.TestCase):
     def test_without_manual_setup(self):
         cfg = render.litellm_config(env(), has_chatgpt=False)
         models = self.models(cfg)
-        self.assertNotIn("gpt-5.3-codex", models)  # トークン無しで chatgpt/ を入れると起動が止まる
+        self.assertNotIn("gpt-5.6-terra", models)  # トークン無しで chatgpt/ を入れると起動が止まる
         self.assertEqual(models["review-judge"], "openai/fake-tools")
         self.assertNotIn("mcp_servers", cfg)
         self.assertFalse(cfg["guardrails"][0]["litellm_params"]["use_jev"])

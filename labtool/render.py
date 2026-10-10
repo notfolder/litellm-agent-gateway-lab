@@ -34,8 +34,8 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
       設定すると、LiteLLM が起動の途中でデバイスコードのログインを始めて止まるため（2026-10-11 に確認）。
       二次判定は試験用の偽 LLM（fake-llm）で代用する
     """
-    codex_model = env.get("LAB_CODEX_MODEL", "gpt-5.3-codex")
-    judge_model = env.get("LAB_JUDGE_MODEL", "gpt-5.1-codex-mini")
+    codex_model = env.get("LAB_CODEX_MODEL", "gpt-5.6-terra")
+    judge_model = env.get("LAB_JUDGE_MODEL", "gpt-5.6-luna")
     use_jev = env.has_jev() and env.get("LAB_USE_JEV", "true").lower() == "true"
 
     # Claude Code（Claude Max のトークンを転送する。api_key は書かない）
@@ -64,6 +64,9 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
                 "jev_threshold": float(env.get("LAB_JEV_THRESHOLD", "0.2")),
                 "judge_model": "review-judge",
                 "fail_open": False,
+                # 疎通確認（偽 LLM の fake-tools）は、結果が決まるように偽 LLM の審査官で判定する
+                "test_model": "fake-tools",
+                "test_judge_model": "fake-tools",
             },
         }],
     }
@@ -189,7 +192,7 @@ def client_files(env: Env, claude_key: str, codex_key: str, codex_home: Path) ->
                                       "headers": {"x-litellm-api-key": f"Bearer {claude_key}"}}
     files["mcp.json"] = json.dumps(mcp, indent=2) + "\n"
 
-    codex_model = env.get("LAB_CODEX_MODEL", "gpt-5.3-codex")
+    codex_model = env.get("LAB_CODEX_MODEL", "gpt-5.6-terra")
     toml = (
         "# 生成物（./lab clients）。手で編集しない\n"
         f'model = "{codex_model}"\n'

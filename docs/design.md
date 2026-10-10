@@ -494,6 +494,14 @@ flowchart TB
 | Codex の設定で MCP の要求に LiteLLM のキー（`x-litellm-api-key`）を付けていると、`codex mcp login` が「OAuth metadata discovery failed」で失敗する。キーがあると `GET /gmail/mcp` が 401 ではなく 200（SSE）を返し、Codex がそれをメタデータとして読もうとするため | `clients/codex-lab` は `mcp login` のときだけキーを外す |
 | サインイン後、ユーザー 1 のキーでは Gmail のツールが使え、サインインしていないユーザー 2 のキーは 401 になった（ユーザーごとのトークンの分離） | 疎通確認の「未サインインなら 401」は、サインインしないマスターキーで確かめるように変えた |
 | Codex（0.162.1）を試験用の偽 LLM（モデル名 `fake-tools`）で動かすと、Gmail の MCP のツールがモデルに渡されない（`codex mcp list` では enabled / OAuth）。未知のモデル名でのツールの扱いが原因とみているが、未確定 | ChatGPT のログインの後、本物のモデルで確かめる |
+| ChatGPT のデバイスコードでのログインは、アカウント側の設定で有効にしないと、コードを入力した後に「ChatGPT のセキュリティ設定で、Codex、Excel、PowerPoint、Word のデバイスコードによるサインインを有効にしてから、`codex login --device-auth` をもう一度実行してください」と出て止まる（2026-10-11 に確認）。また、LiteLLM のログイン処理は URL とコードを表示するだけでブラウザを開かず、コードを要求した時刻だけが `auth.json` に残っていると 5 分間は新しいコードを出さずに黙って待つ | ChatGPT の設定 →「セキュリティ」で、デバイスコードによるサインインを有効にしてから `./lab chatgpt-login` を実行する（文中の `codex login --device-auth` は Codex 本体向けの案内なので、この環境では `./lab chatgpt-login` をやり直す）。`./lab chatgpt-login` は、トークンの無い `auth.json` を消してから始め、表示された URL をブラウザで開く |
+| LiteLLM は MCP の経路（`/<サーバー名>/mcp`）へのセッション無しの GET に、終わらないイベントストリーム（200）を返す。Codex（0.162.1）は起動時にこの GET を送って応答を待ち続け、MCP サーバーを使えなくなる | 入口（Traefik）で、この GET だけを POST 専用の経路に置き換えて 405 を返す（`k8s/ingress.yaml`）。MCP の仕様では、サーバーはこの GET に 405 を返してよい。直した後、Codex は MCP につながり、ツール 7 個の一覧を取れた |
+| Codex は MCP の一覧を取れるようになったが、本物のモデル（gpt-5.6-terra）で「Gmail のラベルの数」を頼むと「Gmail にアクセスできない」と答える。Codex はコードを実行する形（`exec` のツール）でツールを探しており、Gmail のツールが見つかっていない様子。原因は未確定 | 調査中 |
+| `chatgpt/` で使えるモデル名は、ChatGPT のアカウントで決まる。`gpt-5.3-codex` は「ChatGPT のアカウントでは使えない」と拒否された。Codex 本体のモデル一覧（`~/.codex/models_cache.json`）にある名前なら使える | `.env` の既定を `LAB_CODEX_MODEL=gpt-5.6-terra`、`LAB_JUDGE_MODEL=gpt-5.6-luna` にした |
+| 二次判定が本物のモデルになると判定が揺れ、疎通確認（偽 LLM で危険な操作が止まるか）が決まらなくなる | ガードレールに `test_model` / `test_judge_model` を足し、試験用のモデル（`fake-tools`）への要求は偽 LLM の審査官だけで判定する（Jev も使わない） |
+| 本物の二次判定が、Codex がツールを探す操作（MCP のリソースの一覧）を「頼まれたツールではない」として止めることがあった（誤った拒否） | 審査のシナリオ試験（spec 6.2）で、誤った拒否の率として測る |
+| ローリング更新の直後に、終了中の Pod に当たって入口のヘルスチェックが一時的に失敗し、bootstrap の段階が止まった | bootstrap の接続の確認を、1 回ではなく最大 60 秒待つようにした |
+| TypeSafe は、組織の残高（クレジット）が無いと API キーを作れない | 手作業の準備に「Billing でクレジットを追加してからキーを作る」を足した。キーを入れた後、Codex のツールコールが Jev の一次判定（約 0.3 秒、確率 0.03 と 0.16）で判定されることを確かめた |
 | OrbStack が `~/Documents` 以下をコンテナに見せるには、macOS の「書類フォルダへのアクセス」の許可が要る。許可を求める画面が出ている間、`docker run` は止まる | 2026-10-11 に許可済み。構築スクリプトは `~/Documents` をコンテナに見せない（ビルドは Docker のビルドコンテキストで送る） |
 
 ### 試験用の偽 LLM（`tests/fake-llm`）
