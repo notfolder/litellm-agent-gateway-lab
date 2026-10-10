@@ -90,53 +90,53 @@ flowchart LR
 
 ```
 litellm-agent-gateway-lab/
-├── Makefile                      # 入口。make up / down / status / test-*
-├── .env.example                  # 必要な秘密情報の一覧（値は空）
+├── Makefile                      # 入口。make up / down / rebuild / status / upgrade / test-*
+├── .env.example                  # 設定と秘密情報の一覧（値は空。.env にコピーして使う）
 ├── .env                          # 実際の値（.gitignore 対象）
 ├── scripts/
-│   ├── lib.sh                    # 共通関数（ログ、待機、.env 読み込み、冪等チェック）
-│   ├── 00-preflight.sh           # 前提の確認（コマンド、OrbStack、SSD、.env の必須項目）
-│   ├── 10-cluster.sh             # k3d クラスタ作成、Traefik の設定
-│   ├── 20-images.sh              # カスタムイメージのビルドと k3d への取り込み
-│   ├── 30-secrets.sh             # .env から k8s Secret を作成
+│   ├── lib.sh                    # 共通関数（ログ、待機、.env、kapply、イメージの置き場）
+│   ├── 00-preflight.sh           # 前提の確認（コマンド、OrbStack、SSD、手作業の準備の状況）
+│   ├── 10-cluster.sh             # イメージの置き場 2 つ、k3d クラスタ、Traefik の設定
+│   ├── 20-images.sh              # 検証用 LiteLLM イメージのビルドと push
+│   ├── 30-secrets.sh             # .env の生成と k8s Secret
 │   ├── 40-datastores.sh          # PostgreSQL、Redis
-│   ├── 50-mcp.sh                 # google_workspace_mcp
-│   ├── 60-litellm.sh             # LiteLLM（Helm）、DB 移行、起動待ち
-│   ├── 70-bootstrap.sh           # 初期データ（キー、MCP 権限）の投入
-│   ├── 80-chatgpt-login.sh       # chatgpt/ のデバイスコードログイン（初回のみ）
+│   ├── 50-mcp.sh                 # 試験用の偽 LLM、google_workspace_mcp（Google の準備があるとき）
+│   ├── 60-litellm.sh             # プロキシ設定の生成、LiteLLM（Helm）、入口
+│   ├── render-litellm-config.py  # .env からプロキシ設定（config.yaml）を作る
+│   ├── 70-bootstrap.sh           # ユーザーと固定値のキー
+│   ├── 80-chatgpt-login.sh       # chatgpt/ のデバイスコードログイン（手作業。初回のみ）
 │   ├── 90-clients.sh             # Claude Code / Codex の設定を生成
-│   ├── down.sh                   # クラスタ削除
-│   └── status.sh                 # 状態表示
+│   ├── upgrade.sh / down.sh / clean-all.sh / status.sh / test-unit.sh
 ├── k8s/
-│   ├── k3d-config.yaml           # クラスタ定義（ノード数、ポート、k3s イメージ、ボリューム）
+│   ├── k3d-config.yaml           # クラスタ定義（ノード数、ポート、k3s の版、ボリューム、レジストリ）
 │   ├── traefik-config.yaml       # HelmChartConfig（タイムアウト）
 │   ├── namespace.yaml
-│   ├── middleware-block-passthrough.yaml   # パススルー経路の遮断
-│   ├── postgres.yaml             # StatefulSet + Service + PVC
-│   ├── redis.yaml                # Deployment + Service
-│   └── workspace-mcp.yaml        # Deployment + Service（クラスタ内のみ）
+│   ├── ingress.yaml              # 入口（IngressRoute）とパススルー経路の遮断（Middleware）
+│   ├── postgres.yaml / redis.yaml
+│   ├── workspace-mcp.yaml        # google_workspace_mcp（クラスタ内のみ）
+│   └── fake-llm.yaml             # 試験用の偽 LLM
 ├── litellm/
-│   ├── Dockerfile                # FROM litellm-database:v1.104.2 + ガードレール
+│   ├── Dockerfile                # 公式イメージ + ガードレール（ビルド時に単体テスト）
 │   ├── values.yaml               # Helm の値
-│   ├── config.yaml               # proxy_config（values.yaml に埋め込む元）
 │   └── guardrails/
-│       ├── tool_call_review.py   # 審査ガードレール本体
-│       ├── transcript.py         # 判定入力の抽出（形式ごと）
-│       └── tests/                # 単体テスト（pytest、イメージ内で実行）
+│       ├── tool_call_review.py   # 審査ガードレール本体（判定、差し替え、ログ）
+│       ├── transcript.py         # 判定入力の抽出（形式ごと、モデルを呼ばない）
+│       └── tests/                # 単体テスト（unittest）
 ├── clients/
-│   ├── claude-lab                # Claude Code 起動用ラッパー（環境変数を設定して claude を実行）
-│   ├── mcp.json.tmpl             # Claude Code 用 MCP 設定
-│   └── codex-config.toml.tmpl    # Codex 用設定
+│   ├── claude-lab                # Claude Code の起動ラッパー
+│   └── codex-lab                 # Codex の起動ラッパー（CODEX_HOME=.codex-lab）
 ├── tests/
-│   ├── smoke/                    # 疎通確認（curl）
-│   ├── review-scenarios/         # spec 6.2 のシナリオ（使い捨てリポジトリを作る）
-│   └── load/                     # k6 の負荷試験
+│   ├── fake-llm/server.py        # 試験用の偽 LLM（ツールコールと審査官の役）
+│   ├── smoke/smoke.sh            # 疎通確認（19 項目）
+│   ├── idempotency.sh            # 冪等性の試験
+│   ├── load/                     # k6 の負荷試験
+│   └── review-scenarios/         # spec 6.2 のシナリオ試験（使い捨てリポジトリ、判定ログの集計）
 └── docs/
-    ├── spec.md
-    └── design.md
+    ├── spec.md / design.md
+    └── setup-google.md           # Google Cloud の手作業の手順
 ```
 
-- `.env` とクライアント設定の生成物（`.codex-lab/`、`clients/out/`）は `.gitignore` に入れる
+- `.env`、クライアント設定の生成物（`.codex-lab/`、`clients/out/`）、`.build/` は `.gitignore` に入れる
 - スクリプトはすべて bash（`set -euo pipefail`）。追加の実行環境を要らなくするため
 
 ---
@@ -175,7 +175,7 @@ flowchart TB
 | k3s イメージ | `rancher/k3s:v1.35.5-k3s1` |
 | ポート | `8080:80@loadbalancer`（Traefik の HTTP） |
 | ボリューム | `${LAB_DATA_DIR}/chatgpt:/var/lib/lab/chatgpt@all`（chatgpt/ のトークン共有用。全ノードに同じホストのフォルダを見せる） |
-| イメージの取り込み | `k3d image import`（レジストリは立てない） |
+| イメージの置き場 | クラスタとは別に k3d のレジストリを 2 つ立てる（15 章）。自作イメージ用（`k3d-litellm-registry.localhost`）と、Docker Hub の中継キャッシュ（`k3d-dockerio-cache.localhost`）。`make down` では消さない |
 
 `LAB_DATA_DIR` の既定は `/Volumes/SSD/litellm-lab`。
 
@@ -212,7 +212,7 @@ COPY guardrails/ /app/guardrails/
 ENV PYTHONPATH=/app/guardrails
 ```
 
-`20-images.sh` で `litellm-lab:<git の短いハッシュ>` としてビルドし、`k3d image import` で取り込む。Helm の `image.tag` にそのタグを渡す。
+`20-images.sh` で `litellm-lab:<中身のハッシュ>` としてビルドし、自作イメージ用のレジストリに push する。Helm の `image.repository` / `image.tag` にはクラスタ内から見た名前（`k3d-litellm-registry.localhost:5000/litellm-lab`）を渡す。
 
 ### 6.2 Helm の値（`litellm/values.yaml` の要点）
 
@@ -457,7 +457,7 @@ flowchart TB
 | 00 preflight | — | 毎回確かめるだけ（変更しない） |
 | 10 cluster | `k3d cluster list -o json` にクラスタがあり、全ノードが Ready | 飛ばす。設定（ノード数、k3s の版、ポート）が `k3d-config.yaml` と違えば、作り直しを促して止まる |
 | 10 Traefik の設定 | `kubectl apply` | 差分だけ反映 |
-| 20 images | イメージのタグを `litellm/` 以下の内容のハッシュにし、同じタグがローカルにあればビルドを飛ばす。ノードにそのタグがあるかを `crictl images` で確かめ、なければ `k3d image import` | 中身が変わったときだけビルドと取り込み |
+| 20 images | イメージのタグを `litellm/` 以下の内容のハッシュにし、同じタグがローカルにあればビルドを飛ばす。レジストリにそのタグのマニフェストがあれば push も飛ばす | 中身が変わったときだけビルドと push |
 | 30 secrets | `.env` の各値。空なら生成して `.env` に書き足す（既存の値は決して上書きしない） | `kubectl create secret … --dry-run=client -o yaml \| kubectl apply -f -` で差分だけ反映 |
 | 40 datastores | `kubectl apply` | 差分だけ反映。`rollout status` で Ready を待つ |
 | 50 mcp | `kubectl apply` | 同上。`/health` を待つ |
@@ -484,4 +484,34 @@ flowchart TB
 - `make up` を 2 回続けて流し、2 回目で何も変わらないこと（Helm のリビジョンが増えない、Pod が再起動しない）を確かめる
 - 各段階の途中で止め（`Ctrl-C`）、もう一度 `make up` で最後まで進むことを確かめる
 - `make rebuild` の後、生成済みのクライアント設定のまま Claude Code と Codex がつながることを確かめる（キーの固定値の確認）
+
+---
+
+## 15. 実装で分かったこと（2026-10-11）
+
+実装と試験の中で分かり、設計を変えたことをまとめる。
+
+| 分かったこと | 対応 |
+|---|---|
+| `k3d image import` は、複数アーキテクチャのイメージ（`docker save` に arm64 以外の参照が残る）で「content digest not found」になる。しかも最後に「成功」と表示する | 取り込みをやめ、レジストリ方式にした。自作イメージは `docker push --platform linux/arm64` で入れ、外部イメージは Docker Hub の中継キャッシュ経由でノードが取る。キャッシュはクラスタを消しても残るので、作り直しの 2 回目以降が速い |
+| `chatgpt/` のモデルをトークン無しで設定に入れると、LiteLLM が起動の途中でデバイスコードのログインを始めて止まる（起動の確認に通らず、再起動を繰り返す）。途中で止まると、要求時刻だけの `auth.json` が書き残される | トークン（`refresh_token` か `access_token`）があるときだけ、Codex 用のモデルと二次判定の `chatgpt/` を設定に入れる。ログインは `make chatgpt-login` で、クラスタの外の 1 回限りのコンテナで行う |
+| post_call のフックに渡る `data` には `call_type` が入っていない | 形式（Responses / Chat Completions / Anthropic Messages）は、`user_api_key_dict.request_route` などの経路から判定する |
+| ストリーミングでガードレールに届く形は形式ごとに違う。Responses はイベントのオブジェクト、Chat Completions は `ModelResponseStream`、Anthropic Messages は SSE のバイト列 | 形式ごとの処理（`ResponsesStream` / `ChatStream` / `AnthropicStream`）に分けた。ツールコールの始まりまでは素通しで流し、そこから先を溜めて判定する |
+| Helm チャートは、`migrationJob` を有効にすると本体の Pod に `DISABLE_SCHEMA_UPDATE=true` を自分で入れる。`envVars` で重ねて指定すると、重複でインストールが失敗する | `envVars` から外した |
+| `helm --wait` を途中で止めると、リリースが pending のまま残り、次の helm が失敗する | `60-litellm.sh` の冒頭で、pending-install なら削除、pending-upgrade なら直前の版に戻す（戻せなければ削除）、failed なら入れ直す |
+| `kubectl apply` は、中身が同じでも `configured` と出ることがある | `kubectl diff` で差分があるときだけ apply する（`kapply`）。冪等性の試験で「変化なし」を判定できるようにするため |
+| OrbStack が `~/Documents` 以下をコンテナに見せるには、macOS の「書類フォルダへのアクセス」の許可が要る。許可を求める画面が出ている間、`docker run` は止まる | 2026-10-11 に許可済み。構築スクリプトは `~/Documents` をコンテナに見せない（ビルドは Docker のビルドコンテキストで送る） |
+
+### 試験用の偽 LLM（`tests/fake-llm`）
+
+ChatGPT や Claude の利用枠を使わずに審査を試すため、OpenAI 互換の偽 LLM を足した（クラスタ内の `fake-llm`、モデル名 `fake-tools`）。
+
+- ユーザーの発言に `TOOL:<名前>:<引数の JSON>` があれば、そのツールコールを返す（Chat Completions と Responses API、ストリーミングあり・なし）
+- 審査の依頼（`[[tool-call-review]]` の印が付いたもの）には、危険な語（`--delete`、`rm -rf` など）を含むかどうかで block / allow の JSON を返す
+- ChatGPT のトークンが無いあいだは、二次判定（`review-judge`）もこの偽 LLM を使う
+
+### 審査の試験の結果（2026-10-11、偽 LLM で実施）
+
+3 形式 × ストリーミングあり・なしのすべてで、危険なツールコールは「拒否: 理由」に差し替わり、安全なものはそのまま通った。
+Claude Code の User-Agent の Anthropic 形式は審査されずに素通りし、User-Agent が空のものは審査された。
 

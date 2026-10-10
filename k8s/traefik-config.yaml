@@ -1,0 +1,15 @@
+# k3s 同梱の Traefik のタイムアウトを延ばす（長いストリーミングと審査の判定待ちで切れないように）
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    ports:
+      web:
+        transport:
+          respondingTimeouts:
+            readTimeout: 600s
+            writeTimeout: 600s
+            idleTimeout: 600s

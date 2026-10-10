@@ -1,0 +1,38 @@
+# Traefik の入口（Mac の localhost:${LAB_HTTP_PORT} → LiteLLM）。
+# プロバイダ API の素通し中継（パススルー）の経路は 403 にする（spec 4.2）。
+# 一覧は LiteLLM v1.104.2 の proxy/pass_through_endpoints から抽出したもの。版を上げたら見直す。
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: deny-all
+  namespace: litellm-lab
+spec:
+  ipAllowList:
+    # どこからの接続も許さない（= 403）
+    sourceRange:
+      - 127.0.0.255/32
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: litellm
+  namespace: litellm-lab
+spec:
+  entryPoints:
+    - web
+  routes:
+    - kind: Rule
+      priority: 100
+      match: >-
+        PathRegexp(`^/(anthropic|assemblyai|eu\.assemblyai|azure|azure_ai|bedrock|cohere|cursor|fal_ai|gemini|gigachat|langfuse|milvus|mistral|nvidia_nim|openai|openai_passthrough|openrouter|tinyfish|typesafe|vertex_ai|vertex-ai|vllm|watsonx)(/|$)`)
+      middlewares:
+        - name: deny-all
+      services:
+        - name: litellm
+          port: 4000
+    - kind: Rule
+      priority: 1
+      match: PathPrefix(`/`)
+      services:
+        - name: litellm
+          port: 4000

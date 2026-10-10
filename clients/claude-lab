@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# 検証用の LiteLLM を通して Claude Code を起動する。普段の設定は書き換えない。
+# 認証は普段どおり Claude Max のサインインを使う（ANTHROPIC_API_KEY などは設定しない）
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+[[ -f "$here/out/claude.env" ]] || { echo "clients/out/claude.env がありません。make clients を実行してください" >&2; exit 1; }
+# shellcheck disable=SC1091
+source "$here/out/claude.env"
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+exec claude --settings "$here/out/claude-settings.json" --mcp-config "$here/out/mcp.json" "$@"

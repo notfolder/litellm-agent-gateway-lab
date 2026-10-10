@@ -1,0 +1,76 @@
+# LiteLLM 公式 Helm チャート（oci://ghcr.io/berriai/litellm-helm 1.104.2）の値。
+# image.repository / image.tag / podAnnotations.configHash は scripts/60-litellm.sh が --set で渡す。
+
+replicaCount: 2
+numWorkers: 1            # Kubernetes では 1 Pod 1 ワーカーが推奨
+
+image:
+  pullPolicy: IfNotPresent
+
+# プロキシの設定は、スクリプトが生成した ConfigMap（litellm-config）を使う
+proxyConfigMap:
+  create: false
+  name: litellm-config
+  key: config.yaml
+
+masterkeySecretName: litellm-secrets
+masterkeySecretKey: LITELLM_MASTER_KEY
+
+environmentSecrets:
+  - litellm-secrets
+
+envVars:
+  LITELLM_MODE: PRODUCTION
+  # DISABLE_SCHEMA_UPDATE はチャートが設定する（migrationJob を有効にすると本体の Pod は true、Job は false）
+  PROXY_BASE_URL: http://localhost:8080
+  CHATGPT_TOKEN_DIR: /var/lib/lab/chatgpt
+  UI_USERNAME: admin                   # SSO が無いときの管理画面のログイン（パスワードはマスターキー）
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4                       # OrbStack のメモリ上限 8 GB に収める
+  targetCPUUtilizationPercentage: 60
+
+# 起動に時間がかかる（DB 接続と Prisma）ので、startupProbe は既定（最大 300 秒）のまま
+
+# chatgpt/ のトークンを全 Pod で共有する（k3d が全ノードに同じホストのフォルダを見せている）
+volumes:
+  - name: chatgpt-token
+    hostPath:
+      path: /var/lib/lab/chatgpt
+      type: DirectoryOrCreate
+volumeMounts:
+  - name: chatgpt-token
+    mountPath: /var/lib/lab/chatgpt
+
+db:
+  useExisting: true
+  deployStandalone: false
+  endpoint: postgres
+  database: litellm
+  secret:
+    name: postgres
+    usernameKey: username
+    passwordKey: password
+
+redis:
+  enabled: false
+
+migrationJob:
+  enabled: true
+  hooks:
+    argocd:
+      enabled: false
+    helm:
+      enabled: true                    # 素の helm で、install / upgrade の前に DB 移行を流す
+
+ingress:
+  enabled: false                       # k8s/ingress.yaml（Traefik）を使う

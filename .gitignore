@@ -1,0 +1,15 @@
+# 秘密情報（値は .env.example を参照）
+.env
+
+# スクリプトの生成物
+.build/
+.codex-lab/
+clients/out/
+
+# セッションの引き継ぎ記録（公開しない）
+.history/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/

@@ -1,6 +1,6 @@
 # litellm-agent-gateway-lab 仕様書
 
-最終更新: 2026-10-11
+最終更新: 2026-10-11（実装の結果を反映）
 
 LiteLLM を社内 AI ゲートウェイとして使い、次の 2 つを実現するための設計と検証計画をまとめたものです。あわせて、複数レプリカ構成で動くかを Mac 1 台の Kubernetes で検証します（5 章、6.3 節）。
 
@@ -183,7 +183,7 @@ tool_timeout_sec = 180
 
 審査ガードレールは全リクエストに常時適用（`default_on: true`）し、冒頭で分岐する。
 
-- **素通し**: Anthropic 形式（`/v1/messages`）**かつ** User-Agent が Claude Code（`claude-cli/` 前方一致）
+- **素通し**: Anthropic 形式（`/v1/messages`）**かつ** User-Agent が Claude Code（`claude-cli/` または `claude-code/` の前方一致。LiteLLM 組み込みの判定 `is_claude_code_user_agent` を使う）
 - **審査対象**: それ以外すべて（Codex の `/v1/responses`、Chat Completions、Claude Code 以外の Anthropic 形式クライアント、User-Agent 不明）
 - 判別できないリクエスト（User-Agent が空など）は審査側に倒す
 - 素通し件数をクライアント別にログに残す
@@ -365,6 +365,7 @@ sequenceDiagram
 3. データアクセスにスコープを追加する
    - `openid`
    - `https://www.googleapis.com/auth/userinfo.email`（MCP サーバーがトークンの持ち主を確かめるのに使う）
+   - `https://www.googleapis.com/auth/userinfo.profile`（MCP サーバーが要求する。2026-10-11 に確認）
    - `https://www.googleapis.com/auth/gmail.readonly`
 4. OAuth クライアント ID を「ウェブ アプリケーション」で作成し、承認済みのリダイレクト URI に LiteLLM のコールバックを登録する
    - `http://localhost:8080/callback`（`<PROXY_BASE_URL>/callback`）
@@ -382,7 +383,7 @@ LiteLLM と MCP サーバーは同じ OAuth クライアントを使う。
 | `MCP_ENABLE_OAUTH21` | `true` | OAuth 2.1 の複数ユーザー対応 |
 | `EXTERNAL_OAUTH21_PROVIDER` | `true` | 外部で取得したトークンを受け取り、確認だけを行う |
 | `WORKSPACE_MCP_STATELESS_MODE` | `true` | ディスクに書かない（複数レプリカでも状態を持たない） |
-| `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` | k8s の Secret から渡す | LiteLLM と同じクライアント |
+| `GOOGLE_OAUTH_CLIENT_ID` / `GOOGLE_OAUTH_CLIENT_SECRET` | k8s の Secret から渡す | LiteLLM と同じクライアント。シークレットが無いと起動しない（2026-10-11 に確認） |
 | `WORKSPACE_MCP_TOKEN_VALIDATION_CACHE_TTL` | 既定（0）のまま | トークン確認の結果をキャッシュしない |
 
 #### LiteLLM の設定
@@ -401,6 +402,7 @@ mcp_servers:
     scopes:
       - "openid"
       - "https://www.googleapis.com/auth/userinfo.email"
+      - "https://www.googleapis.com/auth/userinfo.profile"
       - "https://www.googleapis.com/auth/gmail.readonly"
 ```
 

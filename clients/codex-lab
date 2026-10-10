@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# 検証用の LiteLLM を通して Codex を起動する。CODEX_HOME を .codex-lab に分けるので、普段の ~/.codex は使わない。
+# Gmail の MCP を初めて使うときは、先に: clients/codex-lab mcp login gmail
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+[[ -f "$here/out/codex.env" ]] || { echo "clients/out/codex.env がありません。make clients を実行してください" >&2; exit 1; }
+# shellcheck disable=SC1091
+source "$here/out/codex.env"
+exec codex "$@"

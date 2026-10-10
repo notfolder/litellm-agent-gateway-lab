@@ -1,0 +1,37 @@
+# k3d のクラスタ定義。scripts/10-cluster.sh が ${...} を置き換えて使う。
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: litellm
+servers: 1
+agents: 2
+image: ${K3S_IMAGE}
+ports:
+  - port: ${LAB_HTTP_PORT}:80
+    nodeFilters:
+      - loadbalancer
+volumes:
+  # chatgpt/ のトークンを全ノードで共有する（Pod からは hostPath で見る）
+  - volume: ${LAB_DATA_DIR}/chatgpt:/var/lib/lab/chatgpt
+    nodeFilters:
+      - server:*
+      - agent:*
+# イメージの置き場（どちらもクラスタとは別に作り、クラスタを消しても残す）
+# - k3d-${LAB_REGISTRY_NAME}: 自作イメージ（検証用 LiteLLM）を push する
+# - k3d-${LAB_CACHE_NAME}: Docker Hub の取得を中継してキャッシュする（k3s 自身のイメージも含む）
+registries:
+  use:
+    - k3d-${LAB_REGISTRY_NAME}:5000
+    - k3d-${LAB_CACHE_NAME}:5000
+  config: |
+    mirrors:
+      "docker.io":
+        endpoint:
+          - http://k3d-${LAB_CACHE_NAME}:5000
+options:
+  k3d:
+    wait: true
+    timeout: "300s"
+  kubeconfig:
+    updateDefaultKubeconfig: true
+    switchCurrentContext: false
