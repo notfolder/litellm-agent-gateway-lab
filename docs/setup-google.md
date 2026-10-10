@@ -62,10 +62,21 @@ LAB_USER2_EMAIL=another@gmail.com
 
 ## 5. サインイン
 
-| クライアント | 手順 |
+| 対象 | 手順 |
 |---|---|
 | 管理画面 | `http://localhost:8080/ui` を開き、Google でログイン（`LAB_USER1_EMAIL` は管理者になる） |
-| Claude Code | `clients/claude-lab` を起動し、`/mcp` から `gmail` を選んで認証する |
-| Codex | `clients/codex-lab mcp login gmail` |
+| Gmail の MCP（Codex） | `clients/codex-lab mcp login gmail`。表示された URL をブラウザで開き、LiteLLM の画面で「Finish connecting」を押す。Google のサインインと権限の許可を求められたら、キーの持ち主と同じアカウントで許可する |
+| Gmail の MCP（Claude Code） | `clients/claude-lab` を起動し、`/mcp` から `gmail` を選んで認証する |
 
-Gmail にサインインするアカウントは、LiteLLM のユーザー（キーの持ち主）と同じメールアドレスでなければ拒否されます（`oauth_identity_binding` の enforce）。
+- Gmail にサインインするアカウントは、LiteLLM のユーザー（キーの持ち主）と同じメールアドレスでなければ拒否されます（`oauth_identity_binding` の enforce）
+- 管理画面の「MCP Servers」→「My Connections」→「Connect」は使えません。enforce の設定では、本人の確認ができない経路として LiteLLM が閉じています（403）
+- `clients/codex-lab` は `mcp login` のときだけ LiteLLM のキーを外して Codex を起動します。キーが付いていると LiteLLM が 401（サインインの要求）を返さず、Codex がサインインの手順を見つけられないためです
+- サインインの結果は、ユーザーごとに LiteLLM の DB に保存されます。`./lab rebuild` で DB を作り直すと消えるので、サインインをやり直します
+
+## 6. 確認（2026-10-11 に実施）
+
+| 確認 | 結果 |
+|---|---|
+| 管理画面に Google でログインする | ユーザー 1（`LAB_USER1_EMAIL`）が管理者として入れた |
+| ユーザー 1 のキーで Gmail のツールを使う（サインイン後） | ツール 7 個が見え、ラベルの一覧を取れた |
+| サインインしていないユーザー 2 のキーで同じことをする | 401 で拒否された（ユーザー 1 のサインインは使えない） |

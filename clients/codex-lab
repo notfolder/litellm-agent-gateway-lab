@@ -6,4 +6,9 @@ here="$(cd "$(dirname "$0")" && pwd)"
 [[ -f "$here/out/codex.env" ]] || { echo "clients/out/codex.env がありません。./lab clients を実行してください" >&2; exit 1; }
 # shellcheck disable=SC1091
 source "$here/out/codex.env"
+# mcp login のときは LiteLLM のキーを付けない。キーが付いていると、LiteLLM が 401（サインインの要求）ではなく
+# 通常の応答を返すので、Codex がサインインの手順を見つけられずに失敗する（2026-10-11 に確認）
+if [[ "${1:-}" == "mcp" && "${2:-}" == "login" ]]; then
+  unset LITELLM_MCP_AUTH
+fi
 exec codex "$@"

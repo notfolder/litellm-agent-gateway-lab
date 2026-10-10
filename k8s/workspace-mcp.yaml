@@ -27,6 +27,9 @@ spec:
       labels:
         app: workspace-mcp
     spec:
+      # Service 名から作られる環境変数 WORKSPACE_MCP_PORT=tcp://… を、サーバーが自分の待ち受け
+      # ポートとして読んでしまい起動に失敗する（2026-10-11 に確認）。Service の環境変数を入れない
+      enableServiceLinks: false
       containers:
         - name: workspace-mcp
           image: ghcr.io/taylorwilsdon/google_workspace_mcp:2.1.0

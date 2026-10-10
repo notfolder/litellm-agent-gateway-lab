@@ -81,8 +81,9 @@ def smoke(env: Env) -> None:
                            headers={"Authorization": f"Bearer {env.get('LAB_KEY_USER1_CODEX')}"},
                            body={"model": "fake-tools", "messages": [{"role": "user", "content": "hi"}]}).status == 200)
     if env.has_google():
+        # マスターキーの持ち主は Google にサインインしないので、検証ユーザーのサインインの有無に関係なく 401 になる
         check("Gmail の MCP は未サインインなら 401", lambda: http("POST", f"{base}/gmail/mcp", headers={
-            "x-litellm-api-key": f"Bearer {env.get('LAB_KEY_USER1_CLAUDE') or key}",
+            "x-litellm-api-key": f"Bearer {key}",
             "accept": "application/json, text/event-stream",
         }, body={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).status == 401)
 

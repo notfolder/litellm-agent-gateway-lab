@@ -489,6 +489,11 @@ flowchart TB
 | Helm チャートは、`migrationJob` を有効にすると本体の Pod に `DISABLE_SCHEMA_UPDATE=true` を自分で入れる。`envVars` で重ねて指定すると、重複でインストールが失敗する | `envVars` から外した |
 | `helm --wait` を途中で止めると、リリースが pending のまま残り、次の helm が失敗する | `./lab litellm` の冒頭で、pending-install なら削除、pending-upgrade なら直前の版に戻す（戻せなければ削除）、failed なら入れ直す |
 | `kubectl apply` は、中身が同じでも `configured` と出ることがある | `kubectl diff` で差分があるときだけ apply する（`kapply`）。冪等性の試験で「変化なし」を判定できるようにするため |
+| Kubernetes は Service ごとに `<名前>_PORT=tcp://…` の環境変数を Pod に入れる。google_workspace_mcp は `WORKSPACE_MCP_PORT` を自分の待ち受けポートとして読むので、Service 名が `workspace-mcp` だと起動に失敗する（Docker 単体での起動確認では起きなかった） | Pod に `enableServiceLinks: false` を付けて、Service の環境変数を入れない |
+| 管理画面の「Connect」で Gmail にサインインすると、Google のトークンの交換までは通るが、保存の段階で 403（`oauth_identity_binding_enforced`）になる。enforce の設定では、本人を確かめられない保存の経路を LiteLLM が閉じている（仕様） | サインインは MCP クライアント（Codex の `mcp login`、Claude Code の `/mcp`）からゲートウェイの OAuth の手順で行う。`docs/setup-google.md` の 5 章 |
+| Codex の設定で MCP の要求に LiteLLM のキー（`x-litellm-api-key`）を付けていると、`codex mcp login` が「OAuth metadata discovery failed」で失敗する。キーがあると `GET /gmail/mcp` が 401 ではなく 200（SSE）を返し、Codex がそれをメタデータとして読もうとするため | `clients/codex-lab` は `mcp login` のときだけキーを外す |
+| サインイン後、ユーザー 1 のキーでは Gmail のツールが使え、サインインしていないユーザー 2 のキーは 401 になった（ユーザーごとのトークンの分離） | 疎通確認の「未サインインなら 401」は、サインインしないマスターキーで確かめるように変えた |
+| Codex（0.162.1）を試験用の偽 LLM（モデル名 `fake-tools`）で動かすと、Gmail の MCP のツールがモデルに渡されない（`codex mcp list` では enabled / OAuth）。未知のモデル名でのツールの扱いが原因とみているが、未確定 | ChatGPT のログインの後、本物のモデルで確かめる |
 | OrbStack が `~/Documents` 以下をコンテナに見せるには、macOS の「書類フォルダへのアクセス」の許可が要る。許可を求める画面が出ている間、`docker run` は止まる | 2026-10-11 に許可済み。構築スクリプトは `~/Documents` をコンテナに見せない（ビルドは Docker のビルドコンテキストで送る） |
 
 ### 試験用の偽 LLM（`tests/fake-llm`）

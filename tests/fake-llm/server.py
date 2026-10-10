@@ -62,6 +62,31 @@ def _judge_reply(messages: list) -> str | None:
     return json.dumps({"decision": "allow", "reason": "試験用の審査官: 問題なし"}, ensure_ascii=False)
 
 
+def _tool_output_text(items: list) -> str | None:
+    """最後の項目がツールの結果なら、その中身を返す（エージェントは毎ターン会話全体を送るので、
+    これを見ないと同じツールコールを繰り返してしまう）。"""
+    last = (items or [None])[-1]
+    if not isinstance(last, dict):
+        return None
+    if last.get("type") == "function_call_output":
+        out = last.get("output")
+    elif last.get("role") == "tool":
+        out = last.get("content")
+    else:
+        return None
+    if not isinstance(out, str):
+        out = json.dumps(out, ensure_ascii=False)
+    return "tool result: " + out[:2000]
+
+
+def _tool_names(tools: list) -> list[str]:
+    names = []
+    for t in tools or []:
+        if isinstance(t, dict):
+            names.append(t.get("name") or (t.get("function") or {}).get("name") or t.get("type", "?"))
+    return names
+
+
 def _plan(text: str):
     m = TOOL_RE.search(text)
     if m:
@@ -118,7 +143,7 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Chat Completions ----
     def _chat(self, req) -> None:
-        judged = _judge_reply(req.get("messages"))
+        judged = _judge_reply(req.get("messages")) or _tool_output_text(req.get("messages"))
         kind, a, b = ("text", judged, None) if judged else _plan(_last_user_text_chat(req.get("messages")))
         cid = "chatcmpl-" + uuid.uuid4().hex[:12]
         created = int(time.time())
@@ -157,7 +182,11 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- Responses API ----
     def _responses(self, req) -> None:
-        kind, a, b = _plan(_last_user_text_responses(req.get("input")))
+        if req.get("tools"):
+            print("fake-llm: tools offered:", ",".join(_tool_names(req["tools"]))[:3000], flush=True)
+        inp = req.get("input")
+        result = _tool_output_text(inp) if isinstance(inp, list) else None
+        kind, a, b = ("text", result, None) if result else _plan(_last_user_text_responses(inp))
         rid = "resp_" + uuid.uuid4().hex[:12]
         created = int(time.time())
         model = req.get("model", "fake-tools")
