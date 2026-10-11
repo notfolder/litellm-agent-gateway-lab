@@ -39,7 +39,7 @@ spec:
                   valueFrom:
                     secretKeyRef: { name: audit-compactor-s3, key: AUDIT_S3_SECRET_KEY }
                 - name: AUDIT_DUCKDB_MEMORY
-                  value: 768MB
+                  value: 512MB
               resources:
                 requests: { cpu: 100m, memory: 256Mi }
                 limits: { memory: 1Gi }

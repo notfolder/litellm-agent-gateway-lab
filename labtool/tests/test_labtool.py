@@ -240,5 +240,31 @@ class RedisSettingsTest(unittest.TestCase):
         self.assertEqual(data["REDIS_SENTINEL_PASSWORD"], "s")
 
 
+class PricingAndPinningTest(unittest.TestCase):
+    def test_price_env_names_are_readable_from_env_file(self):
+        self.assertEqual(render.price_env_prefix("review-judge"), "LAB_PRICE_REVIEW_JUDGE")
+        self.assertEqual(render.price_env_prefix("gpt-5.6-terra"), "LAB_PRICE_GPT_5_6_TERRA")
+        self.assertIn("LAB_PRICE_GPT_5_6_TERRA_IN", parse_env("LAB_PRICE_GPT_5_6_TERRA_IN=3\n"))
+
+    def test_model_prices_default_and_override(self):
+        p = render.model_prices(env(), "gpt-5.6-terra", "gpt-5.6-terra")
+        self.assertAlmostEqual(p["input_cost_per_token"], 2.0e-6)
+        p = render.model_prices(env(LAB_PRICE_REVIEW_JUDGE_IN="1", LAB_PRICE_REVIEW_JUDGE_OUT="2",
+                                    LAB_PRICE_REVIEW_JUDGE_CACHE_READ="0.1"), "review-judge", "unknown")
+        self.assertAlmostEqual(p["output_cost_per_token"], 2.0e-6)
+        self.assertIsNone(render.model_prices(env(), "x", "unknown"))
+        cfg = render.litellm_config(env(), has_chatgpt=True)
+        terra = next(m for m in cfg["model_list"] if m["model_name"] == "gpt-5.6-terra")
+        self.assertIn("model_info", terra)
+        self.assertEqual(cfg["litellm_settings"]["callbacks"], ["audit_log.audit_logger_instance"])
+        self.assertTrue(cfg["general_settings"]["disable_spend_logs"])
+
+    def test_pin_deployments(self):
+        text = "kind: Service\nmetadata: {name: s}\n---\nkind: Deployment\nmetadata: {name: d}\nspec:\n  template:\n    spec: {}\n"
+        docs = list(yaml.safe_load_all(render.pin_deployments(text, {"a": "b"})))
+        self.assertEqual(docs[1]["spec"]["template"]["spec"]["nodeSelector"], {"a": "b"})
+        self.assertNotIn("spec", docs[0])
+
+
 if __name__ == "__main__":
     unittest.main()

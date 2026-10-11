@@ -36,9 +36,11 @@ spec:
   instances: 3
   # 止めるときの待ちに上限を付ける。既定（stopDelay 1800 秒、switchoverDelay 3600 秒）のままだと、消した primary の
   # Pod が Pooler の接続が切れるのを待ち続け、30 分近く Terminating のまま残った（2026-10-12 に確認）
+  # switchoverDelay を 5 秒まで縮めると、計画的な切り替えで失敗が増えた（20 秒と PgBouncer の早いつなぎ直しで、
+  # 計画的な切り替えも primary の Pod の削除も失敗 0 件。2026-10-12 の実測）
   stopDelay: 120
-  smartShutdownTimeout: 15
-  switchoverDelay: 60
+  smartShutdownTimeout: 5
+  switchoverDelay: 20
   # オペレーターの既定は PostgreSQL 18 なので明示する。Barman Cloud Plugin は minimal か standard を推奨
   imageName: ghcr.io/cloudnative-pg/postgresql:17.11-minimal-trixie
   postgresql:
@@ -87,6 +89,9 @@ spec:
     parameters:
       max_client_conn: "1000"
       default_pool_size: "40"
+      # primary が替わったとき、つなぎ直しを早める（既定は失敗後 15 秒待つ、接続の確立を 15 秒待つ）
+      server_login_retry: "1"
+      server_connect_timeout: "3"
       # LiteLLM の Prisma 5.4.2 は pgbouncer=true でも問い合わせごとに準備し DEALLOCATE ALL を送る。
       # PgBouncer の準備済みの問い合わせの機能と組み合わせると失敗するので（prisma#21799）、使わない
       max_prepared_statements: "0"
@@ -97,15 +102,23 @@ spec:
           resources:
             requests: { cpu: 20m, memory: 32Mi }
             limits: { memory: 64Mi }
+      # 2 台を必ず別のノードに置き、ノードが止まったら 30 秒で残りのノードに移す
       affinity:
         podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                topologyKey: kubernetes.io/hostname
-                labelSelector:
-                  matchLabels:
-                    cnpg.io/poolerName: litellm-pg-pooler-rw
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  cnpg.io/poolerName: litellm-pg-pooler-rw
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
 ---
 apiVersion: postgresql.cnpg.io/v1
 kind: ScheduledBackup

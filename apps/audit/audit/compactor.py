@@ -88,7 +88,12 @@ class Compactor:
         self.cfg = cfg
         self.s3 = cfg.s3()
         self.con = duckdb.connect()
-        self.con.execute(f"SET memory_limit='{os.environ.get('AUDIT_DUCKDB_MEMORY', '768MB')}'")
+        self.con.execute(f"SET memory_limit='{os.environ.get('AUDIT_DUCKDB_MEMORY', '512MB')}'")
+        # スレッドを絞り、並べ替えが溢れたら一時ファイルに書く（日ごとのファイルにまとめるとき、本番の規模では
+        # 1 日分の並べ替えになるため）
+        self.con.execute(f"SET threads={int(os.environ.get('AUDIT_DUCKDB_THREADS', '2'))}")
+        self.con.execute("SET preserve_insertion_order=false")
+        self.con.execute(f"SET temp_directory='{tempfile.gettempdir()}/duckdb-spill'")
         self.tmp = Path(tempfile.mkdtemp(prefix="compactor-"))
         self.prefix = cfg.data_prefix
 
@@ -134,6 +139,14 @@ class Compactor:
             local.append(str(p))
         dest = self.tmp / f"usage-{day}.parquet"
         if local:
+            # 日ごとの整形済みのデータ（時間ごとのファイルを 1 つにまとめ、利用者のメールアドレスと時刻の順に並べる）。
+            # 90 日分の履歴を、2,160 個ではなく 90 個のファイルで読めるようにする（2026-10-12 の速さの試験の見積もり）
+            day_file = self.tmp / f"meta-day-{day}.parquet"
+            src_all = "read_parquet([" + ", ".join(f"'{p}'" for p in local) + "])"
+            self.con.execute(f"COPY (SELECT * FROM {src_all} ORDER BY user_email NULLS FIRST, ts_start) TO '{day_file}' "
+                             f"(FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)")
+            self.s3.upload_file(str(day_file), DERIVED, f"{self.prefix}meta_day/dt={day}/part-0.parquet")
+            day_file.unlink(missing_ok=True)
             src = "read_parquet([" + ", ".join(f"'{p}'" for p in local) + "])"
             self.con.execute(f"""COPY (
                 SELECT '{day}'::DATE AS day, user_id, any_value(user_email) AS user_email, team_id, model_group, model,
@@ -166,8 +179,9 @@ class Compactor:
         for i, key in enumerate(files):
             p = self.tmp / f"u-{i}.parquet"
             self.s3.download_file(DERIVED, key, str(p))
-            cur = self.con.execute(f"SELECT user_id, user_email, model_group, model, category, cost_usd "
-                                   f"FROM read_parquet('{p}')")
+            # 利用者 × モデル × 種類に集計してから持ち込む（日次の集計の行をそのまま持ち込むと、メモリを使いすぎる）
+            cur = self.con.execute(f"SELECT user_id, any_value(user_email) AS user_email, model_group, model, category, "
+                                   f"sum(cost_usd) AS cost_usd FROM read_parquet('{p}') GROUP BY ALL")
             names = [d[0] for d in cur.description]
             rows += [dict(zip(names, r)) for r in cur.fetchall()]
             p.unlink(missing_ok=True)

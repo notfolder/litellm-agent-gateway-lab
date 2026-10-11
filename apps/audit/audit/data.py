@@ -65,19 +65,24 @@ class Store:
 
     # ---- 利用量 ----
     def usage(self, start: date, end: date, email: str | None, group_by: list[str]) -> list[dict]:
+        """利用量と概算の集計。日次の集計がある日は DuckDB の中で集計し（行を Python に持ち込まない）、
+        まだ無い日（今日など）は時間ごとのデータから集計して足す。"""
         group_by = [g for g in group_by if g in USAGE_KEYS] or ["user_email"]
         days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
         daily = self._derived_keys("usage_daily", days)
-        rows: list[dict] = []
+        sums = ("requests", "tokens_in", "tokens_out", "tokens_cache_read", "tokens_cache_write", "cost_usd")
+        agg: dict[tuple, dict] = defaultdict(lambda: {k: 0 for k in sums})
         if daily:
-            con = self.con()
             files = [self.url(k) for ks in daily.values() for k in ks]
             where, params = ("WHERE user_email = ?", [email]) if email else ("", [])
-            cur = con.execute(f"""SELECT strftime(day, '%Y-%m-%d') AS day, user_id, user_email, model_group, client,
-                category, requests, tokens_in, tokens_out, tokens_cache_read, tokens_cache_write, cost_usd
-                FROM read_parquet({files!r}) {where}""", params)
-            names = [d[0] for d in cur.description]
-            rows += [dict(zip(names, r)) for r in cur.fetchall()]
+            cols = [("strftime(day, '%Y-%m-%d')" if g == "day" else g) + f" AS {g}" for g in group_by]
+            cur = self.con().execute(
+                f"SELECT {', '.join(cols)}, " + ", ".join(f"sum({k}) AS {k}" for k in sums)
+                + f" FROM read_parquet({files!r}) {where} GROUP BY ALL", params)
+            for row in cur.fetchall():
+                key, vals = tuple(row[:len(group_by)]), row[len(group_by):]
+                for k, v in zip(sums, vals):
+                    agg[key][k] += float(v or 0) if k == "cost_usd" else int(v or 0)
         # 日次の集計がまだ無い日（今日、締まっていない日）は、時間ごとのデータから集計する
         for d in days:
             if d.isoformat() in daily:
@@ -86,24 +91,20 @@ class Store:
             for r in self._detail_rows(day_start, day_start + timedelta(hours=23, minutes=59), email):
                 base = {"day": d.isoformat(), "user_id": r.get("user_id"), "user_email": r.get("user_email"),
                         "client": r.get("client")}
-                rows.append(base | {"model_group": r.get("model_group"), "category": "request", "requests": 1,
-                                    "tokens_in": r.get("tokens_in") or 0, "tokens_out": r.get("tokens_out") or 0,
-                                    "tokens_cache_read": r.get("tokens_cache_read") or 0,
-                                    "tokens_cache_write": r.get("tokens_cache_write") or 0,
-                                    "cost_usd": r.get("cost_usd") or 0.0})
+                parts = [base | {"model_group": r.get("model_group"), "category": "request", "requests": 1,
+                                 "tokens_in": r.get("tokens_in") or 0, "tokens_out": r.get("tokens_out") or 0,
+                                 "tokens_cache_read": r.get("tokens_cache_read") or 0,
+                                 "tokens_cache_write": r.get("tokens_cache_write") or 0,
+                                 "cost_usd": r.get("cost_usd") or 0.0}]
                 if r.get("review_count") and r.get("judge_model_group"):
-                    rows.append(base | {"model_group": r["judge_model_group"], "category": "review",
-                                        "requests": r["review_count"], "tokens_in": r.get("judge_tokens_in") or 0,
-                                        "tokens_out": r.get("judge_tokens_out") or 0, "tokens_cache_read": 0,
-                                        "tokens_cache_write": 0, "cost_usd": r.get("judge_cost_usd") or 0.0})
-        agg: dict[tuple, dict] = defaultdict(lambda: {"requests": 0, "tokens_in": 0, "tokens_out": 0,
-                                                       "tokens_cache_read": 0, "tokens_cache_write": 0,
-                                                       "cost_usd": 0.0})
-        for r in rows:
-            key = tuple(r.get(g) for g in group_by)
-            a = agg[key]
-            for k in a:
-                a[k] += r.get(k) or 0
+                    parts.append(base | {"model_group": r["judge_model_group"], "category": "review",
+                                         "requests": r["review_count"], "tokens_in": r.get("judge_tokens_in") or 0,
+                                         "tokens_out": r.get("judge_tokens_out") or 0, "tokens_cache_read": 0,
+                                         "tokens_cache_write": 0, "cost_usd": r.get("judge_cost_usd") or 0.0})
+                for x in parts:
+                    a = agg[tuple(x.get(g) for g in group_by)]
+                    for k in sums:
+                        a[k] += x.get(k) or 0
         out = [dict(zip(group_by, k)) | v for k, v in agg.items()]
         return sorted(out, key=lambda x: (-x["cost_usd"], str(x)))
 
@@ -111,14 +112,20 @@ class Store:
     def _detail_rows(self, start: datetime, end: datetime, email: str | None, filters: dict | None = None,
                      limit: int | None = None, offset: int = 0) -> list[dict]:
         hours = self._hours(start, end)
+        hour_set = set(hours)
         days = sorted({date.fromisoformat(dt) for dt, _ in hours})
-        parquet = self._derived_keys("meta", days)
+        # 締まった日は日ごとのファイル（1 日 1 個）、まだの日は時間ごとのファイル、まだ整形していない時間は原本を読む
+        per_day = self._derived_keys("meta_day", days)
+        parquet = self._derived_keys("meta", [d for d in days if d.isoformat() not in per_day])
         have, files = set(), []
+        for day, keys in per_day.items():
+            files += [self.url(k) for k in keys]
+            have |= {h for h in hour_set if h[0] == day}
         for keys in parquet.values():
             for k in keys:
                 parts = k.split("/")
                 dt, hour = parts[-3].removeprefix("dt="), parts[-2].removeprefix("hour=")
-                if (dt, hour) in set(hours):
+                if (dt, hour) in hour_set:
                     have.add((dt, hour))
                     files.append(self.url(k))
         cond, params = ["ts_start >= ?", "ts_start <= ?"], [start, end]

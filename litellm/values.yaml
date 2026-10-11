@@ -41,6 +41,25 @@ autoscaling:
 
 # 起動に時間がかかる（DB 接続と Prisma）ので、startupProbe は既定（最大 300 秒）のまま
 
+# Pod をノードに散らし、ノードが止まったら 30 秒で別のノードに移す（既定は 300 秒待つ）。
+# 2026-10-12 の障害の試験で、LiteLLM の Pod が止めたノードに偏っていて、全体が 3 分以上止まったため
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: litellm
+tolerations:
+  - key: node.kubernetes.io/unreachable
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 30
+  - key: node.kubernetes.io/not-ready
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 30
+
 # Pod を止めるとき、止める前に 10 秒待つ。止めると決まってから入口（Traefik）が送り先から外すまでに
 # 数秒かかり、その間に届いた要求が 502 になる（2026-10-11 に確認。Codex は起動時の確認がこれに当たると、
 # その回は MCP のツールを使えないまま動く）。待っている間も要求は普通に処理し、その後の SIGTERM で

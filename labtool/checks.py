@@ -99,26 +99,45 @@ def smoke(env: Env) -> None:
 
 
 def snapshot() -> list[str]:
-    """変化を見る項目: Helm のリビジョン、Pod の UID と再起動回数、ConfigMap / Secret の resourceVersion、
-    Deployment / StatefulSet の generation。"""
+    """変化を見る項目（変更設計書 8.4 節）:
+    - Helm のリビジョン（litellm-lab、cert-manager、cnpg-system の名前空間）
+    - Pod の UID と再起動回数（試験の Job や CronJob の Pod は除く）
+    - ConfigMap / Secret の resourceVersion（CloudNativePG が自分で更新する Secret と、Helm の記録は除く）
+    - Deployment / StatefulSet / CronJob と、CloudNativePG・Traefik のリソースの generation
+    - オブジェクトストレージのバケットの設定と、利用者と権限"""
     lines: list[str] = []
-    for r in json_output(helm("-n", NS, "list", "-o", "json"), default=[]) or []:
-        lines.append(f"helm {r['name']} rev={r['revision']}")
+    for ns in (NS, "cert-manager", "cnpg-system"):
+        for r in json_output(helm("-n", ns, "list", "-o", "json"), default=[]) or []:
+            lines.append(f"helm {ns}/{r['name']} rev={r['revision']}")
     pods = json_output(kn("get", "pods", "-o", "json"), default={}) or {}
     for p in pods.get("items", []):
-        if p["status"].get("phase") != "Running":
+        owners = [o.get("kind") for o in p["metadata"].get("ownerReferences", [])]
+        if p["status"].get("phase") != "Running" or "Job" in owners:
             continue
         restarts = sum(c.get("restartCount", 0) for c in p["status"].get("containerStatuses", []))
         lines.append(f"pod {p['metadata']['name']} uid={p['metadata']['uid']} restarts={restarts}")
-    for kind in ("configmap,secret", "deploy,statefulset"):
+    kinds = ("configmap,secret", "deploy,statefulset,cronjob",
+             "clusters.postgresql.cnpg.io,poolers.postgresql.cnpg.io,scheduledbackups.postgresql.cnpg.io,"
+             "objectstores.barmancloud.cnpg.io,ingressroutes.traefik.io")
+    for kind in kinds:
         objs = json_output(kn("get", kind, "-o", "json"), default={}) or {}
         for o in objs.get("items", []):
             m = o["metadata"]
-            if m["name"].startswith("sh.helm"):
-                continue
-            field = f"gen={m.get('generation')}" if o["kind"] in ("Deployment", "StatefulSet") \
-                else f"rv={m['resourceVersion']}"
+            managed = any(k.startswith("cnpg.io/") for k in (m.get("labels") or {})) \
+                and o["kind"] in ("ConfigMap", "Secret") and m["name"] != "litellm-pg-app"
+            if m["name"].startswith("sh.helm") or managed:
+                continue   # CloudNativePG が自分で作り、更新するもの（証明書、監視の設定など）
+            field = f"rv={m['resourceVersion']}" if o["kind"] in ("ConfigMap", "Secret") \
+                else f"gen={m.get('generation')}"
             lines.append(f"{o['kind']} {m['name']} {field}")
+    try:
+        from . import objectstore
+        from .core import Env, port_forward
+        env = Env.load()
+        with port_forward("svc/rustfs", 9000) as endpoint:
+            lines += objectstore.snapshot(env, endpoint)
+    except Exception as e:  # noqa: BLE001 オブジェクトストレージがまだ無い
+        lines.append(f"objectstore unavailable: {type(e).__name__}")
     return sorted(lines)
 
 

@@ -48,11 +48,16 @@ class Config:
                 f"ENDPOINT '{host}', URL_STYLE 'path', USE_SSL {ssl}, REGION '{self.region}')")
 
 
-def duckdb_connect(cfg: Config, memory_limit: str = "384MB"):
+def duckdb_connect(cfg: Config, memory_limit: str | None = None):
+    """DuckDB の接続。検索アプリの Pod のメモリの上限（512Mi）に収めるため、メモリとスレッドの数を絞る
+    （スレッドの既定はノードの CPU の数で、スレッドごとに読み込みの領域を持つので、合成データの速さの試験で
+    上限を超えて落ちた。2026-10-12）。"""
     import duckdb
     con = duckdb.connect()
     con.execute("LOAD httpfs")
-    con.execute(f"SET memory_limit='{memory_limit}'")
+    con.execute(f"SET memory_limit='{memory_limit or os.environ.get('AUDIT_DUCKDB_MEMORY', '256MB')}'")
+    con.execute(f"SET threads={int(os.environ.get('AUDIT_DUCKDB_THREADS', '2'))}")
+    con.execute("SET preserve_insertion_order=false")
     con.execute(cfg.duckdb_secret_sql())
     return con
 

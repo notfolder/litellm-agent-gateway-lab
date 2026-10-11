@@ -333,6 +333,7 @@ def s3_buckets(env: Env) -> dict[str, dict]:
         # 最新のファイルを今の値とする。小さく編集も稀なので消さない
         AUDIT_DERIVED: {"lock": None, "versioning": True, "lifecycle": [
             _lifecycle("meta", "meta/", raw_days + 1, 1),
+            _lifecycle("meta-day", "meta_day/", raw_days + 1, 1),
             _lifecycle("usage-daily", "usage_daily/", 400, 1),
             _lifecycle("settlement", "billing/settlement/", 400, 400),
             _lifecycle("synth", "synth/", 7, 1),
@@ -401,3 +402,12 @@ def initial_contracts(env: Env) -> dict:
 
 def initial_fx_rates(env: Env) -> dict:
     return json.loads(env.get("LAB_FX_RATES")) if env.get("LAB_FX_RATES") else {"schema": 1, "usd_jpy": {}}
+
+
+def pin_deployments(manifest_text: str, node_selector: dict) -> str:
+    """マニフェストの中の Deployment に nodeSelector を足す（取得した公式のマニフェストを、server ノードに置くため）。"""
+    docs = [d for d in yaml.safe_load_all(manifest_text) if d]
+    for d in docs:
+        if d.get("kind") == "Deployment":
+            d["spec"]["template"]["spec"]["nodeSelector"] = node_selector
+    return yaml.safe_dump_all(docs, sort_keys=False)

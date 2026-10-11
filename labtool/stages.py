@@ -23,6 +23,10 @@ AUDIT_IMAGE_FILE = BUILD_DIR / "audit-image.json"
 
 # クラスタに入れる部品の版（変更設計書 3.1 節）
 CERT_MANAGER = {"repo": "https://charts.jetstack.io", "chart": "cert-manager", "version": "v1.21.2"}
+# クラスタ全体の部品（オペレーター、証明書、入口）は server ノード（Kubernetes の制御部分）に置く。障害の試験で止めるのは
+# agent ノードだけなので、試験で止まらない（2026-10-12 に、CloudNativePG のオペレーターが止めたノードにあって、
+# ノードが戻るまで切り替えが始まらなかった）。本番では、これらを複数台にする
+CONTROL_PLANE = {"node-role.kubernetes.io/control-plane": "true"}
 CNPG = {"repo": "https://cloudnative-pg.github.io/charts", "chart": "cloudnative-pg", "version": "0.29.1"}
 BARMAN_PLUGIN_VERSION = "v0.15.1"
 BARMAN_PLUGIN_URL = ("https://github.com/cloudnative-pg/plugin-barman-cloud/releases/download/"
@@ -147,20 +151,22 @@ def _ensure_chart(release: str, namespace: str, spec: dict, values: dict) -> Non
 
 def operators() -> None:
     """cert-manager → CloudNativePG のオペレーター → Barman Cloud Plugin（この順。プラグインは証明書を使う）。"""
-    _ensure_chart("cert-manager", "cert-manager", CERT_MANAGER, {"crds": {"enabled": True}})
+    _ensure_chart("cert-manager", "cert-manager", CERT_MANAGER, {
+        "crds": {"enabled": True}, "nodeSelector": CONTROL_PLANE, "webhook": {"nodeSelector": CONTROL_PLANE},
+        "cainjector": {"nodeSelector": CONTROL_PLANE}, "startupapicheck": {"nodeSelector": CONTROL_PLANE}})
     wait_until(300, "cert-manager の準備", kc("-n", "cert-manager", "wait", "--for=condition=Available",
                                               "deploy", "--all", "--timeout=5s"))
-    _ensure_chart("cnpg", "cnpg-system", CNPG, {})
+    _ensure_chart("cnpg", "cnpg-system", CNPG, {"nodeSelector": CONTROL_PLANE})
     wait_until(300, "CloudNativePG のオペレーターの準備", kc("-n", "cnpg-system", "wait", "--for=condition=Available",
                                                          "deploy", "-l", "app.kubernetes.io/name=cloudnative-pg",
                                                          "--timeout=5s"))
-    manifest = BUILD_DIR / f"barman-cloud-{BARMAN_PLUGIN_VERSION}.yaml"
+    manifest = BUILD_DIR / f"barman-cloud-{BARMAN_PLUGIN_VERSION}-pinned.yaml"
     if not manifest.exists():
         info(f"Barman Cloud Plugin {BARMAN_PLUGIN_VERSION} のマニフェストを取得します")
         res = http("GET", BARMAN_PLUGIN_URL, timeout=60)
         if res.status != 200:
             raise LabError(f"Barman Cloud Plugin のマニフェストを取得できませんでした（{res.status}）")
-        write_if_changed(manifest, res.body)
+        write_if_changed(manifest, render.pin_deployments(res.body, CONTROL_PLANE))
     kapply(files=[manifest], namespaced=False)
     wait_until(300, "Barman Cloud Plugin の準備", kc("-n", "cnpg-system", "rollout", "status", "deploy/barman-cloud",
                                                   "--timeout=5s"))

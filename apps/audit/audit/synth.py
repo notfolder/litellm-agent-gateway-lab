@@ -27,7 +27,11 @@ def main(argv: list[str]) -> int:
     cfg = Config.from_env()
     s3 = cfg.s3()
     con = duckdb.connect()
-    con.execute("SET memory_limit='768MB'")
+    # スレッドを絞り、並べ替えが溢れたら一時ファイルに書く（既定のスレッド数では 1Gi を超えて落ちた）
+    con.execute("SET memory_limit='512MB'")
+    con.execute("SET threads=2")
+    con.execute("SET preserve_insertion_order=false")
+    con.execute(f"SET temp_directory='{tempfile.gettempdir()}/duckdb-spill'")
     tmp = Path(tempfile.mkdtemp(prefix="synth-"))
     end = now_jst().date() - timedelta(days=1)
     per_hour = args.per_day // 24
@@ -64,10 +68,14 @@ def main(argv: list[str]) -> int:
               ORDER BY user_email, ts_start
             ) TO '{dest}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)""")
             s3.upload_file(str(dest), DERIVED, f"synth/meta/dt={day}/hour={hour:02d}/part-0.parquet")
-        # 日次の集計（その日の 24 時間分から）
+        # 日ごとの整形済みのデータと日次の集計（その日の 24 時間分から。整形の処理と同じ形）
         src = f"read_parquet('s3://{DERIVED}/synth/meta/dt={day}/hour=*/part-0.parquet')"
         con.execute("LOAD httpfs")
         con.execute(cfg.duckdb_secret_sql())
+        day_file = tmp / "day.parquet"
+        con.execute(f"COPY (SELECT * FROM {src} ORDER BY user_email NULLS FIRST, ts_start) TO '{day_file}' "
+                    f"(FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)")
+        s3.upload_file(str(day_file), DERIVED, f"synth/meta_day/dt={day}/part-0.parquet")
         dest = tmp / "d.parquet"
         con.execute(f"""COPY (
             SELECT '{day}'::DATE AS day, user_id, any_value(user_email) AS user_email, team_id, model_group, model,
