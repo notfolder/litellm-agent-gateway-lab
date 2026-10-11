@@ -36,12 +36,31 @@ META_COLUMNS = {
     "review_count": "BIGINT", "review_blocked": "BOOLEAN", "review_reason": "VARCHAR", "jev_probability": "DOUBLE",
     "judge_model_group": "VARCHAR", "judge_tokens_in": "BIGINT", "judge_tokens_out": "BIGINT",
     "judge_cost_usd": "DOUBLE", "pod": "VARCHAR",
+    # 文脈独立審査（機密情報の持ち出し）。review_* と judge_* は文脈あり審査だけの値（review_blocked は両方）
+    "context_blocked": "BOOLEAN", "isolated_count": "BIGINT", "isolated_blocked": "BOOLEAN",
+    "isolated_reason": "VARCHAR", "isolated_judge_model_group": "VARCHAR", "isolated_tokens_in": "BIGINT",
+    "isolated_tokens_out": "BIGINT", "isolated_cost_usd": "DOUBLE",
 }
+# 文脈独立審査を足す前の Parquet には無い列と、無いときに補う値
+ADDED_COLUMNS = {"context_blocked": "NULL::BOOLEAN", "isolated_count": "0::BIGINT",
+                 "isolated_blocked": "NULL::BOOLEAN", "isolated_reason": "NULL::VARCHAR",
+                 "isolated_judge_model_group": "NULL::VARCHAR", "isolated_tokens_in": "0::BIGINT",
+                 "isolated_tokens_out": "0::BIGINT", "isolated_cost_usd": "0::DOUBLE"}
 STATE_KEY = "_state/compactor.json"
 
 
+def parquet_source(con, files: list[str]) -> str:
+    """Parquet の一覧を読む SELECT 文の FROM 句。列の名前で合わせて読み（古いファイルと新しいファイルが混ざるため）、
+    どのファイルにも無い新しい列は空の値で補う（全部が古いファイルのときに、列を名指しした SQL が失敗しないように）。"""
+    src = "read_parquet([" + ", ".join(f"'{p}'" for p in files) + "], union_by_name=true)"
+    have = {r[0] for r in con.execute(f"DESCRIBE SELECT * FROM {src}").fetchall()}
+    missing = [f"{v} AS {k}" for k, v in ADDED_COLUMNS.items() if k not in have]
+    return f"(SELECT *{', ' + ', '.join(missing) if missing else ''} FROM {src})" if missing else src
+
+
 def flatten(rows: list[dict]) -> list[dict]:
-    """原本の行（要求・MCP・審査）を、整形済みの行（要求ごと。審査の結果を足したもの）にする。"""
+    """原本の行（要求・MCP・審査）を、整形済みの行（要求ごと。審査の結果を足したもの）にする。
+    審査は review_kind で分ける（無いものは、文脈独立審査を足す前の記録なので文脈あり審査）。"""
     reviews: dict[str, list[dict]] = {}
     for r in rows:
         if r.get("type") == "review" and r.get("request_call_id"):
@@ -50,7 +69,9 @@ def flatten(rows: list[dict]) -> list[dict]:
     for r in rows:
         if r.get("type") not in ("request", "mcp"):
             continue
-        rv = reviews.get(r.get("call_id") or "", [])
+        allrv = reviews.get(r.get("call_id") or "", [])
+        rv = [x for x in allrv if (x.get("review_kind") or "context") == "context"]
+        iv = [x for x in allrv if x.get("review_kind") == "isolated"]
         body = r.get("body") or {}
         tools = r.get("tool_calls") or []
         out.append({
@@ -59,13 +80,22 @@ def flatten(rows: list[dict]) -> list[dict]:
             "tool_calls": json.dumps(tools, ensure_ascii=False) if tools else None,
             "body_key": body.get("key"), "body_offset": body.get("offset"), "body_length": body.get("length"),
             "review_count": len(rv),
-            "review_blocked": any(x.get("allowed") is False for x in rv) if rv else None,
+            "review_blocked": any(x.get("allowed") is False for x in allrv) if allrv else None,
+            "context_blocked": any(x.get("allowed") is False for x in rv) if rv else None,
             "review_reason": rv[-1].get("reason") if rv else None,
             "jev_probability": max((x.get("jev_probability") or 0.0) for x in rv) if rv else None,
             "judge_model_group": next((x.get("judge_model_group") for x in rv if x.get("judge_model_group")), None),
             "judge_tokens_in": sum(int(x.get("judge_tokens_in") or 0) for x in rv),
             "judge_tokens_out": sum(int(x.get("judge_tokens_out") or 0) for x in rv),
             "judge_cost_usd": sum(float(x.get("judge_cost_usd") or 0) for x in rv),
+            "isolated_count": len(iv),
+            "isolated_blocked": any(x.get("allowed") is False for x in iv) if iv else None,
+            "isolated_reason": iv[-1].get("reason") if iv else None,
+            "isolated_judge_model_group": next((x.get("judge_model_group") for x in iv
+                                                if x.get("judge_model_group")), None),
+            "isolated_tokens_in": sum(int(x.get("judge_tokens_in") or 0) for x in iv),
+            "isolated_tokens_out": sum(int(x.get("judge_tokens_out") or 0) for x in iv),
+            "isolated_cost_usd": sum(float(x.get("judge_cost_usd") or 0) for x in iv),
         })
     return out
 
@@ -80,6 +110,30 @@ def write_parquet(con, rows: list[dict], dest: Path, columns: dict[str, str], or
     con.execute(f"COPY ({select} ORDER BY {order}) TO '{dest}' "
                 f"(FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)")
     src.unlink(missing_ok=True)
+
+
+def usage_daily_select(day: str, src: str) -> str:
+    """日ごとの利用量の SELECT 文（src は parquet_source の戻り値）。要求の分と、審査の分を審査官ごとに分けた行
+    （文脈あり審査は judge_model_group、文脈独立審査は isolated_judge_model_group）。"""
+    return f"""
+                SELECT '{day}'::DATE AS day, user_id, any_value(user_email) AS user_email, team_id, model_group, model,
+                       client, 'request' AS category, count(*) AS requests, sum(tokens_in) AS tokens_in,
+                       sum(tokens_out) AS tokens_out, sum(tokens_cache_read) AS tokens_cache_read,
+                       sum(tokens_cache_write) AS tokens_cache_write, sum(cost_usd) AS cost_usd
+                FROM {src} GROUP BY ALL
+                UNION ALL
+                SELECT '{day}'::DATE, user_id, any_value(user_email), team_id, judge_model_group, judge_model_group,
+                       client, 'review', sum(review_count), sum(judge_tokens_in), sum(judge_tokens_out), 0, 0,
+                       sum(judge_cost_usd)
+                FROM {src} WHERE review_count > 0 AND judge_model_group IS NOT NULL
+                GROUP BY user_id, team_id, judge_model_group, client
+                UNION ALL
+                SELECT '{day}'::DATE, user_id, any_value(user_email), team_id, isolated_judge_model_group,
+                       isolated_judge_model_group, client, 'review', sum(isolated_count), sum(isolated_tokens_in),
+                       sum(isolated_tokens_out), 0, 0, sum(isolated_cost_usd)
+                FROM {src} WHERE isolated_count > 0 AND isolated_judge_model_group IS NOT NULL
+                GROUP BY user_id, team_id, isolated_judge_model_group, client
+                ORDER BY user_id NULLS FIRST"""
 
 
 class Compactor:
@@ -142,26 +196,13 @@ class Compactor:
             # 日ごとの整形済みのデータ（時間ごとのファイルを 1 つにまとめ、利用者のメールアドレスと時刻の順に並べる）。
             # 90 日分の履歴を、2,160 個ではなく 90 個のファイルで読めるようにする（2026-10-12 の速さの試験の見積もり）
             day_file = self.tmp / f"meta-day-{day}.parquet"
-            src_all = "read_parquet([" + ", ".join(f"'{p}'" for p in local) + "])"
+            src_all = parquet_source(self.con, local)
             self.con.execute(f"COPY (SELECT * FROM {src_all} ORDER BY user_email NULLS FIRST, ts_start) TO '{day_file}' "
                              f"(FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)")
             self.s3.upload_file(str(day_file), DERIVED, f"{self.prefix}meta_day/dt={day}/part-0.parquet")
             day_file.unlink(missing_ok=True)
-            src = "read_parquet([" + ", ".join(f"'{p}'" for p in local) + "])"
-            self.con.execute(f"""COPY (
-                SELECT '{day}'::DATE AS day, user_id, any_value(user_email) AS user_email, team_id, model_group, model,
-                       client, 'request' AS category, count(*) AS requests, sum(tokens_in) AS tokens_in,
-                       sum(tokens_out) AS tokens_out, sum(tokens_cache_read) AS tokens_cache_read,
-                       sum(tokens_cache_write) AS tokens_cache_write, sum(cost_usd) AS cost_usd
-                FROM {src} GROUP BY ALL
-                UNION ALL
-                SELECT '{day}'::DATE, user_id, any_value(user_email), team_id, judge_model_group, judge_model_group,
-                       client, 'review', sum(review_count), sum(judge_tokens_in), sum(judge_tokens_out), 0, 0,
-                       sum(judge_cost_usd)
-                FROM {src} WHERE review_count > 0 AND judge_model_group IS NOT NULL
-                GROUP BY user_id, team_id, judge_model_group, client
-                ORDER BY user_id NULLS FIRST
-            ) TO '{dest}' (FORMAT parquet, COMPRESSION zstd)""")
+            src = src_all
+            self.con.execute(f"COPY ({usage_daily_select(day, src)}\n) TO '{dest}' (FORMAT parquet, COMPRESSION zstd)")
         else:
             self.con.execute(f"""COPY (SELECT NULL::DATE AS day, NULL::VARCHAR AS user_id, NULL::VARCHAR AS user_email,
                 NULL::VARCHAR AS team_id, NULL::VARCHAR AS model_group, NULL::VARCHAR AS model, NULL::VARCHAR AS client,

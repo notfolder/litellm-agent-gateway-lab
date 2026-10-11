@@ -3,7 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["pyyaml>=6.0", "boto3>=1.35"]
 # ///
-"""検証環境の構築ツール。どのコマンドも何度実行しても同じ結果になる（docs/design.md 14 章）。
+"""検証環境の構築ツール。どのコマンドも何度実行しても同じ結果になる（docs/design.md 17 章）。
 
 使い方: ./lab <コマンド>（./lab -h で一覧）
 uv が Python と依存（PyYAML）を用意するので、事前の準備は uv のインストールだけ。
@@ -86,10 +86,10 @@ COMMANDS: dict[str, tuple[str, object]] = {
     "clean-all": ("クラスタ、生成したクライアント設定、ビルドしたイメージを消す（.env とトークンは残す）", None),
     # 試験
     "test-unit": ("単体テスト（構築ツールと、LiteLLM のイメージの中でガードレール）", stage(ops.test_unit)),
-    "test-smoke": ("疎通確認（入口、パススルーの遮断、審査の差し替え、Claude Code の素通し）", stage(checks.smoke)),
+    "test-smoke": ("疎通確認（入口、パススルーの遮断、審査の差し替え、機密の持ち出しの拒否）", stage(checks.smoke)),
     "test-idempotency": ("./lab up を 2 回流し、2 回目で何も変わらないことを確かめる", checks.idempotency),
     "test-load": ("偽 LLM を相手にした負荷試験（k6、Docker で実行）", None),
-    "test-judge": ("二次判定の事例試験（本物の審査官を呼ぶ。ChatGPT の利用枠を使う）", None),
+    "test-judge": ("審査官の事例試験（本物の審査官を呼ぶ。ChatGPT の利用枠を使う）", None),
     "test-failover": ("障害の試験（PostgreSQL と Valkey の primary を切り替える・消す・ノードを止める）", None),
     "test-restore": ("PostgreSQL をバックアップから任意の時点に戻す試験", stage(failover.restore)),
     "test-audit": ("監査ログの試験（記録、整形、検索アプリ、精算、改ざんの防止、退避と再送）", stage(audit_test.audit_test)),
@@ -111,6 +111,9 @@ def main(argv: list[str]) -> int:
     parsers["test-load"].add_argument("--duration", default="2m", help="時間（既定 2m）")
     parsers["test-load"].add_argument("--scenario", default="chat", choices=["chat", "review"])
     parsers["test-judge"].add_argument("--repeat", type=int, default=3, help="事例ごとの試行回数（既定 3）")
+    judge_scope = parsers["test-judge"].add_mutually_exclusive_group()
+    judge_scope.add_argument("--context", action="store_true", help="文脈あり審査の事例だけを流す")
+    judge_scope.add_argument("--isolated", action="store_true", help="文脈独立審査の事例だけを流す")
     parsers["test-failover"].add_argument("--pooler", choices=["pooler", "direct"],
                                           help="この接続先に切り替えて試す（終わったら元に戻す）")
     parsers["test-failover"].add_argument("--scenario", default="all", choices=["all", *failover.SCENARIOS])
@@ -130,7 +133,8 @@ def main(argv: list[str]) -> int:
             case "test-load":
                 checks.load(Env.load(), args.vus, args.duration, args.scenario)
             case "test-judge":
-                checks.judge_eval(Env.load(), args.repeat)
+                checks.judge_eval(Env.load(), args.repeat,
+                                  "context" if args.context else "isolated" if args.isolated else "both")
             case "test-failover":
                 test_failover(args.pooler, args.scenario)
             case "audit-synth":

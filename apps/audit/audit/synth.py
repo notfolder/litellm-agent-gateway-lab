@@ -60,7 +60,12 @@ def main(argv: list[str]) -> int:
                 NULL AS review_reason, NULL::DOUBLE AS jev_probability,
                 CASE WHEN r < 0.1 THEN 'review-judge' END AS judge_model_group, 0::BIGINT AS judge_tokens_in,
                 0::BIGINT AS judge_tokens_out, CASE WHEN r < 0.1 THEN random() * 0.001 ELSE 0 END AS judge_cost_usd,
-                'synth' AS pod
+                'synth' AS pod,
+                -- 文脈独立審査の列（合成データでは行わなかったものとして、空と 0）
+                CASE WHEN r < 0.01 THEN true WHEN r < 0.1 THEN false END AS context_blocked,
+                0::BIGINT AS isolated_count, NULL::BOOLEAN AS isolated_blocked, NULL::VARCHAR AS isolated_reason,
+                NULL::VARCHAR AS isolated_judge_model_group, 0::BIGINT AS isolated_tokens_in,
+                0::BIGINT AS isolated_tokens_out, 0::DOUBLE AS isolated_cost_usd
               FROM (SELECT (floor(pow(random(), 4) * {USERS}))::BIGINT AS u,
                            ['gpt-5.6-terra', 'gpt-5.6-luna', 'anthropic/claude-sonnet', 'anthropic/claude-opus'][1 + floor(random() * 4)::INT] AS m,
                            random() AS r

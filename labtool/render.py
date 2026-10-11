@@ -9,11 +9,12 @@ from pathlib import Path
 
 import yaml
 
-from .core import CHATGPT_TOKEN_IN_NODE, Env
+from .core import CHATGPT_TOKEN_IN_NODE, ROOT, Env
 
 FAKE_LLM_BASE = "http://fake-llm.litellm-lab.svc.cluster.local:8000/v1"
 WORKSPACE_MCP_URL = "http://workspace-mcp.litellm-lab.svc.cluster.local:8000/mcp"
 DEFAULT_S3_ENDPOINT = "http://rustfs:9000"
+DEFAULT_ISOLATED_POLICY = "litellm/guardrails/policies/confidential.md"
 SENTINEL_NODES = json.dumps([[f"valkey-sentinel-{i}.valkey-sentinel-headless.litellm-lab.svc.cluster.local", 26379]
                              for i in range(3)])
 GMAIL_SCOPES = [
@@ -89,6 +90,15 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
     if has_chatgpt and (prices := model_prices(env, "review-judge", judge_model)):
         judge["model_info"] = prices
     model_list.append(judge)
+    # 文脈独立審査（機密情報の持ち出し）の審査官。会話を見ずに、ツール名・引数・ツールの定義だけで判定する
+    isolated = isolated_review_enabled(env)
+    if isolated:
+        isolated_model = env.get("LAB_ISOLATED_JUDGE_MODEL") or judge_model
+        entry = {"model_name": "isolated-judge",
+                 "litellm_params": {"model": f"chatgpt/{isolated_model}"} if has_chatgpt else _fake_params()}
+        if has_chatgpt and (prices := model_prices(env, "isolated-judge", isolated_model)):
+            entry["model_info"] = prices
+        model_list.append(entry)
 
     config: dict = {
         "model_list": model_list,
@@ -108,9 +118,19 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
                 # 疎通確認（偽 LLM の fake-tools）は、結果が決まるように偽 LLM の審査官で判定する
                 "test_model": "fake-tools",
                 "test_judge_model": "fake-tools",
+                # 無効のときも必ず出す（ガードレールの既定は true で、判定基準が空だと起動しなくなるため）
+                "isolated_review": isolated,
             },
         }],
     }
+    if isolated:
+        config["guardrails"][0]["litellm_params"].update({
+            "isolated_review_claude_code": env.get("LAB_ISOLATED_CLAUDE_CODE", "true").lower() == "true",
+            "isolated_judge_model": "isolated-judge",
+            "isolated_policy": isolated_policy(env),
+            "isolated_fail_open": False,
+            "test_isolated_judge_model": "fake-tools",
+        })
 
     if env.has_google():
         config["mcp_servers"] = {"gmail": {
@@ -156,6 +176,21 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
         "disable_spend_logs": True,
     }
     return config
+
+
+def isolated_review_enabled(env: Env) -> bool:
+    return env.get("LAB_ISOLATED_REVIEW", "true").lower() == "true"
+
+
+def isolated_policy(env: Env) -> str:
+    """文脈独立審査の判定基準の文章（LAB_ISOLATED_POLICY_FILE。相対パスはリポジトリから）。空ならエラー。"""
+    path = Path(env.get("LAB_ISOLATED_POLICY_FILE") or DEFAULT_ISOLATED_POLICY)
+    if not path.is_absolute():
+        path = ROOT / path
+    text = path.read_text().strip()
+    if not text:
+        raise ValueError(f"判定基準のファイルが空です: {path}")
+    return text
 
 
 def db_pooler(env: Env) -> str:
@@ -394,7 +429,7 @@ def initial_contracts(env: Env) -> dict:
     codex = env.get("LAB_CODEX_MODEL", "gpt-5.6-terra")
     return {"schema": 1, "contracts": [
         {"id": "chatgpt-plus", "name": "ChatGPT Plus", "kind": "subscription", "currency": "USD",
-         "models": [codex, "review-judge"], "fees": {month: 20.0}},
+         "models": [codex, "review-judge", "isolated-judge"], "fees": {month: 20.0}},
         {"id": "claude-max", "name": "Claude Max", "kind": "subscription", "currency": "USD",
          "models": ["anthropic/*", "claude-*"], "fees": {month: 100.0}},
     ]}

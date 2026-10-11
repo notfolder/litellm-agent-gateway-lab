@@ -1,6 +1,6 @@
 # Gmail を読む MCP サーバー（taylorwilsdon/google_workspace_mcp）。クラスタ内だけに公開する。
 # 外部トークンのモード: LiteLLM が付けて送るユーザーの Google アクセストークンを userinfo で確かめ、
-# そのトークンで Gmail API を呼ぶ。サインイン画面やトークンの発行は行わない（docs/spec.md 5.3）
+# そのトークンで Gmail API を呼ぶ。サインイン画面やトークンの発行は行わない（docs/spec.md 8.3）
 apiVersion: v1
 kind: Service
 metadata:

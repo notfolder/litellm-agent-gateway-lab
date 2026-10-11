@@ -17,6 +17,10 @@
 {% endblock %}
 {% block script %}
 <script>
+// 文脈あり審査で止めたか。context_blocked の無い行（文脈独立審査を足す前のデータ）は review_blocked で見る
+const contextBlocked = r => r.context_blocked ?? (r.review_blocked && !r.isolated_blocked);
+const blockedLabel = r => (contextBlocked(r) ? ' <span class="bad">（審査で拒否）</span>' : "")
+  + (r.isolated_blocked ? ' <span class="bad">（機密情報の持ち出しで拒否）</span>' : "");
 const f = document.getElementById("f"); let page = 0;
 async function load(ev) {
   if (ev) { ev.preventDefault(); page = 0; }
@@ -29,7 +33,7 @@ async function load(ev) {
     {key: "type", label: "種類"}, {key: "model_group", label: "モデル"}, {key: "status", label: "結果"},
     {key: "tokens_in", label: "入力", num: true, fmt: v => num(v)}, {key: "tokens_out", label: "出力", num: true, fmt: v => num(v)},
     {key: "cost_usd", label: "概算 USD", num: true, fmt: v => num(v, 4)},
-    {key: "tool_names", label: "ツール", html: r => esc(r.tool_names || r.mcp_tool || "") + (r.review_blocked ? ' <span class="bad">（審査で拒否）</span>' : "")},
+    {key: "tool_names", label: "ツール", html: r => esc(r.tool_names || r.mcp_tool || "") + blockedLabel(r)},
     {key: "call_id", label: "", html: r => `<a href="${BASE}/request?call_id=${encodeURIComponent(r.call_id)}&at=${encodeURIComponent(r.ts_start)}">詳細</a>`}], d.rows);
   document.getElementById("page").textContent = `${page + 1} ページ目`;
   document.getElementById("next").disabled = !d.more; document.getElementById("prev").disabled = page === 0;

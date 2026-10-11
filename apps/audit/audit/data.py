@@ -96,6 +96,13 @@ class Store:
                                  "tokens_cache_read": r.get("tokens_cache_read") or 0,
                                  "tokens_cache_write": r.get("tokens_cache_write") or 0,
                                  "cost_usd": r.get("cost_usd") or 0.0}]
+                # 審査の分は審査官ごとに分ける（文脈あり審査と文脈独立審査）
+                if r.get("isolated_count") and r.get("isolated_judge_model_group"):
+                    parts.append(base | {"model_group": r["isolated_judge_model_group"], "category": "review",
+                                         "requests": r["isolated_count"],
+                                         "tokens_in": r.get("isolated_tokens_in") or 0,
+                                         "tokens_out": r.get("isolated_tokens_out") or 0, "tokens_cache_read": 0,
+                                         "tokens_cache_write": 0, "cost_usd": r.get("isolated_cost_usd") or 0.0})
                 if r.get("review_count") and r.get("judge_model_group"):
                     parts.append(base | {"model_group": r["judge_model_group"], "category": "review",
                                          "requests": r["review_count"], "tokens_in": r.get("judge_tokens_in") or 0,
@@ -144,7 +151,9 @@ class Store:
         rows: list[dict] = []
         if files:
             lim = f"LIMIT {int(limit) + int(offset)}" if limit is not None else ""
-            cur = self.con().execute(f"SELECT * FROM read_parquet({files!r}) WHERE {' AND '.join(cond)} "
+            # 文脈独立審査の列を足す前の Parquet と混ざるので、列の名前で合わせて読む
+            cur = self.con().execute(f"SELECT * FROM read_parquet({files!r}, union_by_name=true) "
+                                     f"WHERE {' AND '.join(cond)} "
                                      f"ORDER BY ts_start DESC {lim}", params)
             names = [d[0] for d in cur.description]
             rows = [dict(zip(names, r)) for r in cur.fetchall()]

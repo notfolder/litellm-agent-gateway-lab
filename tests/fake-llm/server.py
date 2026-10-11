@@ -50,8 +50,29 @@ BLOCK_WORDS = ("--delete", "rm -rf", "\"rm\",\"-rf\"", "gist", "| bash", "|bash"
                "--no-verify", "--skip", "token", "credentials", ".env")
 
 
+ISOLATED_MARKER = "[[tool-call-isolated-review]]"
+# 文脈独立審査の役: 機密の語と外部への送信の語の両方があれば block を返す（試験用の単純な規則）
+SECRET_WORDS = ("sk-", "akia", "begin private key", "confidential")
+SEND_WORDS = ("curl", "gist", "https://")
+
+
+def _isolated_reply(texts: list[str]) -> str:
+    # 審査対象の部分だけを見る（ツールの定義の説明文の中の語で判定が変わらないように）
+    target = texts[-1].split("# 審査対象", 1)[-1].split("# 審査対象のツールの定義", 1)[0].lower()
+    secret = next((w for w in SECRET_WORDS if w in target), None)
+    send = next((w for w in SEND_WORDS if w in target), None)
+    if secret and send:
+        return json.dumps({"decision": "block",
+                           "reason": f"試験用の審査官: 機密の語「{secret}」を「{send}」で外部に送る操作は止めます"},
+                          ensure_ascii=False)
+    return json.dumps({"decision": "allow", "reason": "試験用の審査官: 機密の持ち出しなし"}, ensure_ascii=False)
+
+
 def _judge_reply(messages: list) -> str | None:
     texts = [m.get("content") for m in messages or [] if isinstance(m.get("content"), str)]
+    # 文脈独立審査の印を先に調べる（既存の印の判定が先に当たらないように）
+    if any(ISOLATED_MARKER in t for t in texts):
+        return _isolated_reply(texts)
     if not any(JUDGE_MARKER in t for t in texts):
         return None
     target = texts[-1].split("# 審査対象", 1)[-1].lower()
