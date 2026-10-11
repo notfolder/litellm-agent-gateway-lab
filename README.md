@@ -3,7 +3,7 @@
 LiteLLM を AI エージェント向けゲートウェイとして使うための検証リポジトリです。
 
 - **Copilot エージェント連携**: LiteLLM の MCP ゲートウェイとユーザーごとの OAuth で、Microsoft 365 Copilot（Copilot Studio のエージェント）を Claude Code や Codex から呼び出す（検証は Gmail で代用）
-- **ツールコール審査**: Claude Code の auto mode を参考にした審査を、Codex など他のツールのツールコールに LiteLLM のガードレールとして掛ける
+- **ツールコール審査**: Claude Code の auto mode を参考にした審査を、Codex など他のツールのツールコールに LiteLLM のガードレールとして掛ける。あわせて、会話を見ずにツールの引数だけで機密情報の持ち出しを判定する審査を、Claude Code を含むすべてのツールに掛ける（機密情報の審査は引数だけを見るので、送るファイルの中身までは見られない）
 - **スケール検証**: Mac 1 台の Kubernetes（OrbStack + k3d）で、複数レプリカ構成の LiteLLM を検証する
 
 仕様は [docs/spec.md](docs/spec.md)、詳細設計は [docs/design.md](docs/design.md) を参照してください。
