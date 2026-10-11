@@ -41,6 +41,15 @@ autoscaling:
 
 # 起動に時間がかかる（DB 接続と Prisma）ので、startupProbe は既定（最大 300 秒）のまま
 
+# Pod を止めるとき、止める前に 10 秒待つ。止めると決まってから入口（Traefik）が送り先から外すまでに
+# 数秒かかり、その間に届いた要求が 502 になる（2026-10-11 に確認。Codex は起動時の確認がこれに当たると、
+# その回は MCP のツールを使えないまま動く）。待っている間も要求は普通に処理し、その後の SIGTERM で
+# 処理中の要求を終えてから止まる（terminationGracePeriodSeconds は既定の 90 秒）
+lifecycle:
+  preStop:
+    exec:
+      command: ["sleep", "10"]
+
 # chatgpt/ のトークンを全 Pod で共有する（k3d が全ノードに同じホストのフォルダを見せている）
 volumes:
   - name: chatgpt-token

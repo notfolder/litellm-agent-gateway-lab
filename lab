@@ -68,6 +68,7 @@ COMMANDS: dict[str, tuple[str, object]] = {
     "test-smoke": ("疎通確認（入口、パススルーの遮断、審査の差し替え、Claude Code の素通し）", stage(checks.smoke)),
     "test-idempotency": ("./lab up を 2 回流し、2 回目で何も変わらないことを確かめる", checks.idempotency),
     "test-load": ("偽 LLM を相手にした負荷試験（k6、Docker で実行）", None),
+    "test-judge": ("二次判定の事例試験（本物の審査官を呼ぶ。ChatGPT の利用枠を使う）", None),
     "review-log": ("審査の判定ログを集計する", None),
 }
 
@@ -82,6 +83,7 @@ def main(argv: list[str]) -> int:
     parsers["test-load"].add_argument("--vus", default="20", help="同時接続数（既定 20）")
     parsers["test-load"].add_argument("--duration", default="2m", help="時間（既定 2m）")
     parsers["test-load"].add_argument("--scenario", default="chat", choices=["chat", "review"])
+    parsers["test-judge"].add_argument("--repeat", type=int, default=3, help="事例ごとの試行回数（既定 3）")
     parsers["review-log"].add_argument("--since", default="1h", help="集計する期間（既定 1h）")
     parsers["review-log"].add_argument("--raw", action="store_true", help="集計せずに JSON の行を出す")
     args = parser.parse_args(argv)
@@ -94,6 +96,8 @@ def main(argv: list[str]) -> int:
                 ops.clean_all(args.yes)
             case "test-load":
                 checks.load(Env.load(), args.vus, args.duration, args.scenario)
+            case "test-judge":
+                checks.judge_eval(Env.load(), args.repeat)
             case "review-log":
                 checks.review_log(args.since, args.raw)
             case name:

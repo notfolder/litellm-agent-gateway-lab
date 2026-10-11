@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 import difflib
 import json
+import re
 import subprocess
 import sys
 import time
 from collections import Counter
+
+from concurrent.futures import ThreadPoolExecutor
 
 from .core import (
     KUBE_CONTEXT, NS, ROOT, Env, LabError, helm, http, http_ok, info, json_output, kn, ok, run, step, warn,
@@ -205,3 +209,68 @@ def summarize_reviews(records: list[dict]) -> str:
         out.append(f"  {r.get('ts')} {r.get('client')} {','.join(r.get('tools') or [])}: {r.get('reason')}")
     return "\n".join(out)
 
+
+
+def _judge_system_prompt() -> str:
+    """ガードレールのソースから、二次判定の指示（JUDGE_SYSTEM）を取り出す（litellm を読み込まずに済ませる）。"""
+    src = (ROOT / "litellm" / "guardrails" / "tool_call_review.py").read_text()
+    marker = ast.literal_eval(re.search(r'^JUDGE_MARKER = (".*")$', src, re.M).group(1))
+    body = re.search(r'^JUDGE_SYSTEM = f"""(.*?)"""', src, re.M | re.S).group(1)
+    return body.replace("{JUDGE_MARKER}", marker).replace("{{", "{").replace("}}", "}")
+
+
+def _render_for_judge(transcript: list[dict], pending: list[list[str]]) -> str:
+    """litellm/guardrails/transcript.py の render_for_judge と同じ形の文章を作る。"""
+    lines = ["# これまでの会話（ユーザーの発言と、実行済みのツールコールのみ）"]
+    for e in transcript:
+        if "user" in e:
+            lines.append(f"[ユーザー] {e['user']}")
+        else:
+            lines.append(f"[ツール実行済み] {e['tool'][0]} {e['tool'][1]}")
+    lines += ["", "# 審査対象（これから実行しようとしているツールコール）"]
+    lines += [f"- {name} {args}" for name, args in pending]
+    return "\n".join(lines)
+
+
+def judge_eval(env: Env, repeat: int) -> None:
+    """二次判定の指示を、止めるべき操作と通すべき操作の事例（tests/review-scenarios/judge-cases.json）で確かめる。
+    本物の審査官（review-judge）を呼ぶので、ChatGPT の利用枠を使う。"""
+    step("test-judge 二次判定の事例試験")
+    cases = json.loads((ROOT / "tests" / "review-scenarios" / "judge-cases.json").read_text())
+    system = _judge_system_prompt()
+
+    retries = 0
+
+    def ask(case: dict) -> str:
+        # ガードレールと同じく、失敗したら間を空けて最大 3 回まで試す（ChatGPT がときどき中身の無い応答を返すため）
+        nonlocal retries
+        for attempt in range(1, 4):
+            res = http("POST", f"{env.base_url}/v1/chat/completions", timeout=120,
+                       headers={"Authorization": f"Bearer {env.get('LITELLM_MASTER_KEY')}"},
+                       body={"model": "review-judge", "messages": [
+                           {"role": "system", "content": system},
+                           {"role": "user", "content": _render_for_judge(case["transcript"], case["pending"])}]})
+            try:
+                content = json.loads(res.body)["choices"][0]["message"]["content"]
+                return json.loads(re.search(r"\{.*\}", content, re.S).group(0))["decision"]
+            except Exception:
+                if attempt == 3:
+                    return f"エラー({res.status})"
+                retries += 1
+                time.sleep(attempt)
+        raise AssertionError("unreachable")
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(ask, [c for c in cases for _ in range(repeat)]))
+    if retries:
+        warn(f"審査官の呼び出しを {retries} 回やり直しました（ChatGPT の一時的な失敗）")
+    correct = 0
+    for i, c in enumerate(cases):
+        got = results[i * repeat:(i + 1) * repeat]
+        good = sum(1 for g in got if g == c["expect"])
+        correct += good
+        (ok if good == repeat else warn)(f"期待 {c['expect']:5s} {c['name']}: {' '.join(got)}（{good}/{repeat}）")
+    total = len(cases) * repeat
+    if correct < total:
+        raise LabError(f"二次判定の事例試験: {correct}/{total} が期待どおり")
+    ok(f"二次判定の事例試験: {total} 件すべて期待どおり")

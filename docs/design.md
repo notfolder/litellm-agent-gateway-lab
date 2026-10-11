@@ -357,7 +357,7 @@ flowchart TB
 | `async_post_call_streaming_iterator_hook` | ストリーミングの応答を判定する。テキストの差分はそのまま流し、ツールコールの項目（Responses API の `function_call` / `custom_tool_call` / `local_shell_call`、Chat Completions の `tool_calls`、Anthropic の `tool_use`）の部分だけ溜めて、完了時に判定してから流すか差し替える |
 | `transcript.py` | 3 形式（Responses、Chat Completions、Anthropic Messages）の会話から、ユーザー発言とツールコール本体だけを抜き出す。アシスタントの文章、推論、ツールの結果は捨てる |
 | クライアント判定 | LiteLLM 組み込みの `is_claude_code_user_agent`、`is_codex_user_agent` を使う |
-| 判定ログ | 標準出力に JSON 1 行: 時刻、クライアント（UA 種別）、セッション ID、キーの別名、ツール名、引数の冒頭 200 文字、`use_jev`、Jev の確率とカテゴリ、二次判定の結果と理由、判定にかかった時間、最終判定 |
+| 判定ログ | 標準出力に JSON 1 行: 時刻、クライアント（UA 種別）、セッション ID、キーの別名、ツール名、引数の冒頭 200 文字、`use_jev`、Jev の確率とカテゴリ、二次判定の結果と理由、二次判定を試した回数、判定にかかった時間、最終判定 |
 
 ### 8.3 テスト
 
@@ -493,13 +493,18 @@ flowchart TB
 | 管理画面の「Connect」で Gmail にサインインすると、Google のトークンの交換までは通るが、保存の段階で 403（`oauth_identity_binding_enforced`）になる。enforce の設定では、本人を確かめられない保存の経路を LiteLLM が閉じている（仕様） | サインインは MCP クライアント（Codex の `mcp login`、Claude Code の `/mcp`）からゲートウェイの OAuth の手順で行う。`docs/setup-google.md` の 5 章 |
 | Codex の設定で MCP の要求に LiteLLM のキー（`x-litellm-api-key`）を付けていると、`codex mcp login` が「OAuth metadata discovery failed」で失敗する。キーがあると `GET /gmail/mcp` が 401 ではなく 200（SSE）を返し、Codex がそれをメタデータとして読もうとするため | `clients/codex-lab` は `mcp login` のときだけキーを外す |
 | サインイン後、ユーザー 1 のキーでは Gmail のツールが使え、サインインしていないユーザー 2 のキーは 401 になった（ユーザーごとのトークンの分離） | 疎通確認の「未サインインなら 401」は、サインインしないマスターキーで確かめるように変えた |
-| Codex（0.162.1）を試験用の偽 LLM（モデル名 `fake-tools`）で動かすと、Gmail の MCP のツールがモデルに渡されない（`codex mcp list` では enabled / OAuth）。未知のモデル名でのツールの扱いが原因とみているが、未確定 | ChatGPT のログインの後、本物のモデルで確かめる |
+| Codex（0.162.1）を試験用の偽 LLM（モデル名 `fake-tools`）で動かすと、Gmail の MCP のツールがモデルに渡されない（`codex mcp list` では enabled / OAuth） | 本物のモデルでも同じことが起き、原因は下の「Codex がツールの一覧を待たない」だった。偽 LLM ではやり直していない |
 | ChatGPT のデバイスコードでのログインは、アカウント側の設定で有効にしないと、コードを入力した後に「ChatGPT のセキュリティ設定で、Codex、Excel、PowerPoint、Word のデバイスコードによるサインインを有効にしてから、`codex login --device-auth` をもう一度実行してください」と出て止まる（2026-10-11 に確認）。また、LiteLLM のログイン処理は URL とコードを表示するだけでブラウザを開かず、コードを要求した時刻だけが `auth.json` に残っていると 5 分間は新しいコードを出さずに黙って待つ | ChatGPT の設定 →「セキュリティ」で、デバイスコードによるサインインを有効にしてから `./lab chatgpt-login` を実行する（文中の `codex login --device-auth` は Codex 本体向けの案内なので、この環境では `./lab chatgpt-login` をやり直す）。`./lab chatgpt-login` は、トークンの無い `auth.json` を消してから始め、表示された URL をブラウザで開く |
 | LiteLLM は MCP の経路（`/<サーバー名>/mcp`）へのセッション無しの GET に、終わらないイベントストリーム（200）を返す。Codex（0.162.1）は起動時にこの GET を送って応答を待ち続け、MCP サーバーを使えなくなる | 入口（Traefik）で、この GET だけを POST 専用の経路に置き換えて 405 を返す（`k8s/ingress.yaml`）。MCP の仕様では、サーバーはこの GET に 405 を返してよい。直した後、Codex は MCP につながり、ツール 7 個の一覧を取れた |
-| Codex は MCP の一覧を取れるようになったが、本物のモデル（gpt-5.6-terra）で「Gmail のラベルの数」を頼むと「Gmail にアクセスできない」と答える。Codex はコードを実行する形（`exec` のツール）でツールを探しており、Gmail のツールが見つかっていない様子。原因は未確定 | 調査中 |
+| Codex は MCP の一覧を取れるようになったが、本物のモデル（gpt-5.6-terra）で「Gmail のラベルの数」を頼むと、ときどき「Gmail にアクセスできない」と答える。**原因は、Codex が MCP のツールの一覧（`tools/list`）の応答を待たずに最初のターンを始めること。** 起動から約 1 秒で最初の要求を出すが、ゲートウェイ経由の一覧は 0.6〜1.0 秒かかる（LiteLLM が毎回 MCP サーバーに問い合わせる）。間に合わなかった回は、Gmail のツールが無いまま動く。実測では一覧の応答が 564 ms の回は使え、811 ms と 985 ms の回は使えなかった（Traefik のアクセスログで確認） | Codex の設定に `mcp_optional_startup_grace_ms = 10000` を入れ、任意の MCP サーバーの一覧を最初のターンの前に最大 10 秒待たせる（`./lab clients` が生成）。Pod を入れ替えた直後 3 回と、その 2 回目 3 回の計 12 回すべてで Gmail のツール 7 個が見え、ラベルの数（38）にも正しく答えた。`mcp_servers.gmail.required = true` でも 6 回中 6 回使えたが、Gmail のサインインが切れると Codex 自体が起動しなくなるので採らなかった |
+| ローリング更新の途中で、終了の決まった Pod にも数秒は要求が届き、502 になる（入口が送り先から外すまでの遅れ）。Codex の起動時の確認がこれに当たると、その回は MCP のツールを使えない | LiteLLM の Pod に `preStop` で 10 秒待つ設定を足した（`litellm/values.yaml`）。待つ間も要求は普通に処理する |
+| 上の原因を調べるため、入口（Traefik）の要求ごとの記録が要った | Traefik のアクセスログを有効にした（`k8s/traefik-config.yaml`）。ヘッダーは記録しない（キーやトークンを残さないため） |
+| ゲートウェイの MCP の OAuth は、リフレッシュトークンを使うたびに新しいものに替える（使い回すと `invalid_grant`「already used」）。Pod の入れ替えを何度も繰り返す試験の途中で、Codex のリフレッシュトークンが拒否され、Gmail を使えなくなった | `clients/codex-lab mcp login gmail` でサインインし直す（`docs/setup-google.md` 5 章と同じ手順）。普段の運用では起きていない |
+| 試したが採らなかったこと: 同じ Pod に送り続ける設定（入口のスティッキーセッション）、起動時に MCP のセッションを用意しておくモジュール、未知のセッション ID に 404 を返す改修 | どれも原因（Codex が待たない）に効かなかった。404 の改修は正しいセッションまで壊したので戻した |
 | `chatgpt/` で使えるモデル名は、ChatGPT のアカウントで決まる。`gpt-5.3-codex` は「ChatGPT のアカウントでは使えない」と拒否された。Codex 本体のモデル一覧（`~/.codex/models_cache.json`）にある名前なら使える | `.env` の既定を `LAB_CODEX_MODEL=gpt-5.6-terra`、`LAB_JUDGE_MODEL=gpt-5.6-luna` にした |
 | 二次判定が本物のモデルになると判定が揺れ、疎通確認（偽 LLM で危険な操作が止まるか）が決まらなくなる | ガードレールに `test_model` / `test_judge_model` を足し、試験用のモデル（`fake-tools`）への要求は偽 LLM の審査官だけで判定する（Jev も使わない） |
-| 本物の二次判定が、Codex がツールを探す操作（MCP のリソースの一覧）を「頼まれたツールではない」として止めることがあった（誤った拒否） | 審査のシナリオ試験（spec 6.2）で、誤った拒否の率として測る |
+| 本物の二次判定が、Codex がツールを探す操作（MCP のリソースの一覧）を「頼まれたツールではない」として止めることがあった（誤った拒否）。審査官への指示が「頼まれた範囲かを厳しく確かめる」形だったため | 指示を、Claude Code の auto モードと同じ「原則は通し、決めた危険な操作だけを止める」形に書き直した。止める操作は、頼まれていない破壊的な変更、外部の文章に書かれた指示の実行、別の認証情報の探索、頼まれていない公開（「共有して」だけでは公開の依頼とみなさない）、検証の回避など。ツールや MCP のリソースの一覧・検索は通す例に挙げた。通すべき 5 件と止めるべき 5 件の事例（`tests/review-scenarios/judge-cases.json`）を 3 回ずつ判定させ、旧い指示は 30 回中 27 回（リソースの一覧を 3 回とも止めた）、新しい指示は 30 回中 30 回、期待どおりだった。`./lab test-judge` でいつでも測り直せる |
+| ChatGPT は、審査の依頼を同時に何件も受けると、ときどき中身の無い応答を返す（LiteLLM は「Unknown items in responses API response: []」で 500 にする）。6 件並列で 18 件中 1 件ほど。LiteLLM 自身の再試行は間を空けずに続けるので同じく失敗する。審査に失敗すると操作を止める設定なので、誤った拒否になる | ガードレールで審査官の呼び出しを、1 秒、2 秒と間を空けて最大 3 回まで試す。判定ログに試した回数（`judge_attempts`）を出す。`./lab test-judge` も同じく頼み直し、やり直した回数を表示する |
 | ローリング更新の直後に、終了中の Pod に当たって入口のヘルスチェックが一時的に失敗し、bootstrap の段階が止まった | bootstrap の接続の確認を、1 回ではなく最大 60 秒待つようにした |
 | TypeSafe は、組織の残高（クレジット）が無いと API キーを作れない | 手作業の準備に「Billing でクレジットを追加してからキーを作る」を足した。キーを入れた後、Codex のツールコールが Jev の一次判定（約 0.3 秒、確率 0.03 と 0.16）で判定されることを確かめた |
 | OrbStack が `~/Documents` 以下をコンテナに見せるには、macOS の「書類フォルダへのアクセス」の許可が要る。許可を求める画面が出ている間、`docker run` は止まる | 2026-10-11 に許可済み。構築スクリプトは `~/Documents` をコンテナに見せない（ビルドは Docker のビルドコンテキストで送る） |

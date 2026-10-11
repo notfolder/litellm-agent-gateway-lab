@@ -72,6 +72,7 @@ LAB_USER2_EMAIL=another@gmail.com
 - 管理画面の「MCP Servers」→「My Connections」→「Connect」は使えません。enforce の設定では、本人の確認ができない経路として LiteLLM が閉じています（403）
 - `clients/codex-lab` は `mcp login` のときだけ LiteLLM のキーを外して Codex を起動します。キーが付いていると LiteLLM が 401（サインインの要求）を返さず、Codex がサインインの手順を見つけられないためです
 - サインインの結果は、ユーザーごとに LiteLLM の DB に保存されます。`./lab rebuild` で DB を作り直すと消えるので、サインインをやり直します
+- Codex が「Gmail にアクセスできない」と答えるようになったら、Codex のリフレッシュトークンが拒否されています（ゲートウェイは使うたびに新しいトークンに替え、使い回しを拒否する）。`clients/codex-lab mcp login gmail` でサインインし直します
 
 ## 6. 確認（2026-10-11 に実施）
 
@@ -80,3 +81,4 @@ LAB_USER2_EMAIL=another@gmail.com
 | 管理画面に Google でログインする | ユーザー 1（`LAB_USER1_EMAIL`）が管理者として入れた |
 | ユーザー 1 のキーで Gmail のツールを使う（サインイン後） | ツール 7 個が見え、ラベルの一覧を取れた |
 | サインインしていないユーザー 2 のキーで同じことをする | 401 で拒否された（ユーザー 1 のサインインは使えない） |
+| Codex（`clients/codex-lab`、gpt-5.6-terra）に「Gmail のラベルの数」を頼む | Gmail のツールで数え、38 と答えた。LiteLLM の Pod を入れ替えた直後でも、12 回すべてでツール 7 個が見えた |

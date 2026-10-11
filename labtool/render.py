@@ -197,6 +197,11 @@ def client_files(env: Env, claude_key: str, codex_key: str, codex_home: Path) ->
         "# 生成物（./lab clients）。手で編集しない\n"
         f'model = "{codex_model}"\n'
         'model_provider = "litellm"\n'
+        "# 任意の MCP サーバー（gmail）のツールの一覧を、最初のターンの前に最大 10 秒待つ。Codex は既定では\n"
+        "# ほとんど待たずにモデルを呼ぶので、ゲートウェイの tools/list（約 0.6〜1 秒）が間に合わないと、\n"
+        "# その回は MCP のツールを使えない（2026-10-11 に確認）。required = true でも待つが、その場合は\n"
+        "# gmail のサインインが切れると Codex 自体が起動しなくなる\n"
+        "mcp_optional_startup_grace_ms = 10000\n"
         "\n"
         "[model_providers.litellm]\n"
         'name = "LiteLLM (lab)"\n'

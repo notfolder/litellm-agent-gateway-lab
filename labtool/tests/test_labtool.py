@@ -125,6 +125,8 @@ class ClientFilesTest(unittest.TestCase):
                          "http://localhost:8080/gmail/mcp")
         self.assertIn("[mcp_servers.gmail]", files["codex-config.toml"])
         self.assertIn("LITELLM_API_KEY='kx'", files["codex.env"])
+        # MCP のツールの一覧を最初のターンの前に待つ（待たないと gmail のツールが使えない回がある）
+        self.assertIn("mcp_optional_startup_grace_ms = 10000", files["codex-config.toml"])
 
 
 class TemplateTest(unittest.TestCase):

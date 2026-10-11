@@ -13,3 +13,10 @@ spec:
             readTimeout: 600s
             writeTimeout: 600s
             idleTimeout: 600s
+    # アクセスログ（入口で返した状態コードと、どの Pod に送ったかを残す。502 などの切り分けに使う）
+    logs:
+      access:
+        enabled: true
+        fields:
+          headers:
+            defaultmode: drop

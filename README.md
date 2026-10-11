@@ -37,6 +37,7 @@ brew install uv k3d kubectl helm
 | `./lab status` | 状態の表示 |
 | `./lab upgrade v1.x.y` | LiteLLM のローリング更新 |
 | `./lab test-unit` / `test-smoke` / `test-idempotency` / `test-load` | 試験 |
+| `./lab test-judge` | 二次判定の事例試験（本物の審査官を呼ぶので ChatGPT の利用枠を使う） |
 | `./lab review-log` | 審査の判定ログの集計 |
 | `clients/claude-lab` / `clients/codex-lab` | 検証用の LiteLLM を通して Claude Code / Codex を起動（普段の設定は変えない） |
 
