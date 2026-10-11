@@ -6,13 +6,6 @@
 .codex-lab/
 clients/out/
 
-# セッションの引き継ぎ記録（公開しない）。ただし変更仕様書と変更設計書はコミットする
-.history/*
-!.history/*/
-.history/*/*
-!.history/*/変更仕様書.md
-!.history/*/変更設計書.md
-
 # Python
 __pycache__/
 *.pyc

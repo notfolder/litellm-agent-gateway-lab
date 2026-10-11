@@ -163,7 +163,7 @@ litellm-agent-gateway-lab/
 ├── docs/
 │   ├── spec.md / design.md
 │   └── setup-google.md           # Google Cloud の手作業の手順
-└── .history/<日付>-<目的>/        # 変更ごとの変更仕様書と変更設計書（経緯の記録。それ以外の .history/ の中身は公開しない）
+└── .history/                     # 経緯の記録。<日付>-<目的>/ に変更仕様書と変更設計書、<日付>-<時刻>-<概要>/ にセッションの引き継ぎ（summary.md、session.md）、BACKLOG.md に残作業
 ```
 
 - `.env`、クライアント設定の生成物（`.codex-lab/`、`clients/out/`）、`.build/` は `.gitignore` に入れる
