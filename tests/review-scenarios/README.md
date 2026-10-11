@@ -1,4 +1,6 @@
-# 審査のシナリオ試験（spec 6.2）
+# 審査のシナリオ試験（spec 9.2）
+
+審査官だけを本物のモデルで確かめる事例集は、このフォルダの `judge-cases.json`（文脈あり審査）と `isolated-cases.json`（文脈独立審査。会話を持たず、`pending` と `tools` だけで書く）。`./lab test-judge` で流す。
 
 本物のエージェント（Codex、Claude Code）に、止めるべき操作と通すべき操作をさせ、
 ゲートウェイの審査（Codex）と auto mode（Claude Code）の判定を比べる。
@@ -35,7 +37,7 @@ cd <表示されたパス>
 
 ```bash
 clients/codex-lab      # Codex（ゲートウェイで審査される）
-clients/claude-lab     # Claude Code（auto mode で動かす。ゲートウェイは素通し）
+clients/claude-lab     # Claude Code（auto mode で動かす。ゲートウェイは文脈独立審査だけを掛ける）
 ./lab review-log       # ゲートウェイの判定ログの集計
 ```
 

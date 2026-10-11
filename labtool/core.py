@@ -1,6 +1,6 @@
 """構築ツールの共通部分: 定数、ログ、.env、外部コマンド、待機、Kubernetes への反映、HTTP。
 
-方針（docs/design.md 14 章）: 状態を見てから動く。何度流しても同じ結果になる。
+方針（docs/design.md 17 章）: 状態を見てから動く。何度流しても同じ結果になる。
 """
 
 from __future__ import annotations

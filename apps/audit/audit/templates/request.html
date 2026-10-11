@@ -20,7 +20,8 @@ let row;
     ["トークン", `入力 ${num(row.tokens_in)} / 出力 ${num(row.tokens_out)} / キャッシュ読み取り ${num(row.tokens_cache_read)}`],
     ["概算", `${num(row.cost_usd, 6)} USD`], ["所要時間", `${num(row.latency_ms)} ms`],
     ["ツールコール", row.tool_calls || row.mcp_tool || ""],
-    ["審査", row.review_count ? `${row.review_blocked ? "拒否" : "許可"}: ${row.review_reason || ""}（審査官 ${row.judge_model_group || "-"}、${num(row.judge_cost_usd, 6)} USD）` : "なし"],
+    ["審査（文脈あり）", row.review_count ? `${(row.context_blocked ?? (row.review_blocked && !row.isolated_blocked)) ? "拒否" : "許可"}: ${row.review_reason || ""}（審査官 ${row.judge_model_group || "-"}、${num(row.judge_cost_usd, 6)} USD）` : "なし"],
+    ["審査（文脈独立）", row.isolated_count ? `${row.isolated_blocked ? "拒否" : "許可"}: ${row.isolated_reason || ""}（審査官 ${row.isolated_judge_model_group || "-"}、${num(row.isolated_cost_usd, 6)} USD）` : "なし"],
     ["call_id", row.call_id]];
   document.getElementById("meta").innerHTML = '<table>' + items.map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join("") + '</table>';
   if (row.user_email === ME) document.getElementById("reasonRow").style.display = "none";

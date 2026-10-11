@@ -31,7 +31,7 @@ LiteLLM の管理画面の Google SSO と、Gmail の MCP（`google_workspace_mc
    - `.../auth/userinfo.profile`
    - `.../auth/gmail.readonly`
 
-テストモードでは、リフレッシュトークンが 7 日で失効します（spec 6.1 の再サインインの確認に使う）。
+テストモードでは、リフレッシュトークンが 7 日で失効します（spec 9.1 の再サインインの確認に使う）。
 
 ## 3. OAuth クライアント
 

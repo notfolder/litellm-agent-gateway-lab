@@ -50,7 +50,7 @@ ChatGPT:         {yn(env.has_chatgpt())}  → Codex 用のモデルと二次判�
 
 
 def upgrade(env: Env, version: str) -> None:
-    """LiteLLM を別の版でローリング更新する（spec 6.3 の無停止更新の試験）。
+    """LiteLLM を別の版でローリング更新する（spec 9.3 の無停止更新の試験）。
     .env の LAB_LITELLM_VERSION を書き換えるので、以後の ./lab up もこの版になる。"""
     step(f"upgrade LiteLLM を {env.litellm_version} から {version} に更新")
     if not succeeds(["docker", "manifest", "inspect", f"ghcr.io/berriai/litellm-database:{version}"], timeout=60):

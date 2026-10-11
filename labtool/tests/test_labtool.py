@@ -84,6 +84,49 @@ class LitellmConfigTest(unittest.TestCase):
         cfg = render.litellm_config(env(TYPESAFE_API_KEY="t", LAB_USE_JEV="false"), has_chatgpt=False)
         self.assertFalse(cfg["guardrails"][0]["litellm_params"]["use_jev"])
 
+    def test_isolated_review(self):
+        cfg = render.litellm_config(env(LAB_JUDGE_MODEL="m2"), has_chatgpt=True)
+        self.assertEqual(self.models(cfg)["isolated-judge"], "chatgpt/m2")   # 空なら LAB_JUDGE_MODEL と同じ
+        params = cfg["guardrails"][0]["litellm_params"]
+        self.assertTrue(params["isolated_review"])
+        self.assertTrue(params["isolated_review_claude_code"])
+        self.assertEqual(params["isolated_judge_model"], "isolated-judge")
+        self.assertEqual(params["test_isolated_judge_model"], "fake-tools")
+        self.assertFalse(params["isolated_fail_open"])
+        self.assertIn("社外に出る", params["isolated_policy"])               # 既定の判定基準のファイルの中身
+        cfg = render.litellm_config(env(LAB_ISOLATED_JUDGE_MODEL="m3", LAB_ISOLATED_CLAUDE_CODE="false"),
+                                    has_chatgpt=False)
+        self.assertEqual(self.models(cfg)["isolated-judge"], "openai/fake-tools")
+        self.assertFalse(cfg["guardrails"][0]["litellm_params"]["isolated_review_claude_code"])
+        self.assertEqual(self.models(render.litellm_config(env(LAB_ISOLATED_JUDGE_MODEL="m3"), has_chatgpt=True))
+                         ["isolated-judge"], "chatgpt/m3")
+
+    def test_isolated_review_off_still_says_false(self):
+        cfg = render.litellm_config(env(LAB_ISOLATED_REVIEW="false"), has_chatgpt=True)
+        self.assertNotIn("isolated-judge", self.models(cfg))
+        params = cfg["guardrails"][0]["litellm_params"]
+        # 出さないとガードレールの既定（true）になり、判定基準が空で起動しなくなる
+        self.assertIs(params["isolated_review"], False)
+        self.assertNotIn("isolated_policy", params)
+
+    def test_isolated_policy_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "p.md"
+            f.write_text("  独自の基準  \n")
+            self.assertEqual(render.isolated_policy(env(LAB_ISOLATED_POLICY_FILE=str(f))), "独自の基準")
+            f.write_text("\n")
+            with self.assertRaises(ValueError):
+                render.isolated_policy(env(LAB_ISOLATED_POLICY_FILE=str(f)))
+
+    def test_isolated_judge_prices_and_contract(self):
+        cfg = render.litellm_config(env(LAB_PRICE_ISOLATED_JUDGE_IN="1", LAB_PRICE_ISOLATED_JUDGE_OUT="2",
+                                        LAB_PRICE_ISOLATED_JUDGE_CACHE_READ="0.1", LAB_JUDGE_MODEL="unknown"),
+                                    has_chatgpt=True)
+        iso = next(m for m in cfg["model_list"] if m["model_name"] == "isolated-judge")
+        self.assertAlmostEqual(iso["model_info"]["output_cost_per_token"], 2.0e-6)
+        plus = next(c for c in render.initial_contracts(env())["contracts"] if c["id"] == "chatgpt-plus")
+        self.assertIn("isolated-judge", plus["models"])
+
     def test_yaml_round_trip_is_stable(self):
         cfg = render.litellm_config(env(), has_chatgpt=False)
         text = render.to_yaml(cfg, "header")
@@ -169,6 +212,41 @@ class ReviewLogTest(unittest.TestCase):
         self.assertIn("二次判定まで進んだ割合: 50.0%", text)
         self.assertIn("平均 20 / 最大 30", text)
         self.assertIn("t1 codex shell: 削除", text)
+
+    def test_summary_with_isolated_review(self):
+        records = [
+            {"event": "review", "client": "codex", "allowed": False, "judge_used": True, "context_review": True,
+             "isolated_review": True, "isolated_allowed": False, "blocked_by": ["isolated"],
+             "timings_ms": {"total": 30, "isolated": 25}},
+            {"event": "review", "client": "claude-code", "allowed": True, "judge_used": False,
+             "context_review": False, "isolated_review": True, "isolated_allowed": True, "blocked_by": [],
+             "timings_ms": {"total": 15, "isolated": 15}},
+        ]
+        text = checks.summarize_reviews(records)
+        self.assertIn("二次判定まで進んだ割合: 100.0%", text)   # Claude Code（文脈あり審査なし）は数えない
+        self.assertIn("2 件 / 拒否 1 件 / 判定エラー 0 件", text)
+        self.assertIn("中央値 25 / 最大 25", text)
+        self.assertIn("isolated 1 件", text)
+        self.assertIn("なし 1 件", text)
+
+
+class JudgeEvalTest(unittest.TestCase):
+    def test_scopes(self):
+        self.assertEqual(checks.judge_scopes("both"), ["context", "isolated"])
+        self.assertEqual(checks.judge_scopes("context"), ["context"])
+        self.assertEqual(checks.judge_scopes("isolated"), ["isolated"])
+
+    def test_isolated_prompt_and_input_match_the_guardrail(self):
+        system = checks._isolated_system_prompt(env())
+        self.assertTrue(system.startswith("[[tool-call-isolated-review]]"))
+        self.assertNotIn("{policy}", system)
+        self.assertIn("社外に出る", system)
+        self.assertIn('{"decision": "allow" または "block"', system)
+        cases = json.loads((Path(checks.ROOT) / "tests" / "review-scenarios" / "isolated-cases.json").read_text())
+        self.assertEqual(len(cases), 10)
+        text = checks._render_for_isolated(cases[0])
+        self.assertTrue(text.startswith("# 審査対象（これから実行しようとしているツールコール）"))
+        self.assertIn("## exec_command\n説明: Runs a command", text)
 
 
 class ObjectStoreSpecTest(unittest.TestCase):

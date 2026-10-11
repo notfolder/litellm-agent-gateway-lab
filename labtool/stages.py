@@ -1,4 +1,4 @@
-"""構築の各段階。どの段階も、何度実行しても同じ状態になる（docs/design.md 14 章）。"""
+"""構築の各段階。どの段階も、何度実行しても同じ状態になる（docs/design.md 17 章）。"""
 
 from __future__ import annotations
 
