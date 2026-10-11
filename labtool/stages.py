@@ -19,6 +19,13 @@ from .core import (
 
 K8S = ROOT / "k8s"
 IMAGE_FILE = BUILD_DIR / "litellm-image.json"
+
+# クラスタに入れる部品の版（変更設計書 3.1 節）
+CERT_MANAGER = {"repo": "https://charts.jetstack.io", "chart": "cert-manager", "version": "v1.21.2"}
+CNPG = {"repo": "https://cloudnative-pg.github.io/charts", "chart": "cloudnative-pg", "version": "0.29.1"}
+BARMAN_PLUGIN_VERSION = "v0.15.1"
+BARMAN_PLUGIN_URL = ("https://github.com/cloudnative-pg/plugin-barman-cloud/releases/download/"
+                     f"{BARMAN_PLUGIN_VERSION}/manifest.yaml")
 USER_KEYS = ["LAB_KEY_USER1_CLAUDE", "LAB_KEY_USER1_CODEX", "LAB_KEY_USER2_CLAUDE", "LAB_KEY_USER2_CODEX"]
 
 
@@ -114,7 +121,46 @@ def cluster(env: Env) -> None:
         warn("Traefik の起動引数にタイムアウトの設定が見えません（反映待ちの可能性があります）")
 
     kapply(files=[K8S / "namespace.yaml"], namespaced=False)
+    operators()
     ok("クラスタの準備ができました")
+
+
+def _ensure_chart(release: str, namespace: str, spec: dict, values: dict) -> None:
+    """Helm のリリースを入れる。値のハッシュが同じなら helm を流さない（流すたびにリビジョンが増えるのを防ぐ）。
+    ハッシュはリリースの説明（--description）に持つ（cert-manager のチャートは、値に知らない項目があると断るため）。"""
+    values_hash = short_hash(json.dumps([spec, values], sort_keys=True))
+    mark = f"labValuesHash={values_hash}"
+    history = json_output(helm("-n", namespace, "history", release, "--max", "1", "-o", "json"), default=[]) or []
+    if history and history[-1].get("status") == "deployed" and history[-1].get("description") == mark:
+        ok(f"{release} は最新です（{spec['version']}）")
+        return
+    info(f"{release} {spec['version']} を入れます")
+    values_file = BUILD_DIR / f"{release}-values.json"
+    write_if_changed(values_file, json.dumps(values, indent=2) + "\n")
+    run(helm("upgrade", "--install", release, spec["chart"], "--repo", spec["repo"], "--version", spec["version"],
+             "-n", namespace, "--create-namespace", "-f", str(values_file), "--description", mark,
+             "--wait", "--timeout", "10m"))
+
+
+def operators() -> None:
+    """cert-manager → CloudNativePG のオペレーター → Barman Cloud Plugin（この順。プラグインは証明書を使う）。"""
+    _ensure_chart("cert-manager", "cert-manager", CERT_MANAGER, {"crds": {"enabled": True}})
+    wait_until(300, "cert-manager の準備", kc("-n", "cert-manager", "wait", "--for=condition=Available",
+                                              "deploy", "--all", "--timeout=5s"))
+    _ensure_chart("cnpg", "cnpg-system", CNPG, {})
+    wait_until(300, "CloudNativePG のオペレーターの準備", kc("-n", "cnpg-system", "wait", "--for=condition=Available",
+                                                         "deploy", "-l", "app.kubernetes.io/name=cloudnative-pg",
+                                                         "--timeout=5s"))
+    manifest = BUILD_DIR / f"barman-cloud-{BARMAN_PLUGIN_VERSION}.yaml"
+    if not manifest.exists():
+        info(f"Barman Cloud Plugin {BARMAN_PLUGIN_VERSION} のマニフェストを取得します")
+        res = http("GET", BARMAN_PLUGIN_URL, timeout=60)
+        if res.status != 200:
+            raise LabError(f"Barman Cloud Plugin のマニフェストを取得できませんでした（{res.status}）")
+        write_if_changed(manifest, res.body)
+    kapply(files=[manifest], namespaced=False)
+    wait_until(300, "Barman Cloud Plugin の準備", kc("-n", "cnpg-system", "rollout", "status", "deploy/barman-cloud",
+                                                  "--timeout=5s"))
 
 
 def images(env: Env) -> dict:
@@ -175,7 +221,16 @@ def secrets_(env: Env) -> Env:
         env.fill(key_name, user)
         env.fill(secret_name, gen_secret(20))
 
-    kapply(manifest=secret_manifest("postgres", {"username": "litellm", "password": env.get("POSTGRES_PASSWORD")}))
+    pg_password = env.get("POSTGRES_PASSWORD")
+    # CloudNativePG の初期化に渡す（型は basic-auth）。パスワードは .env の値を使い回し、作り直しても変わらない
+    kapply(manifest=secret_manifest("litellm-pg-app", {"username": "litellm", "password": pg_password},
+                                    "kubernetes.io/basic-auth"))
+    # DB 移行の Job が使う直結の接続先（Pooler を通さない）
+    kapply(manifest=secret_manifest("litellm-migrate-db", {
+        "DATABASE_URL": f"postgresql://litellm:{pg_password}@litellm-pg-rw:5432/litellm"}))
+    backup_key, backup_secret = render.s3_env_names("pg-backup")
+    kapply(manifest=secret_manifest("pg-backup-s3", {"ACCESS_KEY_ID": env.get(backup_key),
+                                                     "ACCESS_SECRET_KEY": env.get(backup_secret)}))
     kapply(manifest=secret_manifest("redis", {"password": env.get("REDIS_PASSWORD")}))
     kapply(manifest=secret_manifest("litellm-secrets", render.secrets_for_litellm(env)))
     kapply(manifest=secret_manifest("rustfs", {"access-key": env.get("RUSTFS_ACCESS_KEY"),
@@ -212,11 +267,25 @@ def objectstore(env: Env) -> None:
     ok("オブジェクトストレージの準備ができました")
 
 
+def _delete_if_present(*resources: str) -> None:
+    """以前の構成の部品を消す。無ければ何もしない（2 回目以降に流しても失敗しない）。"""
+    for r in resources:
+        if succeeds(kn("get", r)):
+            info(f"以前の構成の {r} を消します")
+            run(kn("delete", r, "--ignore-not-found", "--wait=true"))
+
+
 def datastores(env: Env) -> None:
-    """PostgreSQL と Redis。差分だけ反映し、Ready を待つ。"""
+    """PostgreSQL（CloudNativePG、3 台）と Redis。差分だけ反映し、準備ができるまで待つ。"""
     step("datastores PostgreSQL と Redis")
-    kapply(files=[K8S / "postgres.yaml", K8S / "redis.yaml"])
-    rollout("statefulset/postgres", 300, "PostgreSQL の起動")
+    # 1 台の PostgreSQL（以前の構成）を消す。中身は引き継がない（変更仕様書 4 章）
+    _delete_if_present("statefulset/postgres", "service/postgres", "pvc/data-postgres-0", "secret/postgres")
+    kapply(manifest=render_template(K8S / "postgres-cnpg.yaml", {"S3_ENDPOINT": env.get("LAB_S3_ENDPOINT",
+                                                                                       render.DEFAULT_S3_ENDPOINT)}))
+    wait_until(1200, "PostgreSQL（3 台）の準備", kn("wait", "cluster/litellm-pg", "--for=condition=Ready",
+                                                  "--timeout=5s"))
+    rollout("deploy/litellm-pg-pooler-rw", 180, "Pooler の起動")
+    kapply(files=[K8S / "redis.yaml"])
     rollout("deploy/redis", 180, "Redis の起動")
     ok("PostgreSQL と Redis の準備ができました")
 
@@ -279,12 +348,13 @@ def litellm(env: Env) -> None:
     values_file = ROOT / "litellm" / "values.yaml"
     values_hash = short_hash(values_file.read_text() + overrides_file.read_text() + env.chart_version)
 
+    migrate_db(image)
     _recover_helm_release()
     current = (json_output(helm("-n", NS, "get", "values", HELM_RELEASE, "-o", "json"), default={}) or {})
     if current.get("labValuesHash") == values_hash and _helm_status() == "deployed":
         ok(f"LiteLLM のリリースは最新です（値のハッシュ {values_hash}）")
     else:
-        info("LiteLLM を helm upgrade --install します（DB 移行の Job が先に流れます）")
+        info("LiteLLM を helm upgrade --install します")
         run(helm("upgrade", "--install", HELM_RELEASE, LITELLM_CHART, "--version", env.chart_version,
                  "-n", NS, "-f", str(values_file), "-f", str(overrides_file),
                  "--set-string", f"labValuesHash={values_hash}", "--wait", "--timeout", "15m"))
@@ -294,6 +364,37 @@ def litellm(env: Env) -> None:
     wait_until(120, f"入口からの応答（{env.base_url}/health/liveliness）",
                lambda: http_ok(f"{env.base_url}/health/liveliness"))
     ok(f"LiteLLM の準備ができました: {env.base_url}（管理画面 {env.base_url}/ui）")
+
+
+def migrate_db(image: dict) -> None:
+    """DB 移行の Job（変更設計書 3.5 節）。名前はイメージと DB（Cluster の uid）のハッシュ。成功済みなら流さない。"""
+    uid = output(kn("get", "cluster", "litellm-pg", "-o", "jsonpath={.metadata.uid}"), check=False).strip()
+    if not uid:
+        raise LabError("PostgreSQL（cluster/litellm-pg）がありません。先に ./lab datastores を流してください")
+    name = f"litellm-migrate-{short_hash(image['tag'] + uid)}"
+    job = json_output(kn("get", "job", name, "-o", "json"), default=None)
+    if job and (job.get("status") or {}).get("succeeded"):
+        ok(f"DB 移行は済んでいます（{name}）")
+    else:
+        if job:
+            run(kn("delete", "job", name, "--wait=true"))
+        info(f"DB 移行の Job {name} を流します")
+        kapply(manifest=render_template(K8S / "litellm-migrate.yaml", {
+            "JOB_NAME": name, "IMAGE": f"{image['repository']}:{image['tag']}"}))
+
+        def done() -> bool:
+            st = (json_output(kn("get", "job", name, "-o", "json"), default={}) or {}).get("status") or {}
+            for c in st.get("conditions") or []:
+                if c.get("type") == "Failed" and c.get("status") == "True":
+                    run(kn("logs", f"job/{name}", "--tail=50"), check=False)
+                    raise LabError(f"DB 移行が失敗しました（{name}）")
+            return bool(st.get("succeeded"))
+
+        wait_until(300, "DB 移行", done)
+    # 古いハッシュの Job を片付ける
+    for other in output(kn("get", "job", "-l", "app=litellm-migrate", "-o", "name"), check=False).split():
+        if other != f"job.batch/{name}":
+            run(kn("delete", other, "--ignore-not-found"), check=False, quiet=True)
 
 
 def bootstrap(env: Env) -> None:

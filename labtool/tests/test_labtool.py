@@ -199,5 +199,31 @@ class ObjectStoreSpecTest(unittest.TestCase):
                                              "Resource": ["arn:aws:s3:::audit-raw/raw/*"]}])
 
 
+class DatabaseSettingsTest(unittest.TestCase):
+    def test_pooler_is_default(self):
+        o = render.helm_overrides(env(), "repo", "tag", "h")
+        self.assertEqual(o["db"]["endpoint"], "litellm-pg-pooler-rw")
+        self.assertEqual(o["envVars"]["DATABASE_DISABLE_PREPARED_STATEMENTS"], "true")
+        self.assertEqual(o["envVars"]["DISABLE_SCHEMA_UPDATE"], "true")
+        cfg = render.litellm_config(env(), has_chatgpt=False)
+        self.assertEqual(cfg["general_settings"]["database_connection_pool_limit"], 10)
+
+    def test_direct(self):
+        e = env(LAB_DB_POOLER="direct")
+        o = render.helm_overrides(e, "repo", "tag", "h")
+        self.assertEqual(o["db"]["endpoint"], "litellm-pg-rw")
+        self.assertNotIn("DATABASE_DISABLE_PREPARED_STATEMENTS", o["envVars"])
+        self.assertEqual(render.litellm_config(e, has_chatgpt=False)["general_settings"]
+                         ["database_connection_pool_limit"], 5)
+
+    def test_unknown_mode_is_an_error(self):
+        with self.assertRaises(ValueError):
+            render.db_pooler(env(LAB_DB_POOLER="pgbouncer"))
+
+    def test_secret_type(self):
+        m = json.loads(secret_manifest("s", {"username": "u"}, "kubernetes.io/basic-auth"))
+        self.assertEqual(m["type"], "kubernetes.io/basic-auth")
+
+
 if __name__ == "__main__":
     unittest.main()

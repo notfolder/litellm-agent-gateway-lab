@@ -21,7 +21,7 @@ environmentSecrets:
 
 envVars:
   LITELLM_MODE: PRODUCTION
-  # DISABLE_SCHEMA_UPDATE はチャートが設定する（migrationJob を有効にすると本体の Pod は true、Job は false）
+  # DISABLE_SCHEMA_UPDATE と DB の接続先は ./lab litellm が上書き用の値で入れる（DB 移行は自前の Job。変更設計書 3.4 節）
   PROXY_BASE_URL: http://localhost:8080
   CHATGPT_TOKEN_DIR: /var/lib/lab/chatgpt
   UI_USERNAME: admin                   # SSO が無いときの管理画面のログイン（パスワードはマスターキー）
@@ -60,26 +60,25 @@ volumeMounts:
   - name: chatgpt-token
     mountPath: /var/lib/lab/chatgpt
 
+# PostgreSQL は CloudNativePG（k8s/postgres-cnpg.yaml）。endpoint は ./lab litellm が LAB_DB_POOLER で切り替える
+# （Pooler: litellm-pg-pooler-rw、直結: litellm-pg-rw）。Secret litellm-pg-app は ./lab secrets が作る
 db:
   useExisting: true
   deployStandalone: false
-  endpoint: postgres
+  endpoint: litellm-pg-pooler-rw
   database: litellm
   secret:
-    name: postgres
+    name: litellm-pg-app
     usernameKey: username
     passwordKey: password
 
 redis:
   enabled: false
 
+# DB 移行はチャートの Job を使わず、./lab litellm が primary に直結する自前の Job で流す
+# （Pooler の transaction モード越しでは移行が壊れるおそれがあるため。k8s/litellm-migrate.yaml）
 migrationJob:
-  enabled: true
-  hooks:
-    argocd:
-      enabled: false
-    helm:
-      enabled: true                    # 素の helm で、install / upgrade の前に DB 移行を流す
+  enabled: false
 
 ingress:
   enabled: false                       # k8s/ingress.yaml（Traefik）を使う

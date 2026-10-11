@@ -12,6 +12,7 @@ from .core import CHATGPT_TOKEN_IN_NODE, Env
 
 FAKE_LLM_BASE = "http://fake-llm.litellm-lab.svc.cluster.local:8000/v1"
 WORKSPACE_MCP_URL = "http://workspace-mcp.litellm-lab.svc.cluster.local:8000/mcp"
+DEFAULT_S3_ENDPOINT = "http://rustfs:9000"
 GMAIL_SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
@@ -104,12 +105,21 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
     config["general_settings"] = {
         "master_key": "os.environ/LITELLM_MASTER_KEY",
         "database_url": "os.environ/DATABASE_URL",
-        # PostgreSQL の上限 100 ÷ 最大 4 Pod に余裕を持たせる
-        "database_connection_pool_limit": 5,
+        # Pod ごとの接続数の上限（変更設計書 3.4 節）。Pooler 経由なら 10、直結なら 5（最大 4 Pod で 20 本。
+        # PostgreSQL の max_connections 200 に収まる）
+        "database_connection_pool_limit": 10 if db_pooler(env) == "pooler" else 5,
         "proxy_batch_write_at": 60,
         "require_key_mcp_access_defined": True,
     }
     return config
+
+
+def db_pooler(env: Env) -> str:
+    """LiteLLM の DB の接続先: pooler（PgBouncer。既定）か direct（primary に直結）。"""
+    mode = env.get("LAB_DB_POOLER", "pooler")
+    if mode not in ("pooler", "direct"):
+        raise ValueError(f"LAB_DB_POOLER は pooler か direct です（{mode}）")
+    return mode
 
 
 def to_yaml(data: dict, header: str = "") -> str:
@@ -119,16 +129,25 @@ def to_yaml(data: dict, header: str = "") -> str:
 
 def helm_overrides(env: Env, image_repo: str, image_tag: str, config_hash: str) -> dict:
     """values.yaml に重ねる、環境ごとの値。"""
+    pooler = db_pooler(env) == "pooler"
+    env_vars = {
+        "LITELLM_MODE": "PRODUCTION",
+        "PROXY_BASE_URL": env.base_url,
+        "CHATGPT_TOKEN_DIR": CHATGPT_TOKEN_IN_NODE,
+        "UI_USERNAME": "admin",
+        # DB 移行は自前の Job で流すので、Pod の起動時には流さない（チャートは移行の Job を使うときしか入れない）
+        "DISABLE_SCHEMA_UPDATE": "true",
+    }
+    if pooler:
+        # PgBouncer の transaction モードでは準備済みの問い合わせを使わない（LiteLLM が URL に pgbouncer=true を足す）
+        env_vars["DATABASE_DISABLE_PREPARED_STATEMENTS"] = "true"
     return {
         "image": {"repository": image_repo, "tag": image_tag},
         # 設定のハッシュを Pod の注釈に入れ、設定が変わったときだけ Pod を作り直す
         "podAnnotations": {"lab/config-hash": config_hash},
-        "envVars": {
-            "LITELLM_MODE": "PRODUCTION",
-            "PROXY_BASE_URL": env.base_url,
-            "CHATGPT_TOKEN_DIR": CHATGPT_TOKEN_IN_NODE,
-            "UI_USERNAME": "admin",
-        },
+        "envVars": env_vars,
+        # チャートは db.useExisting のとき、DATABASE_URL を Pod の env に直接書く（接続先はここで切り替える）
+        "db": {"endpoint": "litellm-pg-pooler-rw" if pooler else "litellm-pg-rw"},
     }
 
 
