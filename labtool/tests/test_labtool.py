@@ -225,5 +225,20 @@ class DatabaseSettingsTest(unittest.TestCase):
         self.assertEqual(m["type"], "kubernetes.io/basic-auth")
 
 
+class RedisSettingsTest(unittest.TestCase):
+    def test_sentinel_only_via_env(self):
+        cfg = render.litellm_config(env(), has_chatgpt=False)
+        # router_settings に Redis のキーがあると、ルーターが Sentinel を使わない別の接続を作る
+        self.assertFalse([k for k in cfg["router_settings"] if k.startswith("redis")])
+        self.assertTrue(cfg["general_settings"]["use_redis_transaction_buffer"])
+        o = render.helm_overrides(env(), "repo", "tag", "h")
+        nodes = json.loads(o["envVars"]["REDIS_SENTINEL_NODES"])
+        self.assertEqual(len(nodes), 3)
+        self.assertEqual(o["envVars"]["REDIS_SERVICE_NAME"], "mymaster")
+        data = render.secrets_for_litellm(env(REDIS_PASSWORD="r", SENTINEL_PASSWORD="s"))
+        self.assertNotIn("REDIS_HOST", data)
+        self.assertEqual(data["REDIS_SENTINEL_PASSWORD"], "s")
+
+
 if __name__ == "__main__":
     unittest.main()

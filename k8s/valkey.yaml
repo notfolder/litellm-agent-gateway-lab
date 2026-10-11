@@ -1,0 +1,196 @@
+# LiteLLM 用の Redis 互換ストア: Valkey 3 台（primary 1、replica 2）と Sentinel 3 台（変更設計書 4 章）。
+# 公式イメージで自分で書いた構成（Helm チャートやオペレーターは使わない）。パスワードは Secret valkey（./lab secrets）。
+# 起動スクリプトは k8s/valkey/*.sh（./lab datastores が ConfigMap valkey-scripts にし、そのハッシュを注釈に入れる）。
+# - 起動時に Sentinel に今の primary を聞き、その replica として起動する。誰も答えなければ valkey-0 が primary
+# - primary が落ちたら Sentinel（quorum 2）が replica を primary に上げる。戻ってきた元の primary は replica になる
+# - headless Service は準備前の Pod も DNS に載せる（起動の途中でお互いの名前を引けるように）
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey-headless
+  namespace: litellm-lab
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: valkey
+  ports:
+    - name: valkey
+      port: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey-sentinel-headless
+  namespace: litellm-lab
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: valkey-sentinel
+  ports:
+    - name: sentinel
+      port: 26379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey-sentinel
+  namespace: litellm-lab
+spec:
+  selector:
+    app: valkey-sentinel
+  ports:
+    - name: sentinel
+      port: 26379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: valkey
+  namespace: litellm-lab
+spec:
+  serviceName: valkey-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: valkey
+  template:
+    metadata:
+      labels:
+        app: valkey
+      annotations:
+        lab/scripts-hash: "${SCRIPTS_HASH}"
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app: valkey
+      containers:
+        - name: valkey
+          image: valkey/valkey:9.0.6
+          command: ["sh", "/scripts/start-valkey.sh"]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: valkey, key: password }
+            - name: SENTINEL_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: valkey, key: sentinel-password }
+          ports:
+            - containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "valkey-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: valkey-scripts
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 1Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: valkey-sentinel
+  namespace: litellm-lab
+spec:
+  serviceName: valkey-sentinel-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: valkey-sentinel
+  template:
+    metadata:
+      labels:
+        app: valkey-sentinel
+      annotations:
+        lab/scripts-hash: "${SCRIPTS_HASH}"
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app: valkey-sentinel
+      containers:
+        - name: sentinel
+          image: valkey/valkey:9.0.6
+          command: ["sh", "/scripts/start-sentinel.sh"]
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: valkey, key: password }
+            - name: SENTINEL_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: valkey, key: sentinel-password }
+          ports:
+            - containerPort: 26379
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "valkey-cli -p 26379 -a \"$$SENTINEL_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { memory: 64Mi }
+          volumeMounts:
+            - name: conf
+              mountPath: /conf
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: valkey-scripts
+  volumeClaimTemplates:
+    - metadata:
+        name: conf
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 64Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: valkey
+  namespace: litellm-lab
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: valkey
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: valkey-sentinel
+  namespace: litellm-lab
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: valkey-sentinel

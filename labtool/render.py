@@ -13,6 +13,8 @@ from .core import CHATGPT_TOKEN_IN_NODE, Env
 FAKE_LLM_BASE = "http://fake-llm.litellm-lab.svc.cluster.local:8000/v1"
 WORKSPACE_MCP_URL = "http://workspace-mcp.litellm-lab.svc.cluster.local:8000/mcp"
 DEFAULT_S3_ENDPOINT = "http://rustfs:9000"
+SENTINEL_NODES = json.dumps([[f"valkey-sentinel-{i}.valkey-sentinel-headless.litellm-lab.svc.cluster.local", 26379]
+                             for i in range(3)])
 GMAIL_SCOPES = [
     "openid",
     "https://www.googleapis.com/auth/userinfo.email",
@@ -94,10 +96,9 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
             },
         }}
 
+    # Redis（Valkey）は環境変数の Sentinel の指定（REDIS_SENTINEL_NODES など）だけで使う。router_settings に
+    # Redis のキー（redis_host など）を書くと、ルーターが Sentinel を使わない別の接続を作る（変更設計書 4.5 節）
     config["router_settings"] = {
-        "redis_host": "os.environ/REDIS_HOST",
-        "redis_port": "os.environ/REDIS_PORT",
-        "redis_password": "os.environ/REDIS_PASSWORD",
         "routing_strategy": "simple-shuffle",
         # Claude Max のトークン切れの 1 人のせいで、他の人まで止まらないように
         "disable_cooldowns": True,
@@ -109,6 +110,8 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
         # PostgreSQL の max_connections 200 に収まる）
         "database_connection_pool_limit": 10 if db_pooler(env) == "pooler" else 5,
         "proxy_batch_write_at": 60,
+        # 利用量の DB への書き込みを Redis に溜め、1 台がまとめて書く（10 台以上で公式が推奨。本番は 20〜30 Pod）
+        "use_redis_transaction_buffer": True,
         "require_key_mcp_access_defined": True,
     }
     return config
@@ -135,6 +138,9 @@ def helm_overrides(env: Env, image_repo: str, image_tag: str, config_hash: str) 
         "PROXY_BASE_URL": env.base_url,
         "CHATGPT_TOKEN_DIR": CHATGPT_TOKEN_IN_NODE,
         "UI_USERNAME": "admin",
+        # Valkey は Sentinel 経由（パスワードは Secret litellm-secrets の REDIS_PASSWORD と REDIS_SENTINEL_PASSWORD）
+        "REDIS_SENTINEL_NODES": SENTINEL_NODES,
+        "REDIS_SERVICE_NAME": "mymaster",
         # DB 移行は自前の Job で流すので、Pod の起動時には流さない（チャートは移行の Job を使うときしか入れない）
         "DISABLE_SCHEMA_UPDATE": "true",
     }
@@ -168,9 +174,8 @@ def secrets_for_litellm(env: Env) -> dict[str, str]:
     data = {
         "LITELLM_MASTER_KEY": env.get("LITELLM_MASTER_KEY"),
         "LITELLM_SALT_KEY": env.get("LITELLM_SALT_KEY"),
-        "REDIS_HOST": "redis",
-        "REDIS_PORT": "6379",
         "REDIS_PASSWORD": env.get("REDIS_PASSWORD"),
+        "REDIS_SENTINEL_PASSWORD": env.get("SENTINEL_PASSWORD"),
     }
     if env.has_google():
         # 管理画面の Google SSO（GOOGLE_*）と Gmail の MCP（GOOGLE_OAUTH_*）で同じクライアントを使う

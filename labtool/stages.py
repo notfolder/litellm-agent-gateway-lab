@@ -211,6 +211,7 @@ def secrets_(env: Env) -> Env:
     env.fill("LITELLM_SALT_KEY", gen_key())
     env.fill("POSTGRES_PASSWORD", gen_secret(16))
     env.fill("REDIS_PASSWORD", gen_secret(16))
+    env.fill("SENTINEL_PASSWORD", gen_secret(16))
     for k in USER_KEYS:
         env.fill(k, gen_key())
     # オブジェクトストレージの管理者と、用途ごとの利用者（アクセスキーは利用者の名前、シークレットは生成）
@@ -231,7 +232,8 @@ def secrets_(env: Env) -> Env:
     backup_key, backup_secret = render.s3_env_names("pg-backup")
     kapply(manifest=secret_manifest("pg-backup-s3", {"ACCESS_KEY_ID": env.get(backup_key),
                                                      "ACCESS_SECRET_KEY": env.get(backup_secret)}))
-    kapply(manifest=secret_manifest("redis", {"password": env.get("REDIS_PASSWORD")}))
+    kapply(manifest=secret_manifest("valkey", {"password": env.get("REDIS_PASSWORD"),
+                                               "sentinel-password": env.get("SENTINEL_PASSWORD")}))
     kapply(manifest=secret_manifest("litellm-secrets", render.secrets_for_litellm(env)))
     kapply(manifest=secret_manifest("rustfs", {"access-key": env.get("RUSTFS_ACCESS_KEY"),
                                                "secret-key": env.get("RUSTFS_SECRET_KEY")}))
@@ -285,9 +287,30 @@ def datastores(env: Env) -> None:
     wait_until(1200, "PostgreSQL（3 台）の準備", kn("wait", "cluster/litellm-pg", "--for=condition=Ready",
                                                   "--timeout=5s"))
     rollout("deploy/litellm-pg-pooler-rw", 180, "Pooler の起動")
-    kapply(files=[K8S / "redis.yaml"])
-    rollout("deploy/redis", 180, "Redis の起動")
-    ok("PostgreSQL と Redis の準備ができました")
+
+    # Valkey と Sentinel（変更設計書 4 章）。1 台の Redis（以前の構成）は消す（中身はキャッシュと回数の集計だけ）
+    _delete_if_present("deployment/redis", "service/redis", "secret/redis")
+    scripts = {p.name: p.read_text() for p in sorted((K8S / "valkey").glob("*.sh"))}
+    kapply(manifest=configmap_manifest("valkey-scripts", scripts))
+    kapply(manifest=render_template(K8S / "valkey.yaml", {"SCRIPTS_HASH": short_hash(json.dumps(scripts,
+                                                                                                sort_keys=True))}))
+    rollout("statefulset/valkey", 300, "Valkey（3 台）の起動")
+    rollout("statefulset/valkey-sentinel", 300, "Sentinel（3 台）の起動")
+    wait_until(60, "Sentinel 3 台が同じ primary を指す", lambda: len(set(sentinel_masters(env))) == 1
+               and len(sentinel_masters(env)) == 3)
+    ok(f"PostgreSQL と Valkey の準備ができました（Valkey の primary: {sentinel_masters(env)[0].split('.')[0]}）")
+
+
+def sentinel_masters(env: Env) -> list[str]:
+    """3 台の Sentinel それぞれが答える、今の primary（答えなければ含めない）。"""
+    answers = []
+    for i in range(3):
+        out = output(kn("exec", f"valkey-sentinel-{i}", "--", "valkey-cli", "-p", "26379", "-a",
+                        env.get("SENTINEL_PASSWORD"), "--no-auth-warning", "SENTINEL", "get-master-addr-by-name",
+                        "mymaster"), check=False).split()
+        if out:
+            answers.append(out[0])
+    return answers
 
 
 def mcp(env: Env) -> None:
