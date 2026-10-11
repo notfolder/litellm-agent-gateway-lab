@@ -274,3 +274,10 @@ def judge_eval(env: Env, repeat: int) -> None:
     if correct < total:
         raise LabError(f"二次判定の事例試験: {correct}/{total} が期待どおり")
     ok(f"二次判定の事例試験: {total} 件すべて期待どおり")
+
+
+def failover_audit_check(env: Env):
+    """障害の試験の監査ログの欠けの照合（検索アプリと監査ログが入っていれば有効）。"""
+    from . import audit_test
+    from .core import succeeds as _succeeds, kn as _kn
+    return audit_test.failover_audit_check(env) if _succeeds(_kn("get", "cronjob", "audit-compactor")) else None

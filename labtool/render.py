@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import yaml
@@ -21,6 +22,33 @@ GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
+
+
+# ChatGPT のモデルの「同等の API の公開価格」（1 百万トークンあたりの USD: 入力、出力、キャッシュの読み取り）。
+# 契約経由の利用の概算（A）に使う（変更仕様書 6.7 節）。OpenAI の 2026-07-30 の値下げの後の値（2026-10-12 に確認）
+PUBLIC_PRICES = {
+    "gpt-5.6-terra": (2.00, 12.00, 0.20),
+    "gpt-5.6-luna": (0.20, 1.20, 0.02),
+}
+
+
+def price_env_prefix(model_name: str) -> str:
+    """.env の単価の名前の接頭辞（例 review-judge → LAB_PRICE_REVIEW_JUDGE）。英数字以外は _ にする。"""
+    return "LAB_PRICE_" + re.sub(r"[^A-Z0-9]", "_", model_name.upper())
+
+
+def model_prices(env: Env, model_name: str, chatgpt_model: str) -> dict | None:
+    """chatgpt/ のモデルの単価（model_info）。.env の LAB_PRICE_<名前>_IN / _OUT / _CACHE_READ が優先。"""
+    prefix = price_env_prefix(model_name)
+    default = PUBLIC_PRICES.get(chatgpt_model)
+    values = []
+    for i, suffix in enumerate(("_IN", "_OUT", "_CACHE_READ")):
+        v = env.get(prefix + suffix) or (str(default[i]) if default else "")
+        if not v:
+            return None
+        values.append(float(v) / 1_000_000)
+    return {"input_cost_per_token": values[0], "output_cost_per_token": values[1],
+            "cache_read_input_token_cost": values[2]}
 
 
 def _fake_params() -> dict:
@@ -44,18 +72,28 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
     # Claude Code（Claude Max のトークンを転送する。api_key は書かない）
     model_list: list[dict] = [{"model_name": "anthropic/*", "litellm_params": {"model": "anthropic/*"}}]
     if has_chatgpt:
-        # Codex（ChatGPT Plus）
-        model_list.append({"model_name": codex_model, "litellm_params": {"model": f"chatgpt/{codex_model}"}})
+        # Codex（ChatGPT Plus）。単価は概算用（ChatGPT の定額の契約は単価表に無く、そのままでは 0 になるため）
+        entry = {"model_name": codex_model, "litellm_params": {"model": f"chatgpt/{codex_model}"}}
+        if prices := model_prices(env, codex_model, codex_model):
+            entry["model_info"] = prices
+        model_list.append(entry)
     # 審査の試験用の偽 LLM（tests/fake-llm）。ツールコールを返す
-    model_list.append({"model_name": "fake-tools", "litellm_params": _fake_params()})
+    # 試験用の単価（1 百万トークンあたり 1 / 2 USD）。精算の按分を試すには、概算（A）が 0 でないことが要るため
+    model_list.append({"model_name": "fake-tools", "litellm_params": _fake_params(),
+                       "model_info": {"input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6}})
     # 二次判定
-    model_list.append({
+    judge: dict = {
         "model_name": "review-judge",
         "litellm_params": {"model": f"chatgpt/{judge_model}"} if has_chatgpt else _fake_params(),
-    })
+    }
+    if has_chatgpt and (prices := model_prices(env, "review-judge", judge_model)):
+        judge["model_info"] = prices
+    model_list.append(judge)
 
     config: dict = {
         "model_list": model_list,
+        # 監査ログ（litellm/guardrails/audit_log.py。変更設計書 5 章）
+        "litellm_settings": {"callbacks": ["audit_log.audit_logger_instance"]},
         "guardrails": [{
             "guardrail_name": "tool-call-review",
             "litellm_params": {
@@ -113,6 +151,9 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
         # 利用量の DB への書き込みを Redis に溜め、1 台がまとめて書く（10 台以上で公式が推奨。本番は 20〜30 Pod）
         "use_redis_transaction_buffer": True,
         "require_key_mcp_access_defined": True,
+        # 利用ログ（LiteLLM_SpendLogs）は書かない。利用量と利用料は監査ログから集計する。使用額と日次の集計は
+        # この設定でも更新され続ける（v1.104.2 のソースで確認。変更仕様書 6.6 節）
+        "disable_spend_logs": True,
     }
     return config
 
@@ -141,6 +182,11 @@ def helm_overrides(env: Env, image_repo: str, image_tag: str, config_hash: str) 
         # Valkey は Sentinel 経由（パスワードは Secret litellm-secrets の REDIS_PASSWORD と REDIS_SENTINEL_PASSWORD）
         "REDIS_SENTINEL_NODES": SENTINEL_NODES,
         "REDIS_SERVICE_NAME": "mymaster",
+        # 監査ログの書き込み先（資格情報は Secret litellm-secrets の AUDIT_S3_ACCESS_KEY / AUDIT_S3_SECRET_KEY）
+        "AUDIT_S3_ENDPOINT": env.get("LAB_S3_ENDPOINT", DEFAULT_S3_ENDPOINT),
+        "AUDIT_S3_REGION": env.get("LAB_S3_REGION", "us-east-1"),
+        "AUDIT_S3_BUCKET": AUDIT_RAW,
+        "AUDIT_FLUSH_SECONDS": env.get("LAB_AUDIT_FLUSH_SECONDS", "10"),
         # DB 移行は自前の Job で流すので、Pod の起動時には流さない（チャートは移行の Job を使うときしか入れない）
         "DISABLE_SCHEMA_UPDATE": "true",
     }
@@ -176,6 +222,8 @@ def secrets_for_litellm(env: Env) -> dict[str, str]:
         "LITELLM_SALT_KEY": env.get("LITELLM_SALT_KEY"),
         "REDIS_PASSWORD": env.get("REDIS_PASSWORD"),
         "REDIS_SENTINEL_PASSWORD": env.get("SENTINEL_PASSWORD"),
+        "AUDIT_S3_ACCESS_KEY": env.get(s3_env_names("litellm-writer")[0]),
+        "AUDIT_S3_SECRET_KEY": env.get(s3_env_names("litellm-writer")[1]),
     }
     if env.has_google():
         # 管理画面の Google SSO（GOOGLE_*）と Gmail の MCP（GOOGLE_OAUTH_*）で同じクライアントを使う
@@ -319,3 +367,37 @@ def s3_policies() -> dict[str, dict]:
         ),
         "pg-backup": doc(_stmt(["s3:*"], [PG_BACKUP, f"{PG_BACKUP}/*"])),
     }
+
+
+def dir_hash(path: Path) -> str:
+    """フォルダの中身のハッシュ（イメージのタグ）。__pycache__ と .pyc は含めない。"""
+    h = hashlib.sha256()
+    for p in sorted(x for x in path.rglob("*") if x.is_file() and "__pycache__" not in x.parts and x.suffix != ".pyc"):
+        h.update(str(p.relative_to(path)).encode() + b"\0")
+        h.update(hashlib.sha256(p.read_bytes()).digest())
+    return h.hexdigest()[:12]
+
+
+def audit_oidc_client(env: Env) -> tuple[str, str]:
+    """検索アプリのサインインの OAuth クライアント（既定は Google の OAuth クライアントと同じ）。"""
+    return (env.get("LAB_AUDIT_OIDC_CLIENT_ID") or env.get("GOOGLE_OAUTH_CLIENT_ID"),
+            env.get("LAB_AUDIT_OIDC_CLIENT_SECRET") or env.get("GOOGLE_OAUTH_CLIENT_SECRET"))
+
+
+def initial_contracts(env: Env) -> dict:
+    """請求の単位の初期値（.env の LAB_CONTRACTS。無ければ検証環境の ChatGPT Plus と Claude Max）。"""
+    if env.get("LAB_CONTRACTS"):
+        return json.loads(env.get("LAB_CONTRACTS"))
+    from datetime import datetime, timedelta, timezone
+    month = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m")
+    codex = env.get("LAB_CODEX_MODEL", "gpt-5.6-terra")
+    return {"schema": 1, "contracts": [
+        {"id": "chatgpt-plus", "name": "ChatGPT Plus", "kind": "subscription", "currency": "USD",
+         "models": [codex, "review-judge"], "fees": {month: 20.0}},
+        {"id": "claude-max", "name": "Claude Max", "kind": "subscription", "currency": "USD",
+         "models": ["anthropic/*", "claude-*"], "fees": {month: 100.0}},
+    ]}
+
+
+def initial_fx_rates(env: Env) -> dict:
+    return json.loads(env.get("LAB_FX_RATES")) if env.get("LAB_FX_RATES") else {"schema": 1, "usd_jpy": {}}

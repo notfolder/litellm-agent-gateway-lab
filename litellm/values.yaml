@@ -50,15 +50,21 @@ lifecycle:
     exec:
       command: ["sleep", "10"]
 
-# chatgpt/ のトークンを全 Pod で共有する（k3d が全ノードに同じホストのフォルダを見せている）
+# chatgpt-token: chatgpt/ のトークンを全 Pod で共有する（k3d が全ノードに同じホストのフォルダを見せている）
+# audit-spool: 監査ログを S3 に書けないときの退避先（Pod と一緒に消える。上限 1Gi、900MiB を超えたら捨てて数える）
 volumes:
   - name: chatgpt-token
     hostPath:
       path: /var/lib/lab/chatgpt
       type: DirectoryOrCreate
+  - name: audit-spool
+    emptyDir:
+      sizeLimit: 1Gi
 volumeMounts:
   - name: chatgpt-token
     mountPath: /var/lib/lab/chatgpt
+  - name: audit-spool
+    mountPath: /var/lib/audit-spool
 
 # PostgreSQL は CloudNativePG（k8s/postgres-cnpg.yaml）。endpoint は ./lab litellm が LAB_DB_POOLER で切り替える
 # （Pooler: litellm-pg-pooler-rw、直結: litellm-pg-rw）。Secret litellm-pg-app は ./lab secrets が作る

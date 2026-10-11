@@ -1,0 +1,38 @@
+{% extends "base.html" %}{% block title %}履歴の詳細{% endblock %}
+{% block body %}
+<h2>履歴の詳細</h2>
+<div id="meta"></div>
+<h3>本文（入力と出力）</h3>
+<p class="muted">本文を開くと、誰がいつ開いたかが記録されます（13 か月、消せない形）。</p>
+<p id="reasonRow"><label>理由（他人の本文を開くときは必須）<input id="reason" size="60"></label></p>
+<button class="primary" id="show">本文を表示</button>
+<div id="body"></div>
+{% endblock %}
+{% block script %}
+<script>
+const q = new URLSearchParams(location.search), CALL = q.get("call_id"), AT = q.get("at");
+let row;
+(async () => {
+  row = await api(`/requests/${encodeURIComponent(CALL)}?at=${encodeURIComponent(AT)}`).catch(e => ({error: e.message}));
+  if (row.error) { document.getElementById("meta").innerHTML = `<p class="bad">${esc(row.error)}</p>`; return; }
+  const items = [["時刻", jst(row.ts_start)], ["利用者", row.user_email], ["キー", row.key_alias], ["クライアント", row.client],
+    ["種類", row.type], ["モデル", `${row.model_group || ""}（${row.model || ""}）`], ["結果", row.status + (row.error_class ? `（${row.error_class}）` : "")],
+    ["トークン", `入力 ${num(row.tokens_in)} / 出力 ${num(row.tokens_out)} / キャッシュ読み取り ${num(row.tokens_cache_read)}`],
+    ["概算", `${num(row.cost_usd, 6)} USD`], ["所要時間", `${num(row.latency_ms)} ms`],
+    ["ツールコール", row.tool_calls || row.mcp_tool || ""],
+    ["審査", row.review_count ? `${row.review_blocked ? "拒否" : "許可"}: ${row.review_reason || ""}（審査官 ${row.judge_model_group || "-"}、${num(row.judge_cost_usd, 6)} USD）` : "なし"],
+    ["call_id", row.call_id]];
+  document.getElementById("meta").innerHTML = '<table>' + items.map(([k, v]) => `<tr><th>${esc(k)}</th><td>${esc(v)}</td></tr>`).join("") + '</table>';
+  if (row.user_email === ME) document.getElementById("reasonRow").style.display = "none";
+})();
+document.getElementById("show").onclick = async () => {
+  const el = document.getElementById("body");
+  const d = await api(`/requests/${encodeURIComponent(CALL)}/body?at=${encodeURIComponent(AT)}`,
+    {method: "POST", body: JSON.stringify({reason: document.getElementById("reason").value})}).catch(e => ({error: e.message}));
+  if (d.error) { el.innerHTML = `<p class="bad">${esc(d.error)}</p>`; return; }
+  const p = d.payload || {}, msgs = Array.isArray(p.messages) ? p.messages : [p.messages];
+  el.innerHTML = "<h4>入力</h4>" + msgs.map((m, i) => `<details ${i === msgs.length - 1 ? "open" : ""}><summary>${esc((m && m.role) || "message")} ${i + 1}</summary><pre>${esc(typeof m === "string" ? m : JSON.stringify(m, null, 2))}</pre></details>`).join("")
+    + `<h4>出力</h4><pre>${esc(JSON.stringify(p.response, null, 2))}</pre>`;
+};
+</script>
+{% endblock %}

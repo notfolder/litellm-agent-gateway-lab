@@ -55,8 +55,9 @@ spec:
             tcpSocket: { port: 9000 }
             periodSeconds: 5
           resources:
-            requests: { cpu: 50m, memory: 128Mi }
-            limits: { memory: 256Mi }
+            # 256Mi では上限に張り付いて CPU を 8 コア使い、応答しなくなった（2026-10-12）
+            requests: { cpu: 100m, memory: 512Mi }
+            limits: { cpu: "2", memory: 1Gi }
           volumeMounts:
             - name: data
               mountPath: /data

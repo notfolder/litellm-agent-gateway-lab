@@ -19,6 +19,7 @@ from .core import (
 
 K8S = ROOT / "k8s"
 IMAGE_FILE = BUILD_DIR / "litellm-image.json"
+AUDIT_IMAGE_FILE = BUILD_DIR / "audit-image.json"
 
 # クラスタに入れる部品の版（変更設計書 3.1 節）
 CERT_MANAGER = {"repo": "https://charts.jetstack.io", "chart": "cert-manager", "version": "v1.21.2"}
@@ -33,6 +34,8 @@ def preflight() -> Env:
     """前提の確認。何も変更しない（.env が無いときに雛形からコピーすることだけを行う）。"""
     step("preflight 前提の確認")
     require_commands("docker", "k3d", "kubectl", "helm")
+    if not succeeds(["kubectl", "cnpg", "version"]):
+        raise LabError("kubectl cnpg（CloudNativePG のプラグイン）がありません。brew install kubectl-cnpg で入れてください")
     if not succeeds(["docker", "info"]):
         raise LabError("Docker が動いていません。OrbStack を起動してください")
 
@@ -163,38 +166,44 @@ def operators() -> None:
                                                   "--timeout=5s"))
 
 
-def images(env: Env) -> dict:
-    """検証用 LiteLLM イメージのビルドと push。
-    - 中身（Dockerfile、ガードレール、ベースイメージ）のハッシュをタグにする。同じタグがあればビルドしない
-    - 自作イメージの置き場に同じタグがあれば push しない
-    外部のイメージ（PostgreSQL など）は、ノードが Docker Hub の中継キャッシュ経由で取るので扱わない。"""
-    step("images イメージ")
-    tag = render.image_tag(env.litellm_base_image, ROOT / "litellm")
-    local_image = f"litellm-lab:{tag}"
-    push_image = f"localhost:{REGISTRY_HOST_PORT}/litellm-lab:{tag}"
-    # クラスタの中から見たイメージ名（Helm に渡す）
-    image = {"repository": f"{REGISTRY_IN_CLUSTER}/litellm-lab", "tag": tag, "local": local_image}
-    write_if_changed(IMAGE_FILE, json.dumps(image, indent=2) + "\n")
-
+def _build_and_push(name: str, tag: str, context, build_args: list[str]) -> dict:
+    """自作イメージをビルドして置き場に push する（同じタグがあれば、どちらも飛ばす）。"""
+    local_image = f"{name}:{tag}"
+    push_image = f"localhost:{REGISTRY_HOST_PORT}/{name}:{tag}"
     if succeeds(["docker", "image", "inspect", local_image]):
-        ok(f"LiteLLM イメージ {local_image} はビルド済みです")
+        ok(f"イメージ {local_image} はビルド済みです")
     else:
-        info(f"LiteLLM イメージ {local_image} をビルドします（単体テストも流れます）")
-        run(["docker", "build", "--build-arg", f"LITELLM_BASE_IMAGE={env.litellm_base_image}",
-             "-t", local_image, str(ROOT / "litellm")])
-
+        info(f"イメージ {local_image} をビルドします（単体テストも流れます）")
+        run(["docker", "build", *build_args, "-t", local_image, str(context)])
     accept = ("application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, "
               "application/vnd.oci.image.manifest.v1+json")
-    res = http("HEAD", f"http://localhost:{REGISTRY_HOST_PORT}/v2/litellm-lab/manifests/{tag}",
+    res = http("HEAD", f"http://localhost:{REGISTRY_HOST_PORT}/v2/{name}/manifests/{tag}",
                headers={"Accept": accept}, timeout=10)
     if res.status == 200:
-        ok(f"置き場に {tag} があります")
+        ok(f"置き場に {name}:{tag} があります")
     else:
-        info("置き場に push します")
+        info(f"置き場に {name}:{tag} を push します")
         run(["docker", "tag", local_image, push_image])
         # Mac 側には arm64 の中身しか無いので、arm64 だけを push する
         run(["docker", "push", "--platform", "linux/arm64", "-q", push_image], quiet=True)
         ok(f"push しました: {push_image}")
+    # クラスタの中から見たイメージ名（マニフェストと Helm に渡す）
+    return {"repository": f"{REGISTRY_IN_CLUSTER}/{name}", "tag": tag, "local": local_image}
+
+
+def images(env: Env) -> dict:
+    """検証用 LiteLLM イメージと、監査ログの整形・検索アプリのイメージ（audit-lab）のビルドと push。
+    - 中身のハッシュをタグにする。同じタグがあればビルドしない。置き場に同じタグがあれば push しない
+    - apps/audit が無い間（実装の途中）は audit-lab を飛ばす
+    外部のイメージ（PostgreSQL など）は、ノードが Docker Hub の中継キャッシュ経由で取るので扱わない。"""
+    step("images イメージ")
+    tag = render.image_tag(env.litellm_base_image, ROOT / "litellm")
+    image = _build_and_push("litellm-lab", tag, ROOT / "litellm",
+                            ["--build-arg", f"LITELLM_BASE_IMAGE={env.litellm_base_image}"])
+    write_if_changed(IMAGE_FILE, json.dumps(image, indent=2) + "\n")
+    if (ROOT / "apps" / "audit" / "Dockerfile").exists():
+        audit = _build_and_push("audit-lab", render.dir_hash(ROOT / "apps" / "audit"), ROOT / "apps" / "audit", [])
+        write_if_changed(AUDIT_IMAGE_FILE, json.dumps(audit, indent=2) + "\n")
     return image
 
 
@@ -221,6 +230,7 @@ def secrets_(env: Env) -> Env:
         key_name, secret_name = render.s3_env_names(user)
         env.fill(key_name, user)
         env.fill(secret_name, gen_secret(20))
+    env.fill("AUDIT_SESSION_SECRET", gen_secret(32))
 
     pg_password = env.get("POSTGRES_PASSWORD")
     # CloudNativePG の初期化に渡す（型は basic-auth）。パスワードは .env の値を使い回し、作り直しても変わらない
@@ -232,6 +242,15 @@ def secrets_(env: Env) -> Env:
     backup_key, backup_secret = render.s3_env_names("pg-backup")
     kapply(manifest=secret_manifest("pg-backup-s3", {"ACCESS_KEY_ID": env.get(backup_key),
                                                      "ACCESS_SECRET_KEY": env.get(backup_secret)}))
+    for user, secret in (("audit-compactor", "audit-compactor-s3"), ("audit-viewer", "audit-viewer-s3")):
+        key_name, secret_name = render.s3_env_names(user)
+        kapply(manifest=secret_manifest(secret, {"AUDIT_S3_ACCESS_KEY": env.get(key_name),
+                                                 "AUDIT_S3_SECRET_KEY": env.get(secret_name)}))
+    kapply(manifest=secret_manifest("audit-viewer-session", {"AUDIT_SESSION_SECRET": env.get("AUDIT_SESSION_SECRET")}))
+    oidc_id, oidc_secret = render.audit_oidc_client(env)
+    if oidc_id:
+        kapply(manifest=secret_manifest("audit-viewer-oidc", {"AUDIT_OIDC_CLIENT_ID": oidc_id,
+                                                              "AUDIT_OIDC_CLIENT_SECRET": oidc_secret}))
     kapply(manifest=secret_manifest("valkey", {"password": env.get("REDIS_PASSWORD"),
                                                "sentinel-password": env.get("SENTINEL_PASSWORD")}))
     kapply(manifest=secret_manifest("litellm-secrets", render.secrets_for_litellm(env)))
@@ -387,6 +406,46 @@ def litellm(env: Env) -> None:
     wait_until(120, f"入口からの応答（{env.base_url}/health/liveliness）",
                lambda: http_ok(f"{env.base_url}/health/liveliness"))
     ok(f"LiteLLM の準備ができました: {env.base_url}（管理画面 {env.base_url}/ui）")
+
+
+def load_audit_image() -> dict:
+    if not AUDIT_IMAGE_FILE.exists():
+        raise LabError("audit-lab のイメージ名がありません。先に ./lab images を流してください")
+    return json.loads(AUDIT_IMAGE_FILE.read_text())
+
+
+def audit(env: Env) -> None:
+    """監査ログの整形の定期処理と、利用料・入出力の履歴を検索するアプリ（変更設計書 5.8 節、6 章）。
+    請求の単位と換算のレートが 1 つも無ければ、.env の初期値（LAB_CONTRACTS、LAB_FX_RATES）を書く。"""
+    step("audit 監査ログの整形と検索アプリ")
+    image = load_audit_image()
+    ref = f"{image['repository']}:{image['tag']}"
+    common = {"IMAGE": ref, "S3_ENDPOINT": env.get("LAB_S3_ENDPOINT", render.DEFAULT_S3_ENDPOINT),
+              "S3_REGION": env.get("LAB_S3_REGION", "us-east-1")}
+    kapply(manifest=render_template(K8S / "audit-compactor.yaml", common))
+    with port_forward("svc/rustfs", 9000) as endpoint:
+        s3 = objstore.s3_client(endpoint, *objstore.admin_credentials(env))
+        for kind, doc in (("contracts", render.initial_contracts(env)), ("fx_rates", render.initial_fx_rates(env))):
+            if not s3.list_objects_v2(Bucket=render.AUDIT_DERIVED, Prefix=f"billing/{kind}/").get("KeyCount"):
+                s3.put_object(Bucket=render.AUDIT_DERIVED, Key=f"billing/{kind}/00000000T000000-lab-initial.json",
+                              Body=json.dumps(doc, ensure_ascii=False, indent=2).encode())
+                info(f"{kind} の初期値を書きました")
+    if render.audit_oidc_client(env)[0]:
+        values = common | {"BASE_URL": env.base_url, "OIDC_ISSUER": env.get("LAB_AUDIT_OIDC_ISSUER",
+                                                                              "https://accounts.google.com"),
+                           "ADMINS": env.get("LAB_AUDIT_ADMINS", env.get("LAB_USER1_EMAIL")),
+                           "AUDITORS": env.get("LAB_AUDITORS"), "ROLE_CLAIM": env.get("LAB_AUDIT_ROLE_CLAIM")}
+        values["CONFIG_HASH"] = short_hash(json.dumps(values, sort_keys=True) + json.dumps(
+            render.audit_oidc_client(env)) + env.get("AUDIT_SESSION_SECRET"))
+        kapply(manifest=render_template(K8S / "audit-viewer.yaml", values))
+        rollout("deploy/audit-viewer", 300, "検索アプリの起動")
+        ok(f"検索アプリ: {env.base_url}/lab-audit/")
+    else:
+        if succeeds(kn("get", "deploy", "audit-viewer")):
+            run(kn("delete", "deploy/audit-viewer", "service/audit-viewer", "ingressroute/audit-viewer",
+                   "--ignore-not-found"))
+        warn("サインインの設定（Google の OAuth クライアントか LAB_AUDIT_OIDC_*）が無いので、検索アプリは入れません")
+    ok("監査ログの段階が終わりました")
 
 
 def migrate_db(image: dict) -> None:

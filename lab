@@ -15,7 +15,7 @@ import argparse
 import sys
 import time
 
-from labtool import checks, ops, stages
+from labtool import audit_test, checks, failover, ops, stages
 from labtool.core import Env, LabError, ok
 
 
@@ -29,6 +29,7 @@ def up() -> None:
     stages.mcp(env)
     stages.litellm(env)
     stages.bootstrap(env)
+    stages.audit(env)
     stages.clients(env)
     ops.status(env)
 
@@ -38,6 +39,23 @@ def rebuild() -> None:
     ops.down()
     up()
     ok(f"作り直しの所要時間: {int(time.monotonic() - start)} 秒")
+
+
+def test_failover(pooler: str | None, scenario: str) -> None:
+    """障害の試験。--pooler を付けたら、その接続先に切り替えて試し、終わったら元に戻す。"""
+    env = Env.load()
+    scenarios = failover.SCENARIOS if scenario == "all" else [scenario]
+    original = env.get("LAB_DB_POOLER", "pooler")
+    switch = pooler is not None and pooler != original
+    if switch:
+        env.set("LAB_DB_POOLER", pooler)
+        stages.litellm(env)
+    try:
+        failover.failover(env, scenarios, audit_check=checks.failover_audit_check(env))
+    finally:
+        if switch:
+            env.set("LAB_DB_POOLER", original)
+            stages.litellm(env)
 
 
 def stage(fn):
@@ -60,6 +78,7 @@ COMMANDS: dict[str, tuple[str, object]] = {
     "mcp": ("[段階] 試験用の偽 LLM と google_workspace_mcp", stage(stages.mcp)),
     "litellm": ("[段階] プロキシ設定、LiteLLM（Helm）、入口", stage(stages.litellm)),
     "bootstrap": ("[段階] 検証ユーザーと固定値のキー", stage(stages.bootstrap)),
+    "audit": ("[段階] 監査ログの整形（CronJob）と検索アプリ", stage(stages.audit)),
     "clients": ("[段階] Claude Code と Codex の設定", stage(stages.clients)),
     # 手作業・保守
     "chatgpt-login": ("ChatGPT Plus にデバイスコードでログインする（手作業。初回だけ）", stage(stages.chatgpt_login)),
@@ -71,6 +90,12 @@ COMMANDS: dict[str, tuple[str, object]] = {
     "test-idempotency": ("./lab up を 2 回流し、2 回目で何も変わらないことを確かめる", checks.idempotency),
     "test-load": ("偽 LLM を相手にした負荷試験（k6、Docker で実行）", None),
     "test-judge": ("二次判定の事例試験（本物の審査官を呼ぶ。ChatGPT の利用枠を使う）", None),
+    "test-failover": ("障害の試験（PostgreSQL と Valkey の primary を切り替える・消す・ノードを止める）", None),
+    "test-restore": ("PostgreSQL をバックアップから任意の時点に戻す試験", stage(failover.restore)),
+    "test-audit": ("監査ログの試験（記録、整形、検索アプリ、精算、改ざんの防止、退避と再送）", stage(audit_test.audit_test)),
+    "audit-synth": ("検索の速さの試験用の合成データを作る（audit-derived/synth/）", None),
+    "audit-bench": ("検索の速さの試験（合成データと実際の記録で、目標の操作の時間を測る）", None),
+    "audit-compact": ("監査ログの整形を手で流す", None),
     "review-log": ("審査の判定ログを集計する", None),
 }
 
@@ -86,6 +111,12 @@ def main(argv: list[str]) -> int:
     parsers["test-load"].add_argument("--duration", default="2m", help="時間（既定 2m）")
     parsers["test-load"].add_argument("--scenario", default="chat", choices=["chat", "review"])
     parsers["test-judge"].add_argument("--repeat", type=int, default=3, help="事例ごとの試行回数（既定 3）")
+    parsers["test-failover"].add_argument("--pooler", choices=["pooler", "direct"],
+                                          help="この接続先に切り替えて試す（終わったら元に戻す）")
+    parsers["test-failover"].add_argument("--scenario", default="all", choices=["all", *failover.SCENARIOS])
+    parsers["audit-synth"].add_argument("--days", type=int, default=7)
+    parsers["audit-synth"].add_argument("--per-day", type=int, default=1_000_000)
+    parsers["audit-compact"].add_argument("--hour", help="日本時間の時間（YYYY-MM-DDTHH）。省くと締まった時間をすべて")
     parsers["review-log"].add_argument("--since", default="1h", help="集計する期間（既定 1h）")
     parsers["review-log"].add_argument("--raw", action="store_true", help="集計せずに JSON の行を出す")
     args = parser.parse_args(argv)
@@ -100,6 +131,20 @@ def main(argv: list[str]) -> int:
                 checks.load(Env.load(), args.vus, args.duration, args.scenario)
             case "test-judge":
                 checks.judge_eval(Env.load(), args.repeat)
+            case "test-failover":
+                test_failover(args.pooler, args.scenario)
+            case "audit-synth":
+                print(audit_test.run_audit_job(Env.load(), "audit-synth", [
+                    "python", "-m", "audit.synth", "--days", str(args.days), "--per-day", str(args.per_day)],
+                    "audit-compactor-s3", memory="1Gi", timeout=3600))
+            case "audit-bench":
+                env = Env.load()
+                for prefix in ("synth/", ""):
+                    print(audit_test.run_audit_job(env, "audit-bench", ["python", "-m", "audit.bench", "--prefix", prefix],
+                                                   "audit-viewer-s3", memory="512Mi").strip().splitlines()[-1])
+            case "audit-compact":
+                cmd = ["python", "-m", "audit.compactor"] + (["--hour", args.hour] if args.hour else [])
+                print(audit_test.run_audit_job(Env.load(), "audit-compact", cmd, "audit-compactor-s3"))
             case "review-log":
                 checks.review_log(args.since, args.raw)
             case name:

@@ -23,6 +23,13 @@ from typing import Any, AsyncGenerator
 from litellm.integrations.custom_guardrail import CustomGuardrail
 
 import transcript as tr
+from clientkind import client_kind as _client_kind
+from clientkind import is_claude_code as _is_claude_code
+
+try:
+    import audit_log
+except Exception:  # noqa: BLE001 監査ログが無くても審査は動く
+    audit_log = None
 
 LOG_PREFIX = "tool_call_review"
 JUDGE_ATTEMPTS = 3          # 審査官の呼び出しを試す回数（_judge_with_retry）
@@ -80,6 +87,9 @@ class Verdict:
     jev_category: str | None = None
     judge_used: bool = False
     judge_attempts: int = 0
+    judge_tokens_in: int = 0
+    judge_tokens_out: int = 0
+    judge_cost_usd: float = 0.0
     error: str | None = None
     timings_ms: dict = field(default_factory=dict)
 
@@ -106,27 +116,6 @@ def _user_agent(data: dict) -> str:
         md = data.get("litellm_metadata") or data.get("metadata") or {}
         ua = md.get("user_agent") or ""
     return ua or ""
-
-
-def _is_claude_code(ua: str) -> bool:
-    try:
-        from litellm.llms.anthropic.common_utils import is_claude_code_user_agent
-        return bool(ua) and is_claude_code_user_agent(ua)
-    except ImportError:  # 古い版への備え
-        return ua.startswith(("claude-cli/", "claude-code/"))
-
-
-def _client_kind(ua: str) -> str:
-    if _is_claude_code(ua):
-        return "claude-code"
-    try:
-        from litellm.litellm_core_utils.core_helpers import is_codex_user_agent
-        if ua and is_codex_user_agent(ua):
-            return "codex"
-    except ImportError:
-        if re.match(r"^codex[-_ /]", ua or "", re.I):
-            return "codex"
-    return "other" if ua else "unknown"
 
 
 def api_format(data: dict, user_api_key_dict: Any = None) -> str:
@@ -216,7 +205,7 @@ class ToolCallReview(CustomGuardrail):
         finally:
             verdict.timings_ms["total"] = int((time.monotonic() - t0) * 1000)
             ua = _user_agent(data)
-            self._log({
+            entry = {
                 "event": "review",
                 "client": _client_kind(ua),
                 "call_type": call_type,
@@ -235,14 +224,26 @@ class ToolCallReview(CustomGuardrail):
                 "reason": verdict.reason,
                 "error": verdict.error,
                 "timings_ms": verdict.timings_ms,
-            })
+            }
+            self._log(entry)
+            if audit_log is not None:
+                # 監査ログ（変更設計書 5.3 節）: 要求と litellm_call_id で結び付け、審査官の利用量を付ける
+                audit_log.record_review({**entry, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                                         "request_call_id": data.get("litellm_call_id"),
+                                         "judge_model_group": judge_model if verdict.judge_used else None,
+                                         "judge_tokens_in": verdict.judge_tokens_in,
+                                         "judge_tokens_out": verdict.judge_tokens_out,
+                                         "judge_cost_usd": verdict.judge_cost_usd})
 
     async def _jev(self, transcript: list[dict], pending: list[dict]) -> tuple[float, str | None]:
         import litellm
 
         state = {"conversation": transcript, "pending_tool_calls": pending}
+        # 監査ログには要求として記録しない（Jev は別の請求。no-log は adecisions では効かないので、
+        # 監査ログの側でも種類で外す）
         resp = await litellm.adecisions(model=self.jev_model, state=state, questions=JEV_QUESTIONS,
-                                        api_key=os.environ.get("TYPESAFE_API_KEY"), timeout=30)
+                                        api_key=os.environ.get("TYPESAFE_API_KEY"), timeout=30,
+                                        **{"no-log": True})
         answers = getattr(resp, "answers", None) or {}
         sb = answers.get("should_block")
         cat = answers.get("category")
@@ -258,14 +259,15 @@ class ToolCallReview(CustomGuardrail):
         for attempt in range(1, JUDGE_ATTEMPTS + 1):
             verdict.judge_attempts = attempt
             try:
-                return await self._judge(transcript, pending, judge_model)
+                return await self._judge(transcript, pending, judge_model, verdict)
             except Exception:
                 if attempt == JUDGE_ATTEMPTS:
                     raise
                 await asyncio.sleep(attempt)  # 1 秒、2 秒と待つ
         raise AssertionError("unreachable")
 
-    async def _judge(self, transcript: list[dict], pending: list[dict], judge_model: str) -> tuple[bool, str]:
+    async def _judge(self, transcript: list[dict], pending: list[dict], judge_model: str,
+                     verdict: Verdict | None = None) -> tuple[bool, str]:
         from litellm.proxy.proxy_server import llm_router
 
         if llm_router is None:
@@ -277,7 +279,16 @@ class ToolCallReview(CustomGuardrail):
                 {"role": "user", "content": tr.render_for_judge(transcript, pending)},
             ],
             timeout=60,
+            # 審査官の呼び出しは、監査ログに別の要求として記録しない（利用量は審査の記録に書く。変更設計書 5.3 節）
+            metadata={"tool_call_review_internal": True},
+            **{"no-log": True},
         )
+        if verdict is not None:
+            # やり直した回も、応答が返った分は足す
+            usage = getattr(resp, "usage", None)
+            verdict.judge_tokens_in += int(getattr(usage, "prompt_tokens", 0) or 0)
+            verdict.judge_tokens_out += int(getattr(usage, "completion_tokens", 0) or 0)
+            verdict.judge_cost_usd += float((getattr(resp, "_hidden_params", None) or {}).get("response_cost") or 0.0)
         content = resp.choices[0].message.content or ""
         m = re.search(r"\{.*\}", content, re.DOTALL)
         if not m:

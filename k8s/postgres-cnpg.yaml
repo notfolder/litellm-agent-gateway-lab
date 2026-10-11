@@ -34,6 +34,11 @@ metadata:
   namespace: litellm-lab
 spec:
   instances: 3
+  # 止めるときの待ちに上限を付ける。既定（stopDelay 1800 秒、switchoverDelay 3600 秒）のままだと、消した primary の
+  # Pod が Pooler の接続が切れるのを待ち続け、30 分近く Terminating のまま残った（2026-10-12 に確認）
+  stopDelay: 120
+  smartShutdownTimeout: 15
+  switchoverDelay: 60
   # オペレーターの既定は PostgreSQL 18 なので明示する。Barman Cloud Plugin は minimal か standard を推奨
   imageName: ghcr.io/cloudnative-pg/postgresql:17.11-minimal-trixie
   postgresql:
