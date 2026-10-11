@@ -21,7 +21,7 @@ environmentSecrets:
 
 envVars:
   LITELLM_MODE: PRODUCTION
-  # DISABLE_SCHEMA_UPDATE はチャートが設定する（migrationJob を有効にすると本体の Pod は true、Job は false）
+  # DISABLE_SCHEMA_UPDATE と DB の接続先は ./lab litellm が上書き用の値で入れる（DB 移行は自前の Job。変更設計書 3.4 節）
   PROXY_BASE_URL: http://localhost:8080
   CHATGPT_TOKEN_DIR: /var/lib/lab/chatgpt
   UI_USERNAME: admin                   # SSO が無いときの管理画面のログイン（パスワードはマスターキー）
@@ -41,6 +41,25 @@ autoscaling:
 
 # 起動に時間がかかる（DB 接続と Prisma）ので、startupProbe は既定（最大 300 秒）のまま
 
+# Pod をノードに散らし、ノードが止まったら 30 秒で別のノードに移す（既定は 300 秒待つ）。
+# 2026-10-12 の障害の試験で、LiteLLM の Pod が止めたノードに偏っていて、全体が 3 分以上止まったため
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: litellm
+tolerations:
+  - key: node.kubernetes.io/unreachable
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 30
+  - key: node.kubernetes.io/not-ready
+    operator: Exists
+    effect: NoExecute
+    tolerationSeconds: 30
+
 # Pod を止めるとき、止める前に 10 秒待つ。止めると決まってから入口（Traefik）が送り先から外すまでに
 # 数秒かかり、その間に届いた要求が 502 になる（2026-10-11 に確認。Codex は起動時の確認がこれに当たると、
 # その回は MCP のツールを使えないまま動く）。待っている間も要求は普通に処理し、その後の SIGTERM で
@@ -50,36 +69,41 @@ lifecycle:
     exec:
       command: ["sleep", "10"]
 
-# chatgpt/ のトークンを全 Pod で共有する（k3d が全ノードに同じホストのフォルダを見せている）
+# chatgpt-token: chatgpt/ のトークンを全 Pod で共有する（k3d が全ノードに同じホストのフォルダを見せている）
+# audit-spool: 監査ログを S3 に書けないときの退避先（Pod と一緒に消える。上限 1Gi、900MiB を超えたら捨てて数える）
 volumes:
   - name: chatgpt-token
     hostPath:
       path: /var/lib/lab/chatgpt
       type: DirectoryOrCreate
+  - name: audit-spool
+    emptyDir:
+      sizeLimit: 1Gi
 volumeMounts:
   - name: chatgpt-token
     mountPath: /var/lib/lab/chatgpt
+  - name: audit-spool
+    mountPath: /var/lib/audit-spool
 
+# PostgreSQL は CloudNativePG（k8s/postgres-cnpg.yaml）。endpoint は ./lab litellm が LAB_DB_POOLER で切り替える
+# （Pooler: litellm-pg-pooler-rw、直結: litellm-pg-rw）。Secret litellm-pg-app は ./lab secrets が作る
 db:
   useExisting: true
   deployStandalone: false
-  endpoint: postgres
+  endpoint: litellm-pg-pooler-rw
   database: litellm
   secret:
-    name: postgres
+    name: litellm-pg-app
     usernameKey: username
     passwordKey: password
 
 redis:
   enabled: false
 
+# DB 移行はチャートの Job を使わず、./lab litellm が primary に直結する自前の Job で流す
+# （Pooler の transaction モード越しでは移行が壊れるおそれがあるため。k8s/litellm-migrate.yaml）
 migrationJob:
-  enabled: true
-  hooks:
-    argocd:
-      enabled: false
-    helm:
-      enabled: true                    # 素の helm で、install / upgrade の前に DB 移行を流す
+  enabled: false
 
 ingress:
   enabled: false                       # k8s/ingress.yaml（Traefik）を使う

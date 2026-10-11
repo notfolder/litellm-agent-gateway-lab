@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% block title %}閲覧の記録{% endblock %}
+{% block body %}
+<h2>閲覧の記録 <span class="muted" style="font-size:13px">誰がいつ誰の本文を開いたか</span></h2>
+<form class="filters" id="f">
+  <label>開始<input type="date" name="start" value="{{ query.start or '' }}"></label><label>終了<input type="date" name="end" value="{{ today }}"></label>
+  <label>閲覧した人<input name="viewer"></label><label>本文の持ち主<input name="subject"></label><button class="primary">表示</button></form>
+<div id="out"></div>
+{% endblock %}
+{% block script %}
+<script>
+const f = document.getElementById("f");
+async function load(ev) {
+  ev && ev.preventDefault();
+  const d = await api("/views?" + params(f)).catch(e => ({error: e.message}));
+  if (d.error) { document.getElementById("out").innerHTML = `<p class="bad">${esc(d.error)}</p>`; return; }
+  table(document.getElementById("out"), [{key: "ts", label: "時刻", fmt: jst}, {key: "viewer_email", label: "閲覧した人"},
+    {key: "viewer_role", label: "役割"}, {key: "subject_user_email", label: "本文の持ち主"}, {key: "reason", label: "理由"},
+    {key: "call_id", label: "call_id"}, {key: "client_ip", label: "接続元"}], d.rows);
+}
+f.addEventListener("submit", load); load();
+</script>
+{% endblock %}

@@ -6,18 +6,31 @@ import json
 import shutil
 import sys
 
+from . import objectstore as objstore
 from . import render
 from .core import (
     BUILD_DIR, CACHE_HOST_PORT, CACHE_NAME, CLUSTER, ENV_EXAMPLE, ENV_FILE, HELM_RELEASE, K3S_IMAGE,
     LITELLM_CHART, NS, REGISTRY_HOST_PORT, REGISTRY_IN_CLUSTER, REGISTRY_NAME, ROOT, Env, LabError,
     admin_api, cluster_exists, configmap_manifest, container_running, gen_key, gen_secret, helm, http,
-    http_ok, info, json_output, kapply, kc, kn, ok, output, registry_exists, render_template,
+    http_ok, info, json_output, kapply, kc, kn, ok, output, port_forward, registry_exists, render_template,
     require_commands, rollout, run, secret_manifest, short_hash, step, succeeds, wait_until, warn,
     write_if_changed,
 )
 
 K8S = ROOT / "k8s"
 IMAGE_FILE = BUILD_DIR / "litellm-image.json"
+AUDIT_IMAGE_FILE = BUILD_DIR / "audit-image.json"
+
+# クラスタに入れる部品の版（変更設計書 3.1 節）
+CERT_MANAGER = {"repo": "https://charts.jetstack.io", "chart": "cert-manager", "version": "v1.21.2"}
+# クラスタ全体の部品（オペレーター、証明書、入口）は server ノード（Kubernetes の制御部分）に置く。障害の試験で止めるのは
+# agent ノードだけなので、試験で止まらない（2026-10-12 に、CloudNativePG のオペレーターが止めたノードにあって、
+# ノードが戻るまで切り替えが始まらなかった）。本番では、これらを複数台にする
+CONTROL_PLANE = {"node-role.kubernetes.io/control-plane": "true"}
+CNPG = {"repo": "https://cloudnative-pg.github.io/charts", "chart": "cloudnative-pg", "version": "0.29.1"}
+BARMAN_PLUGIN_VERSION = "v0.15.1"
+BARMAN_PLUGIN_URL = ("https://github.com/cloudnative-pg/plugin-barman-cloud/releases/download/"
+                     f"{BARMAN_PLUGIN_VERSION}/manifest.yaml")
 USER_KEYS = ["LAB_KEY_USER1_CLAUDE", "LAB_KEY_USER1_CODEX", "LAB_KEY_USER2_CLAUDE", "LAB_KEY_USER2_CODEX"]
 
 
@@ -25,6 +38,8 @@ def preflight() -> Env:
     """前提の確認。何も変更しない（.env が無いときに雛形からコピーすることだけを行う）。"""
     step("preflight 前提の確認")
     require_commands("docker", "k3d", "kubectl", "helm")
+    if not succeeds(["kubectl", "cnpg", "version"]):
+        raise LabError("kubectl cnpg（CloudNativePG のプラグイン）がありません。brew install kubectl-cnpg で入れてください")
     if not succeeds(["docker", "info"]):
         raise LabError("Docker が動いていません。OrbStack を起動してください")
 
@@ -113,41 +128,88 @@ def cluster(env: Env) -> None:
         warn("Traefik の起動引数にタイムアウトの設定が見えません（反映待ちの可能性があります）")
 
     kapply(files=[K8S / "namespace.yaml"], namespaced=False)
+    operators()
     ok("クラスタの準備ができました")
 
 
-def images(env: Env) -> dict:
-    """検証用 LiteLLM イメージのビルドと push。
-    - 中身（Dockerfile、ガードレール、ベースイメージ）のハッシュをタグにする。同じタグがあればビルドしない
-    - 自作イメージの置き場に同じタグがあれば push しない
-    外部のイメージ（PostgreSQL など）は、ノードが Docker Hub の中継キャッシュ経由で取るので扱わない。"""
-    step("images イメージ")
-    tag = render.image_tag(env.litellm_base_image, ROOT / "litellm")
-    local_image = f"litellm-lab:{tag}"
-    push_image = f"localhost:{REGISTRY_HOST_PORT}/litellm-lab:{tag}"
-    # クラスタの中から見たイメージ名（Helm に渡す）
-    image = {"repository": f"{REGISTRY_IN_CLUSTER}/litellm-lab", "tag": tag, "local": local_image}
-    write_if_changed(IMAGE_FILE, json.dumps(image, indent=2) + "\n")
+def _ensure_chart(release: str, namespace: str, spec: dict, values: dict) -> None:
+    """Helm のリリースを入れる。値のハッシュが同じなら helm を流さない（流すたびにリビジョンが増えるのを防ぐ）。
+    ハッシュはリリースの説明（--description）に持つ（cert-manager のチャートは、値に知らない項目があると断るため）。"""
+    values_hash = short_hash(json.dumps([spec, values], sort_keys=True))
+    mark = f"labValuesHash={values_hash}"
+    history = json_output(helm("-n", namespace, "history", release, "--max", "1", "-o", "json"), default=[]) or []
+    if history and history[-1].get("status") == "deployed" and history[-1].get("description") == mark:
+        ok(f"{release} は最新です（{spec['version']}）")
+        return
+    info(f"{release} {spec['version']} を入れます")
+    values_file = BUILD_DIR / f"{release}-values.json"
+    write_if_changed(values_file, json.dumps(values, indent=2) + "\n")
+    run(helm("upgrade", "--install", release, spec["chart"], "--repo", spec["repo"], "--version", spec["version"],
+             "-n", namespace, "--create-namespace", "-f", str(values_file), "--description", mark,
+             "--wait", "--timeout", "10m"))
 
+
+def operators() -> None:
+    """cert-manager → CloudNativePG のオペレーター → Barman Cloud Plugin（この順。プラグインは証明書を使う）。"""
+    _ensure_chart("cert-manager", "cert-manager", CERT_MANAGER, {
+        "crds": {"enabled": True}, "nodeSelector": CONTROL_PLANE, "webhook": {"nodeSelector": CONTROL_PLANE},
+        "cainjector": {"nodeSelector": CONTROL_PLANE}, "startupapicheck": {"nodeSelector": CONTROL_PLANE}})
+    wait_until(300, "cert-manager の準備", kc("-n", "cert-manager", "wait", "--for=condition=Available",
+                                              "deploy", "--all", "--timeout=5s"))
+    _ensure_chart("cnpg", "cnpg-system", CNPG, {"nodeSelector": CONTROL_PLANE})
+    wait_until(300, "CloudNativePG のオペレーターの準備", kc("-n", "cnpg-system", "wait", "--for=condition=Available",
+                                                         "deploy", "-l", "app.kubernetes.io/name=cloudnative-pg",
+                                                         "--timeout=5s"))
+    manifest = BUILD_DIR / f"barman-cloud-{BARMAN_PLUGIN_VERSION}-pinned.yaml"
+    if not manifest.exists():
+        info(f"Barman Cloud Plugin {BARMAN_PLUGIN_VERSION} のマニフェストを取得します")
+        res = http("GET", BARMAN_PLUGIN_URL, timeout=60)
+        if res.status != 200:
+            raise LabError(f"Barman Cloud Plugin のマニフェストを取得できませんでした（{res.status}）")
+        write_if_changed(manifest, render.pin_deployments(res.body, CONTROL_PLANE))
+    kapply(files=[manifest], namespaced=False)
+    wait_until(300, "Barman Cloud Plugin の準備", kc("-n", "cnpg-system", "rollout", "status", "deploy/barman-cloud",
+                                                  "--timeout=5s"))
+
+
+def _build_and_push(name: str, tag: str, context, build_args: list[str]) -> dict:
+    """自作イメージをビルドして置き場に push する（同じタグがあれば、どちらも飛ばす）。"""
+    local_image = f"{name}:{tag}"
+    push_image = f"localhost:{REGISTRY_HOST_PORT}/{name}:{tag}"
     if succeeds(["docker", "image", "inspect", local_image]):
-        ok(f"LiteLLM イメージ {local_image} はビルド済みです")
+        ok(f"イメージ {local_image} はビルド済みです")
     else:
-        info(f"LiteLLM イメージ {local_image} をビルドします（単体テストも流れます）")
-        run(["docker", "build", "--build-arg", f"LITELLM_BASE_IMAGE={env.litellm_base_image}",
-             "-t", local_image, str(ROOT / "litellm")])
-
+        info(f"イメージ {local_image} をビルドします（単体テストも流れます）")
+        run(["docker", "build", *build_args, "-t", local_image, str(context)])
     accept = ("application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, "
               "application/vnd.oci.image.manifest.v1+json")
-    res = http("HEAD", f"http://localhost:{REGISTRY_HOST_PORT}/v2/litellm-lab/manifests/{tag}",
+    res = http("HEAD", f"http://localhost:{REGISTRY_HOST_PORT}/v2/{name}/manifests/{tag}",
                headers={"Accept": accept}, timeout=10)
     if res.status == 200:
-        ok(f"置き場に {tag} があります")
+        ok(f"置き場に {name}:{tag} があります")
     else:
-        info("置き場に push します")
+        info(f"置き場に {name}:{tag} を push します")
         run(["docker", "tag", local_image, push_image])
         # Mac 側には arm64 の中身しか無いので、arm64 だけを push する
         run(["docker", "push", "--platform", "linux/arm64", "-q", push_image], quiet=True)
         ok(f"push しました: {push_image}")
+    # クラスタの中から見たイメージ名（マニフェストと Helm に渡す）
+    return {"repository": f"{REGISTRY_IN_CLUSTER}/{name}", "tag": tag, "local": local_image}
+
+
+def images(env: Env) -> dict:
+    """検証用 LiteLLM イメージと、監査ログの整形・検索アプリのイメージ（audit-lab）のビルドと push。
+    - 中身のハッシュをタグにする。同じタグがあればビルドしない。置き場に同じタグがあれば push しない
+    - apps/audit が無い間（実装の途中）は audit-lab を飛ばす
+    外部のイメージ（PostgreSQL など）は、ノードが Docker Hub の中継キャッシュ経由で取るので扱わない。"""
+    step("images イメージ")
+    tag = render.image_tag(env.litellm_base_image, ROOT / "litellm")
+    image = _build_and_push("litellm-lab", tag, ROOT / "litellm",
+                            ["--build-arg", f"LITELLM_BASE_IMAGE={env.litellm_base_image}"])
+    write_if_changed(IMAGE_FILE, json.dumps(image, indent=2) + "\n")
+    if (ROOT / "apps" / "audit" / "Dockerfile").exists():
+        audit = _build_and_push("audit-lab", render.dir_hash(ROOT / "apps" / "audit"), ROOT / "apps" / "audit", [])
+        write_if_changed(AUDIT_IMAGE_FILE, json.dumps(audit, indent=2) + "\n")
     return image
 
 
@@ -164,12 +226,42 @@ def secrets_(env: Env) -> Env:
     env.fill("LITELLM_SALT_KEY", gen_key())
     env.fill("POSTGRES_PASSWORD", gen_secret(16))
     env.fill("REDIS_PASSWORD", gen_secret(16))
+    env.fill("SENTINEL_PASSWORD", gen_secret(16))
     for k in USER_KEYS:
         env.fill(k, gen_key())
+    # オブジェクトストレージの管理者と、用途ごとの利用者（アクセスキーは利用者の名前、シークレットは生成）
+    env.fill("RUSTFS_ACCESS_KEY", "lab-admin")
+    env.fill("RUSTFS_SECRET_KEY", gen_secret(20))
+    for user in render.S3_USERS:
+        key_name, secret_name = render.s3_env_names(user)
+        env.fill(key_name, user)
+        env.fill(secret_name, gen_secret(20))
+    env.fill("AUDIT_SESSION_SECRET", gen_secret(32))
 
-    kapply(manifest=secret_manifest("postgres", {"username": "litellm", "password": env.get("POSTGRES_PASSWORD")}))
-    kapply(manifest=secret_manifest("redis", {"password": env.get("REDIS_PASSWORD")}))
+    pg_password = env.get("POSTGRES_PASSWORD")
+    # CloudNativePG の初期化に渡す（型は basic-auth）。パスワードは .env の値を使い回し、作り直しても変わらない
+    kapply(manifest=secret_manifest("litellm-pg-app", {"username": "litellm", "password": pg_password},
+                                    "kubernetes.io/basic-auth"))
+    # DB 移行の Job が使う直結の接続先（Pooler を通さない）
+    kapply(manifest=secret_manifest("litellm-migrate-db", {
+        "DATABASE_URL": f"postgresql://litellm:{pg_password}@litellm-pg-rw:5432/litellm"}))
+    backup_key, backup_secret = render.s3_env_names("pg-backup")
+    kapply(manifest=secret_manifest("pg-backup-s3", {"ACCESS_KEY_ID": env.get(backup_key),
+                                                     "ACCESS_SECRET_KEY": env.get(backup_secret)}))
+    for user, secret in (("audit-compactor", "audit-compactor-s3"), ("audit-viewer", "audit-viewer-s3")):
+        key_name, secret_name = render.s3_env_names(user)
+        kapply(manifest=secret_manifest(secret, {"AUDIT_S3_ACCESS_KEY": env.get(key_name),
+                                                 "AUDIT_S3_SECRET_KEY": env.get(secret_name)}))
+    kapply(manifest=secret_manifest("audit-viewer-session", {"AUDIT_SESSION_SECRET": env.get("AUDIT_SESSION_SECRET")}))
+    oidc_id, oidc_secret = render.audit_oidc_client(env)
+    if oidc_id:
+        kapply(manifest=secret_manifest("audit-viewer-oidc", {"AUDIT_OIDC_CLIENT_ID": oidc_id,
+                                                              "AUDIT_OIDC_CLIENT_SECRET": oidc_secret}))
+    kapply(manifest=secret_manifest("valkey", {"password": env.get("REDIS_PASSWORD"),
+                                               "sentinel-password": env.get("SENTINEL_PASSWORD")}))
     kapply(manifest=secret_manifest("litellm-secrets", render.secrets_for_litellm(env)))
+    kapply(manifest=secret_manifest("rustfs", {"access-key": env.get("RUSTFS_ACCESS_KEY"),
+                                               "secret-key": env.get("RUSTFS_SECRET_KEY")}))
     if env.has_google():
         kapply(manifest=secret_manifest("workspace-mcp", {
             "GOOGLE_OAUTH_CLIENT_ID": env.get("GOOGLE_OAUTH_CLIENT_ID"),
@@ -179,13 +271,71 @@ def secrets_(env: Env) -> Env:
     return env
 
 
+def objectstore(env: Env) -> None:
+    """S3 互換のオブジェクトストレージ（RustFS）と、バケット、利用者、権限（変更設計書 2 章）。
+    最後に、許した操作ができ、許していない操作が拒否されることを確かめる。"""
+    step("objectstore オブジェクトストレージ")
+    kapply(files=[K8S / "rustfs.yaml"])
+    rollout("statefulset/rustfs", 180, "RustFS の起動")
+    with port_forward("svc/rustfs", 9000) as endpoint:
+        s3 = objstore.s3_client(endpoint, *objstore.admin_credentials(env))
+
+        def ready() -> bool:
+            try:
+                s3.list_buckets()
+                return True
+            except Exception:  # noqa: BLE001 起動直後は応答しないことがある
+                return False
+
+        wait_until(60, "RustFS の S3 の応答", ready)
+        objstore.ensure_buckets(env, s3)
+        objstore.ensure_users(env, objstore.Admin(endpoint, *objstore.admin_credentials(env)))
+        objstore.self_check(env, endpoint)
+    ok("オブジェクトストレージの準備ができました")
+
+
+def _delete_if_present(*resources: str) -> None:
+    """以前の構成の部品を消す。無ければ何もしない（2 回目以降に流しても失敗しない）。"""
+    for r in resources:
+        if succeeds(kn("get", r)):
+            info(f"以前の構成の {r} を消します")
+            run(kn("delete", r, "--ignore-not-found", "--wait=true"))
+
+
 def datastores(env: Env) -> None:
-    """PostgreSQL と Redis。差分だけ反映し、Ready を待つ。"""
+    """PostgreSQL（CloudNativePG、3 台）と Redis。差分だけ反映し、準備ができるまで待つ。"""
     step("datastores PostgreSQL と Redis")
-    kapply(files=[K8S / "postgres.yaml", K8S / "redis.yaml"])
-    rollout("statefulset/postgres", 300, "PostgreSQL の起動")
-    rollout("deploy/redis", 180, "Redis の起動")
-    ok("PostgreSQL と Redis の準備ができました")
+    # 1 台の PostgreSQL（以前の構成）を消す。中身は引き継がない（変更仕様書 4 章）
+    _delete_if_present("statefulset/postgres", "service/postgres", "pvc/data-postgres-0", "secret/postgres")
+    kapply(manifest=render_template(K8S / "postgres-cnpg.yaml", {"S3_ENDPOINT": env.get("LAB_S3_ENDPOINT",
+                                                                                       render.DEFAULT_S3_ENDPOINT)}))
+    wait_until(1200, "PostgreSQL（3 台）の準備", kn("wait", "cluster/litellm-pg", "--for=condition=Ready",
+                                                  "--timeout=5s"))
+    rollout("deploy/litellm-pg-pooler-rw", 180, "Pooler の起動")
+
+    # Valkey と Sentinel（変更設計書 4 章）。1 台の Redis（以前の構成）は消す（中身はキャッシュと回数の集計だけ）
+    _delete_if_present("deployment/redis", "service/redis", "secret/redis")
+    scripts = {p.name: p.read_text() for p in sorted((K8S / "valkey").glob("*.sh"))}
+    kapply(manifest=configmap_manifest("valkey-scripts", scripts))
+    kapply(manifest=render_template(K8S / "valkey.yaml", {"SCRIPTS_HASH": short_hash(json.dumps(scripts,
+                                                                                                sort_keys=True))}))
+    rollout("statefulset/valkey", 300, "Valkey（3 台）の起動")
+    rollout("statefulset/valkey-sentinel", 300, "Sentinel（3 台）の起動")
+    wait_until(60, "Sentinel 3 台が同じ primary を指す", lambda: len(set(sentinel_masters(env))) == 1
+               and len(sentinel_masters(env)) == 3)
+    ok(f"PostgreSQL と Valkey の準備ができました（Valkey の primary: {sentinel_masters(env)[0].split('.')[0]}）")
+
+
+def sentinel_masters(env: Env) -> list[str]:
+    """3 台の Sentinel それぞれが答える、今の primary（答えなければ含めない）。"""
+    answers = []
+    for i in range(3):
+        out = output(kn("exec", f"valkey-sentinel-{i}", "--", "valkey-cli", "-p", "26379", "-a",
+                        env.get("SENTINEL_PASSWORD"), "--no-auth-warning", "SENTINEL", "get-master-addr-by-name",
+                        "mymaster"), check=False).split()
+        if out:
+            answers.append(out[0])
+    return answers
 
 
 def mcp(env: Env) -> None:
@@ -246,12 +396,13 @@ def litellm(env: Env) -> None:
     values_file = ROOT / "litellm" / "values.yaml"
     values_hash = short_hash(values_file.read_text() + overrides_file.read_text() + env.chart_version)
 
+    migrate_db(image)
     _recover_helm_release()
     current = (json_output(helm("-n", NS, "get", "values", HELM_RELEASE, "-o", "json"), default={}) or {})
     if current.get("labValuesHash") == values_hash and _helm_status() == "deployed":
         ok(f"LiteLLM のリリースは最新です（値のハッシュ {values_hash}）")
     else:
-        info("LiteLLM を helm upgrade --install します（DB 移行の Job が先に流れます）")
+        info("LiteLLM を helm upgrade --install します")
         run(helm("upgrade", "--install", HELM_RELEASE, LITELLM_CHART, "--version", env.chart_version,
                  "-n", NS, "-f", str(values_file), "-f", str(overrides_file),
                  "--set-string", f"labValuesHash={values_hash}", "--wait", "--timeout", "15m"))
@@ -261,6 +412,77 @@ def litellm(env: Env) -> None:
     wait_until(120, f"入口からの応答（{env.base_url}/health/liveliness）",
                lambda: http_ok(f"{env.base_url}/health/liveliness"))
     ok(f"LiteLLM の準備ができました: {env.base_url}（管理画面 {env.base_url}/ui）")
+
+
+def load_audit_image() -> dict:
+    if not AUDIT_IMAGE_FILE.exists():
+        raise LabError("audit-lab のイメージ名がありません。先に ./lab images を流してください")
+    return json.loads(AUDIT_IMAGE_FILE.read_text())
+
+
+def audit(env: Env) -> None:
+    """監査ログの整形の定期処理と、利用料・入出力の履歴を検索するアプリ（変更設計書 5.8 節、6 章）。
+    請求の単位と換算のレートが 1 つも無ければ、.env の初期値（LAB_CONTRACTS、LAB_FX_RATES）を書く。"""
+    step("audit 監査ログの整形と検索アプリ")
+    image = load_audit_image()
+    ref = f"{image['repository']}:{image['tag']}"
+    common = {"IMAGE": ref, "S3_ENDPOINT": env.get("LAB_S3_ENDPOINT", render.DEFAULT_S3_ENDPOINT),
+              "S3_REGION": env.get("LAB_S3_REGION", "us-east-1")}
+    kapply(manifest=render_template(K8S / "audit-compactor.yaml", common))
+    with port_forward("svc/rustfs", 9000) as endpoint:
+        s3 = objstore.s3_client(endpoint, *objstore.admin_credentials(env))
+        for kind, doc in (("contracts", render.initial_contracts(env)), ("fx_rates", render.initial_fx_rates(env))):
+            if not s3.list_objects_v2(Bucket=render.AUDIT_DERIVED, Prefix=f"billing/{kind}/").get("KeyCount"):
+                s3.put_object(Bucket=render.AUDIT_DERIVED, Key=f"billing/{kind}/00000000T000000-lab-initial.json",
+                              Body=json.dumps(doc, ensure_ascii=False, indent=2).encode())
+                info(f"{kind} の初期値を書きました")
+    if render.audit_oidc_client(env)[0]:
+        values = common | {"BASE_URL": env.base_url, "OIDC_ISSUER": env.get("LAB_AUDIT_OIDC_ISSUER",
+                                                                              "https://accounts.google.com"),
+                           "ADMINS": env.get("LAB_AUDIT_ADMINS", env.get("LAB_USER1_EMAIL")),
+                           "AUDITORS": env.get("LAB_AUDITORS"), "ROLE_CLAIM": env.get("LAB_AUDIT_ROLE_CLAIM")}
+        values["CONFIG_HASH"] = short_hash(json.dumps(values, sort_keys=True) + json.dumps(
+            render.audit_oidc_client(env)) + env.get("AUDIT_SESSION_SECRET"))
+        kapply(manifest=render_template(K8S / "audit-viewer.yaml", values))
+        rollout("deploy/audit-viewer", 300, "検索アプリの起動")
+        ok(f"検索アプリ: {env.base_url}/lab-audit/")
+    else:
+        if succeeds(kn("get", "deploy", "audit-viewer")):
+            run(kn("delete", "deploy/audit-viewer", "service/audit-viewer", "ingressroute/audit-viewer",
+                   "--ignore-not-found"))
+        warn("サインインの設定（Google の OAuth クライアントか LAB_AUDIT_OIDC_*）が無いので、検索アプリは入れません")
+    ok("監査ログの段階が終わりました")
+
+
+def migrate_db(image: dict) -> None:
+    """DB 移行の Job（変更設計書 3.5 節）。名前はイメージと DB（Cluster の uid）のハッシュ。成功済みなら流さない。"""
+    uid = output(kn("get", "cluster", "litellm-pg", "-o", "jsonpath={.metadata.uid}"), check=False).strip()
+    if not uid:
+        raise LabError("PostgreSQL（cluster/litellm-pg）がありません。先に ./lab datastores を流してください")
+    name = f"litellm-migrate-{short_hash(image['tag'] + uid)}"
+    job = json_output(kn("get", "job", name, "-o", "json"), default=None)
+    if job and (job.get("status") or {}).get("succeeded"):
+        ok(f"DB 移行は済んでいます（{name}）")
+    else:
+        if job:
+            run(kn("delete", "job", name, "--wait=true"))
+        info(f"DB 移行の Job {name} を流します")
+        kapply(manifest=render_template(K8S / "litellm-migrate.yaml", {
+            "JOB_NAME": name, "IMAGE": f"{image['repository']}:{image['tag']}"}))
+
+        def done() -> bool:
+            st = (json_output(kn("get", "job", name, "-o", "json"), default={}) or {}).get("status") or {}
+            for c in st.get("conditions") or []:
+                if c.get("type") == "Failed" and c.get("status") == "True":
+                    run(kn("logs", f"job/{name}", "--tail=50"), check=False)
+                    raise LabError(f"DB 移行が失敗しました（{name}）")
+            return bool(st.get("succeeded"))
+
+        wait_until(300, "DB 移行", done)
+    # 古いハッシュの Job を片付ける
+    for other in output(kn("get", "job", "-l", "app=litellm-migrate", "-o", "name"), check=False).split():
+        if other != f"job.batch/{name}":
+            run(kn("delete", other, "--ignore-not-found"), check=False, quiet=True)
 
 
 def bootstrap(env: Env) -> None:

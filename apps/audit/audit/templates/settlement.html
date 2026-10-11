@@ -1,0 +1,29 @@
+{% extends "base.html" %}{% block title %}精算{% endblock %}
+{% block body %}
+<h2>精算 <span class="muted" style="font-size:13px">実費を概算（A）の割合で按分（B）。月は日本時間</span></h2>
+<form class="filters" id="f"><label>月<input type="month" name="month" value="{{ query.month or today[:7] }}"></label>
+  <button class="primary">表示</button> <a id="csv" href="#">CSV</a></form>
+<div id="out"></div>
+{% endblock %}
+{% block script %}
+<script>
+const f = document.getElementById("f");
+const KIND = {user: "利用者", no_user: "利用者なし", unallocated: "未配分", uncontracted: "対象外のモデル"};
+const STATUS = {estimate: "見込み", final: "確定", no_fee: "実費未入力"};
+async function load(ev) {
+  ev && ev.preventDefault();
+  const p = params(f); document.getElementById("csv").href = BASE + "/api/settlement.csv?" + p;
+  const d = await api("/settlement?" + p).catch(e => ({error: e.message}));
+  if (d.error) { document.getElementById("out").innerHTML = `<p class="bad">${esc(d.error)}</p>`; return; }
+  table(document.getElementById("out"), [
+    {key: "contract_id", label: "請求の単位"}, {key: "row_kind", label: "行", fmt: v => KIND[v] || v},
+    {key: "user_email", label: "利用者"}, {key: "cost_a_request", label: "概算 要求（USD）", num: true, fmt: v => num(v, 4)},
+    {key: "cost_a_review", label: "概算 審査（USD）", num: true, fmt: v => num(v, 4)},
+    {key: "cost_b", label: "按分", num: true, html: r => r.cost_b == null ? "" : `${num(r.cost_b, r.currency === "JPY" ? 0 : 2)} ${esc(r.currency)}`},
+    {key: "cost_b_jpy", label: "按分（円）", num: true, html: r => r.cost_b_jpy != null ? num(r.cost_b_jpy) : (r.fx_status === "missing" ? '<span class="warn">レート未入力</span>' : "")},
+    {key: "fee", label: "実費", num: true, html: r => r.fee == null ? "" : `${num(r.fee, 2)} ${esc(r.currency)}`},
+    {key: "status", label: "状態", fmt: v => STATUS[v] || v || ""}], d.rows);
+}
+f.addEventListener("submit", load); load();
+</script>
+{% endblock %}

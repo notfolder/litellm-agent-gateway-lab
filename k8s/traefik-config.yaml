@@ -13,6 +13,10 @@ spec:
             readTimeout: 600s
             writeTimeout: 600s
             idleTimeout: 600s
+    # 入口は server ノード（Kubernetes の制御部分）に置く。障害の試験で止めるのは agent ノードだけなので、
+    # 試験で入口ごと止まらないように（本番では入口を複数台にする）
+    nodeSelector:
+      node-role.kubernetes.io/control-plane: "true"
     # アクセスログ（入口で返した状態コードと、どの Pod に送ったかを残す。502 などの切り分けに使う）
     logs:
       access:

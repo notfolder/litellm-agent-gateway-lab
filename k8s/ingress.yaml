@@ -25,6 +25,28 @@ spec:
   replacePath:
     path: /v1/chat/completions
 ---
+# ノードが止まったとき、止まったノードの LiteLLM の Pod には、ノードが NotReady になって送り先から外れるまで
+# （約 40 秒）要求が届き、接続の確立を既定の 30 秒待って失敗する（2026-10-12 の障害の試験で確認）。
+# 接続を 2 秒で諦め、接続できなかった要求だけを別の Pod に送り直す（応答が始まった要求は送り直さない）
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: litellm-fast-dial
+  namespace: litellm-lab
+spec:
+  forwardingTimeouts:
+    dialTimeout: 2s
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: litellm-retry
+  namespace: litellm-lab
+spec:
+  retry:
+    attempts: 3
+    initialInterval: 100ms
+---
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
@@ -54,6 +76,9 @@ spec:
     - kind: Rule
       priority: 1
       match: PathPrefix(`/`)
+      middlewares:
+        - name: litellm-retry
       services:
         - name: litellm
           port: 4000
+          serversTransport: litellm-fast-dial

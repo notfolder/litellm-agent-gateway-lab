@@ -1,0 +1,44 @@
+{% extends "base.html" %}{% block title %}利用状況{% endblock %}
+{% block body %}
+<h2>利用状況 <span class="muted" style="font-size:13px">利用料は概算（単価表）。実費の按分は「精算」</span></h2>
+<form class="filters" id="f">
+  <label>開始<input type="date" name="start" value="{{ query.start or '' }}"></label>
+  <label>終了<input type="date" name="end" value="{{ query.end or today }}"></label>
+  {% if user.role != 'user' %}<label>利用者（メール）<input name="user_email" value="{{ query.user_email or '' }}"></label>{% endif %}
+  <label>集計の単位<select name="group_by">
+    <option value="user_email">利用者</option><option value="user_email,model_group">利用者 × モデル</option>
+    <option value="user_email,client">利用者 × クライアント</option><option value="user_email,category">利用者 × 要求／審査</option>
+    <option value="model_group">モデル</option><option value="day">日ごと</option></select></label>
+  <button class="primary">表示</button> <a id="csv" href="#">CSV</a>
+</form>
+<div id="total" class="muted"></div>
+<canvas id="chart" height="80"></canvas>
+<div id="out"></div>
+{% endblock %}
+{% block script %}
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+const f = document.getElementById("f"); let chart;
+async function load(ev) {
+  ev && ev.preventDefault();
+  const p = params(f), gb = p.get("group_by") || "user_email";
+  document.getElementById("csv").href = BASE + "/api/usage.csv?" + p;
+  const d = await api("/usage?" + p).catch(e => ({error: e.message}));
+  if (d.error) { document.getElementById("out").innerHTML = `<p class="bad">${esc(d.error)}</p>`; return; }
+  const cols = gb.split(",").map(k => ({key: k, label: {user_email: "利用者", model_group: "モデル", client: "クライアント", category: "種類", day: "日", user_id: "利用者 ID"}[k] || k,
+    fmt: k === "category" ? v => (v === "review" ? "審査" : "要求") : null}));
+  table(document.getElementById("out"), cols.concat([
+    {key: "requests", label: "件数", num: true, fmt: v => num(v)}, {key: "tokens_in", label: "入力トークン", num: true, fmt: v => num(v)},
+    {key: "tokens_out", label: "出力トークン", num: true, fmt: v => num(v)}, {key: "tokens_cache_read", label: "キャッシュ読み取り", num: true, fmt: v => num(v)},
+    {key: "cost_usd", label: "概算（単価表、USD）", num: true, fmt: v => num(v, 4)}]), d.rows);
+  const sum = d.rows.reduce((a, r) => a + r.cost_usd, 0), n = d.rows.reduce((a, r) => a + r.requests, 0);
+  document.getElementById("total").textContent = `${d.start} 〜 ${d.end}（日本時間）: 合計 ${num(n)} 件、概算 ${num(sum, 4)} USD`;
+  const byDay = await api("/usage?" + new URLSearchParams([...p.entries()].filter(([k]) => k !== "group_by")).toString() + "&group_by=day").catch(() => ({rows: []}));
+  const days = byDay.rows.sort((a, b) => a.day < b.day ? -1 : 1);
+  chart && chart.destroy();
+  if (window.Chart && days.length) chart = new Chart(document.getElementById("chart"), {type: "bar",
+    data: {labels: days.map(r => r.day), datasets: [{label: "概算（USD）", data: days.map(r => r.cost_usd)}]}, options: {plugins: {legend: {display: false}}}});
+}
+f.addEventListener("submit", load); load();
+</script>
+{% endblock %}

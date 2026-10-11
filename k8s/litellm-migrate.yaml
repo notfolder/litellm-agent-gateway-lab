@@ -1,0 +1,36 @@
+# LiteLLM の DB 移行だけを流す Job（変更設計書 3.5 節）。./lab litellm が helm の更新の前に流す。
+# 中身は公式の Helm チャートの移行の Job と同じ。Pooler（PgBouncer の transaction モード）越しでは移行が壊れるおそれが
+# あるので、primary に直結する（Secret litellm-migrate-db の DATABASE_URL）。
+# 名前にイメージと DB（Cluster の uid）のハッシュを含め、成功済みなら流さない。そのため ttlSecondsAfterFinished は
+# 付けない（付けると Job が消えて、成功済みの判定ができなくなる）。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ${JOB_NAME}
+  namespace: litellm-lab
+  labels:
+    app: litellm-migrate
+spec:
+  backoffLimit: 4
+  activeDeadlineSeconds: 1800
+  template:
+    metadata:
+      labels:
+        app: litellm-migrate
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: ${IMAGE}
+          workingDir: /app
+          command: ["python", "litellm/proxy/prisma_migration.py"]
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: litellm-migrate-db, key: DATABASE_URL }
+            - name: DISABLE_SCHEMA_UPDATE
+              value: "false"
+            # DATABASE_DISABLE_PREPARED_STATEMENTS は付けない（付けると直結の URL にも pgbouncer=true が付く）
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 2Gi }      # prisma generate（Node）が 768Mi では足りず OOM になった（2026-10-11）

@@ -1,0 +1,42 @@
+{% extends "base.html" %}{% block title %}管理{% endblock %}
+{% block body %}
+<h2>請求の単位</h2>
+<p class="muted">kind: subscription（定額）/ invoice（従量課金の請求書）。currency: USD / JPY。models は完全一致か末尾 * の前方一致。fees は月（日本時間）ごとの実費。</p>
+<textarea id="contracts" rows="16" style="width:100%;font-family:monospace"></textarea>
+<p><button class="primary" id="saveC">保存</button> <span id="msgC"></span></p>
+<h2>換算のレート（米ドル → 円）</h2>
+<form class="filters" id="fx"><label>月<input type="month" name="month" value="{{ today[:7] }}"></label>
+  <label>1 USD =<input name="usd_jpy" size="8"></label><span>円</span><button class="primary">保存</button> <span id="msgF"></span></form>
+<div id="fxList"></div>
+<h2>管理操作の記録</h2><div id="log"></div>
+<h2>整形の状態</h2><pre id="state"></pre>
+{% endblock %}
+{% block script %}
+<script>
+let cver, fver;
+async function load() {
+  const c = await api("/contracts"); cver = c.version;
+  document.getElementById("contracts").value = JSON.stringify(c.contracts, null, 2);
+  const fx = await api("/fx-rates"); fver = fx.version;
+  table(document.getElementById("fxList"), [{key: "m", label: "月"}, {key: "r", label: "レート", num: true}],
+    Object.entries(fx.usd_jpy || {}).sort().reverse().map(([m, r]) => ({m, r})));
+  const log = await api("/admin-log?start=" + new Date(Date.now() - 89 * 864e5).toISOString().slice(0, 10));
+  table(document.getElementById("log"), [{key: "ts", label: "時刻", fmt: jst}, {key: "actor_email", label: "操作した人"},
+    {key: "action", label: "操作"}, {key: "conflict", label: "同時の編集", fmt: v => v ? "あり" : ""}], log.rows);
+  document.getElementById("state").textContent = JSON.stringify(await api("/compactor"), null, 2);
+}
+document.getElementById("saveC").onclick = async () => {
+  const m = document.getElementById("msgC");
+  try {
+    const r = await api("/contracts", {method: "PUT", body: JSON.stringify({base_version: cver, contracts: JSON.parse(document.getElementById("contracts").value)})});
+    m.textContent = r.conflict ? "保存しました（ほかの人が間に編集していました。内容を確かめてください）" : "保存しました"; load();
+  } catch (e) { m.innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+};
+document.getElementById("fx").onsubmit = async ev => {
+  ev.preventDefault(); const p = new FormData(ev.target), m = document.getElementById("msgF");
+  try { await api(`/fx-rates/${p.get("month")}`, {method: "PUT", body: JSON.stringify({usd_jpy: p.get("usd_jpy"), base_version: fver})}); m.textContent = "保存しました"; load(); }
+  catch (e) { m.innerHTML = `<span class="bad">${esc(e.message)}</span>`; }
+};
+load();
+</script>
+{% endblock %}

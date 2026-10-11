@@ -171,5 +171,100 @@ class ReviewLogTest(unittest.TestCase):
         self.assertIn("t1 codex shell: 削除", text)
 
 
+class ObjectStoreSpecTest(unittest.TestCase):
+    def test_env_names(self):
+        self.assertEqual(render.s3_env_names("litellm-writer"), ("S3_LITELLM_WRITER_KEY", "S3_LITELLM_WRITER_SECRET"))
+
+    def test_buckets_follow_env(self):
+        b = render.s3_buckets(env(LAB_AUDIT_LOCK_MODE="COMPLIANCE", LAB_AUDIT_RETENTION_DAYS="30"))
+        self.assertEqual(b["audit-raw"]["lock"], {"Mode": "COMPLIANCE", "Days": 30})
+        self.assertEqual(b["audit-raw"]["lifecycle"][0]["Expiration"], {"Days": 31})
+        self.assertEqual(b["audit-access"]["lock"]["Days"], 400)
+        self.assertIsNone(b["audit-derived"]["lock"])
+        self.assertFalse(b["pg-backup"]["versioning"])
+
+    def test_no_user_may_delete_or_bypass_audit_records(self):
+        for user, doc in render.s3_policies().items():
+            for st in doc["Statement"]:
+                touches_audit = any(r.startswith(("arn:aws:s3:::audit-raw", "arn:aws:s3:::audit-access"))
+                                    for r in st["Resource"])
+                if touches_audit:
+                    for action in st["Action"]:
+                        self.assertNotIn(action, ("s3:*", "s3:DeleteObject", "s3:DeleteObjectVersion",
+                                                  "s3:BypassGovernanceRetention"), (user, action))
+
+    def test_writer_can_only_append_raw(self):
+        doc = render.s3_policies()["litellm-writer"]
+        self.assertEqual(doc["Statement"], [{"Effect": "Allow", "Action": ["s3:PutObject"],
+                                             "Resource": ["arn:aws:s3:::audit-raw/raw/*"]}])
+
+
+class DatabaseSettingsTest(unittest.TestCase):
+    def test_pooler_is_default(self):
+        o = render.helm_overrides(env(), "repo", "tag", "h")
+        self.assertEqual(o["db"]["endpoint"], "litellm-pg-pooler-rw")
+        self.assertEqual(o["envVars"]["DATABASE_DISABLE_PREPARED_STATEMENTS"], "true")
+        self.assertEqual(o["envVars"]["DISABLE_SCHEMA_UPDATE"], "true")
+        cfg = render.litellm_config(env(), has_chatgpt=False)
+        self.assertEqual(cfg["general_settings"]["database_connection_pool_limit"], 10)
+
+    def test_direct(self):
+        e = env(LAB_DB_POOLER="direct")
+        o = render.helm_overrides(e, "repo", "tag", "h")
+        self.assertEqual(o["db"]["endpoint"], "litellm-pg-rw")
+        self.assertNotIn("DATABASE_DISABLE_PREPARED_STATEMENTS", o["envVars"])
+        self.assertEqual(render.litellm_config(e, has_chatgpt=False)["general_settings"]
+                         ["database_connection_pool_limit"], 5)
+
+    def test_unknown_mode_is_an_error(self):
+        with self.assertRaises(ValueError):
+            render.db_pooler(env(LAB_DB_POOLER="pgbouncer"))
+
+    def test_secret_type(self):
+        m = json.loads(secret_manifest("s", {"username": "u"}, "kubernetes.io/basic-auth"))
+        self.assertEqual(m["type"], "kubernetes.io/basic-auth")
+
+
+class RedisSettingsTest(unittest.TestCase):
+    def test_sentinel_only_via_env(self):
+        cfg = render.litellm_config(env(), has_chatgpt=False)
+        # router_settings に Redis のキーがあると、ルーターが Sentinel を使わない別の接続を作る
+        self.assertFalse([k for k in cfg["router_settings"] if k.startswith("redis")])
+        self.assertTrue(cfg["general_settings"]["use_redis_transaction_buffer"])
+        o = render.helm_overrides(env(), "repo", "tag", "h")
+        nodes = json.loads(o["envVars"]["REDIS_SENTINEL_NODES"])
+        self.assertEqual(len(nodes), 3)
+        self.assertEqual(o["envVars"]["REDIS_SERVICE_NAME"], "mymaster")
+        data = render.secrets_for_litellm(env(REDIS_PASSWORD="r", SENTINEL_PASSWORD="s"))
+        self.assertNotIn("REDIS_HOST", data)
+        self.assertEqual(data["REDIS_SENTINEL_PASSWORD"], "s")
+
+
+class PricingAndPinningTest(unittest.TestCase):
+    def test_price_env_names_are_readable_from_env_file(self):
+        self.assertEqual(render.price_env_prefix("review-judge"), "LAB_PRICE_REVIEW_JUDGE")
+        self.assertEqual(render.price_env_prefix("gpt-5.6-terra"), "LAB_PRICE_GPT_5_6_TERRA")
+        self.assertIn("LAB_PRICE_GPT_5_6_TERRA_IN", parse_env("LAB_PRICE_GPT_5_6_TERRA_IN=3\n"))
+
+    def test_model_prices_default_and_override(self):
+        p = render.model_prices(env(), "gpt-5.6-terra", "gpt-5.6-terra")
+        self.assertAlmostEqual(p["input_cost_per_token"], 2.0e-6)
+        p = render.model_prices(env(LAB_PRICE_REVIEW_JUDGE_IN="1", LAB_PRICE_REVIEW_JUDGE_OUT="2",
+                                    LAB_PRICE_REVIEW_JUDGE_CACHE_READ="0.1"), "review-judge", "unknown")
+        self.assertAlmostEqual(p["output_cost_per_token"], 2.0e-6)
+        self.assertIsNone(render.model_prices(env(), "x", "unknown"))
+        cfg = render.litellm_config(env(), has_chatgpt=True)
+        terra = next(m for m in cfg["model_list"] if m["model_name"] == "gpt-5.6-terra")
+        self.assertIn("model_info", terra)
+        self.assertEqual(cfg["litellm_settings"]["callbacks"], ["audit_log.audit_logger_instance"])
+        self.assertTrue(cfg["general_settings"]["disable_spend_logs"])
+
+    def test_pin_deployments(self):
+        text = "kind: Service\nmetadata: {name: s}\n---\nkind: Deployment\nmetadata: {name: d}\nspec:\n  template:\n    spec: {}\n"
+        docs = list(yaml.safe_load_all(render.pin_deployments(text, {"a": "b"})))
+        self.assertEqual(docs[1]["spec"]["template"]["spec"]["nodeSelector"], {"a": "b"})
+        self.assertNotIn("spec", docs[0])
+
+
 if __name__ == "__main__":
     unittest.main()

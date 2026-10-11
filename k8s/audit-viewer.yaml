@@ -1,0 +1,87 @@
+# 利用料と入出力の履歴を検索するアプリ（変更設計書 6 章）。経路は /lab-audit/（LiteLLM 自身が /audit を持つため）。
+# ./lab audit が変数を置き換えて使う。サインインの設定（OIDC）が無いときは入れない。
+apiVersion: v1
+kind: Service
+metadata:
+  name: audit-viewer
+  namespace: litellm-lab
+spec:
+  selector:
+    app: audit-viewer
+  ports:
+    - port: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audit-viewer
+  namespace: litellm-lab
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: audit-viewer
+  template:
+    metadata:
+      labels:
+        app: audit-viewer
+      annotations:
+        lab/config-hash: "${CONFIG_HASH}"
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: audit-viewer
+      containers:
+        - name: viewer
+          image: ${IMAGE}
+          command: ["python", "-m", "audit.viewer"]
+          env:
+            - name: AUDIT_S3_ENDPOINT
+              value: "${S3_ENDPOINT}"
+            - name: AUDIT_S3_REGION
+              value: "${S3_REGION}"
+            - name: AUDIT_BASE_URL
+              value: "${BASE_URL}"
+            - name: AUDIT_OIDC_ISSUER
+              value: "${OIDC_ISSUER}"
+            - name: AUDIT_ADMINS
+              value: "${ADMINS}"
+            - name: AUDIT_AUDITORS
+              value: "${AUDITORS}"
+            - name: AUDIT_ROLE_CLAIM
+              value: "${ROLE_CLAIM}"
+          envFrom:
+            - secretRef: { name: audit-viewer-s3 }
+            - secretRef: { name: audit-viewer-oidc }
+            - secretRef: { name: audit-viewer-session }
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet: { path: /lab-audit/healthz, port: 8000 }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 512Mi }
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: audit-viewer
+  namespace: litellm-lab
+spec:
+  entryPoints:
+    - web
+  routes:
+    # 優先度 50: 素通しの拒否（100）と MCP の GET（90）より後、その他すべて（1、LiteLLM）より先
+    - kind: Rule
+      priority: 50
+      match: PathPrefix(`/lab-audit/`) || Path(`/lab-audit`)
+      services:
+        - name: audit-viewer
+          port: 8000

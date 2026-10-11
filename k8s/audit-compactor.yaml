@@ -1,0 +1,45 @@
+# 監査ログの整形の定期処理（変更設計書 5.8 節）。毎時 10 分（日本時間）に動く。./lab audit が変数を置き換えて使う。
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: audit-compactor
+  namespace: litellm-lab
+spec:
+  schedule: "10 * * * *"
+  timeZone: Asia/Tokyo
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    metadata:
+      labels:
+        app: audit-compactor
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 3000
+      template:
+        metadata:
+          labels:
+            app: audit-compactor
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: compactor
+              image: ${IMAGE}
+              command: ["python", "-m", "audit.compactor"]
+              env:
+                - name: AUDIT_S3_ENDPOINT
+                  value: "${S3_ENDPOINT}"
+                - name: AUDIT_S3_REGION
+                  value: "${S3_REGION}"
+                - name: AUDIT_S3_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef: { name: audit-compactor-s3, key: AUDIT_S3_ACCESS_KEY }
+                - name: AUDIT_S3_SECRET_KEY
+                  valueFrom:
+                    secretKeyRef: { name: audit-compactor-s3, key: AUDIT_S3_SECRET_KEY }
+                - name: AUDIT_DUCKDB_MEMORY
+                  value: 512MB
+              resources:
+                requests: { cpu: 100m, memory: 256Mi }
+                limits: { memory: 1Gi }

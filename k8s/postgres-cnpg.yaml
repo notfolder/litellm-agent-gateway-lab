@@ -1,0 +1,136 @@
+# LiteLLM 用の PostgreSQL（CloudNativePG、3 台。変更設計書 3 章）。./lab datastores が変数（S3_ENDPOINT）を置き換えて使う。
+# - 3 台を別々のノードに置き、同期複製（どれか 1 台の standby が受け取れば書き込み完了）。切り替えは過半数の合意で行う
+# - LiteLLM は Pooler（PgBouncer、transaction モード）か、直結（litellm-pg-rw）につなぐ（.env の LAB_DB_POOLER）
+# - WAL とバックアップは Barman Cloud Plugin で RustFS（S3 互換）の pg-backup バケットへ送る
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: pg-backup
+  namespace: litellm-lab
+spec:
+  retentionPolicy: "30d"
+  configuration:
+    destinationPath: s3://pg-backup/litellm-pg
+    endpointURL: ${S3_ENDPOINT}
+    s3Credentials:
+      accessKeyId: { name: pg-backup-s3, key: ACCESS_KEY_ID }
+      secretAccessKey: { name: pg-backup-s3, key: ACCESS_SECRET_KEY }
+    wal:
+      compression: gzip
+    data:
+      compression: gzip
+  instanceSidecarConfiguration:
+    # S3 互換のストレージ向けの公式の回避策（付けて害は無い）
+    env:
+      - name: AWS_REQUEST_CHECKSUM_CALCULATION
+        value: when_required
+      - name: AWS_RESPONSE_CHECKSUM_VALIDATION
+        value: when_required
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: litellm-pg
+  namespace: litellm-lab
+spec:
+  instances: 3
+  # 止めるときの待ちに上限を付ける。既定（stopDelay 1800 秒、switchoverDelay 3600 秒）のままだと、消した primary の
+  # Pod が Pooler の接続が切れるのを待ち続け、30 分近く Terminating のまま残った（2026-10-12 に確認）
+  # switchoverDelay を 5 秒まで縮めると、計画的な切り替えで失敗が増えた（20 秒と PgBouncer の早いつなぎ直しで、
+  # 計画的な切り替えも primary の Pod の削除も失敗 0 件。2026-10-12 の実測）
+  stopDelay: 120
+  smartShutdownTimeout: 5
+  switchoverDelay: 20
+  # オペレーターの既定は PostgreSQL 18 なので明示する。Barman Cloud Plugin は minimal か standard を推奨
+  imageName: ghcr.io/cloudnative-pg/postgresql:17.11-minimal-trixie
+  postgresql:
+    parameters:
+      max_connections: "200"
+      shared_buffers: 128MB
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: required
+      failoverQuorum: true
+  affinity:
+    enablePodAntiAffinity: true
+    podAntiAffinityType: required
+    topologyKey: kubernetes.io/hostname
+  storage:
+    storageClass: local-path
+    size: 2Gi
+  resources:
+    requests: { cpu: 250m, memory: 384Mi }
+    limits: { memory: 512Mi }
+  bootstrap:
+    initdb:
+      database: litellm
+      owner: litellm
+      secret:
+        name: litellm-pg-app
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: pg-backup
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Pooler
+metadata:
+  name: litellm-pg-pooler-rw
+  namespace: litellm-lab
+spec:
+  cluster:
+    name: litellm-pg
+  instances: 2
+  type: rw
+  pgbouncer:
+    poolMode: transaction
+    parameters:
+      max_client_conn: "1000"
+      default_pool_size: "40"
+      # primary が替わったとき、つなぎ直しを早める（既定は失敗後 15 秒待つ、接続の確立を 15 秒待つ）
+      server_login_retry: "1"
+      server_connect_timeout: "3"
+      # LiteLLM の Prisma 5.4.2 は pgbouncer=true でも問い合わせごとに準備し DEALLOCATE ALL を送る。
+      # PgBouncer の準備済みの問い合わせの機能と組み合わせると失敗するので（prisma#21799）、使わない
+      max_prepared_statements: "0"
+  template:
+    spec:
+      containers:
+        - name: pgbouncer
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { memory: 64Mi }
+      # 2 台を必ず別のノードに置き、ノードが止まったら 30 秒で残りのノードに移す
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  cnpg.io/poolerName: litellm-pg-pooler-rw
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: litellm-pg-daily
+  namespace: litellm-lab
+spec:
+  # 秒 分 時 日 月 曜日（UTC）。18:00 UTC は日本時間 3:00（業務時間を避ける）
+  schedule: "0 0 18 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: litellm-pg
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io

@@ -1,0 +1,41 @@
+{% extends "base.html" %}{% block title %}履歴{% endblock %}
+{% block body %}
+<h2>履歴</h2>
+<form class="filters" id="f">
+  <label>開始<input type="date" name="start" value="{{ query.start or today }}"></label>
+  <label>終了<input type="date" name="end" value="{{ query.end or today }}"></label>
+  {% if user.role != 'user' %}<label>利用者（メール）<input name="user_email" value="{{ query.user_email or '' }}"></label>{% endif %}
+  <label>モデル<input name="model_group" value="{{ query.model_group or '' }}"></label>
+  <label>クライアント<select name="client"><option value="">すべて</option><option>codex</option><option>claude-code</option><option>other</option><option>unknown</option></select></label>
+  <label>結果<select name="status"><option value="">すべて</option><option value="success">成功</option><option value="failure">失敗</option></select></label>
+  <label>ツール名<input name="tool" value="{{ query.tool or '' }}"></label>
+  <label><span>審査で止めたものだけ</span><input type="checkbox" name="blocked" value="true"></label>
+  <button class="primary">検索</button>
+</form>
+<div id="out"></div>
+<p><button id="prev">前の 100 件</button> <button id="next">次の 100 件</button> <span id="page" class="muted"></span></p>
+{% endblock %}
+{% block script %}
+<script>
+const f = document.getElementById("f"); let page = 0;
+async function load(ev) {
+  if (ev) { ev.preventDefault(); page = 0; }
+  const p = params(f); p.set("page", page);
+  const out = document.getElementById("out"); out.innerHTML = '<p class="muted">検索しています…</p>';
+  const d = await api("/requests?" + p).catch(e => ({error: e.message}));
+  if (d.error) { out.innerHTML = `<p class="bad">${esc(d.error)}</p>`; return; }
+  table(out, [
+    {key: "ts_start", label: "時刻（日本時間）", fmt: jst}, {key: "user_email", label: "利用者"}, {key: "client", label: "クライアント"},
+    {key: "type", label: "種類"}, {key: "model_group", label: "モデル"}, {key: "status", label: "結果"},
+    {key: "tokens_in", label: "入力", num: true, fmt: v => num(v)}, {key: "tokens_out", label: "出力", num: true, fmt: v => num(v)},
+    {key: "cost_usd", label: "概算 USD", num: true, fmt: v => num(v, 4)},
+    {key: "tool_names", label: "ツール", html: r => esc(r.tool_names || r.mcp_tool || "") + (r.review_blocked ? ' <span class="bad">（審査で拒否）</span>' : "")},
+    {key: "call_id", label: "", html: r => `<a href="${BASE}/request?call_id=${encodeURIComponent(r.call_id)}&at=${encodeURIComponent(r.ts_start)}">詳細</a>`}], d.rows);
+  document.getElementById("page").textContent = `${page + 1} ページ目`;
+  document.getElementById("next").disabled = !d.more; document.getElementById("prev").disabled = page === 0;
+}
+document.getElementById("next").onclick = () => { page++; load(); };
+document.getElementById("prev").onclick = () => { page = Math.max(0, page - 1); load(); };
+f.addEventListener("submit", load); load();
+</script>
+{% endblock %}

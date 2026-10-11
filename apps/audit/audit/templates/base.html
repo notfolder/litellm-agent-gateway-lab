@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf-token" content="{{ csrf or '' }}">
+<title>{% block title %}利用状況{% endblock %} - LiteLLM 監査</title>
+<style>
+  :root { --bg:#fff; --fg:#1f2328; --muted:#656d76; --line:#d0d7de; --accent:#0969da; --warn:#9a6700; --bad:#cf222e; --row:#f6f8fa; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0d1117; --fg:#e6edf3; --muted:#8d96a0; --line:#30363d; --accent:#4493f8; --warn:#d29922; --bad:#f85149; --row:#161b22; } }
+  body { margin:0; font:14px/1.5 system-ui, "Hiragino Sans", sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; gap:16px; align-items:center; padding:10px 16px; border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header a { color:var(--fg); text-decoration:none; } header a.on { color:var(--accent); font-weight:600; }
+  header .me { margin-left:auto; color:var(--muted); }
+  main { padding:16px; max-width:1200px; }
+  form.filters { display:flex; gap:8px; flex-wrap:wrap; align-items:end; margin-bottom:12px; }
+  label { display:flex; flex-direction:column; font-size:12px; color:var(--muted); }
+  input, select, textarea, button { font:inherit; padding:4px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:var(--fg); }
+  button { cursor:pointer; } button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { border-bottom:1px solid var(--line); padding:4px 8px; text-align:left; vertical-align:top; }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; }
+  tr:nth-child(even) td { background:var(--row); }
+  .muted { color:var(--muted); } .bad { color:var(--bad); } .warn { color:var(--warn); }
+  .scroll { overflow-x:auto; }
+  pre { white-space:pre-wrap; word-break:break-word; background:var(--row); padding:8px; border-radius:6px; max-height:480px; overflow:auto; }
+  details { margin:4px 0; }
+</style>
+</head>
+<body>
+<header>
+  <strong>LiteLLM 監査</strong>
+  <a href="{{ base }}/" class="{{ 'on' if request.url.path == base + '/' }}">利用状況</a>
+  <a href="{{ base }}/requests" class="{{ 'on' if request.url.path.endswith('/requests') }}">履歴</a>
+  <a href="{{ base }}/settlement" class="{{ 'on' if request.url.path.endswith('/settlement') }}">精算</a>
+  {% if user.role in ('auditor', 'admin') %}<a href="{{ base }}/views" class="{{ 'on' if request.url.path.endswith('/views') }}">閲覧の記録</a>{% endif %}
+  {% if user.role == 'admin' %}<a href="{{ base }}/admin" class="{{ 'on' if request.url.path.endswith('/admin') }}">管理</a>{% endif %}
+  <span class="me">{{ user.email }}（{{ {'user':'一般の利用者','auditor':'監査担当','admin':'管理者'}[user.role] }}）<a href="{{ base }}/logout">サインアウト</a></span>
+</header>
+<main>{% block body %}{% endblock %}</main>
+<script>
+const BASE = "{{ base }}", ROLE = "{{ user.role }}", ME = "{{ user.email }}";
+const CSRF = document.querySelector('meta[name=csrf-token]').content;
+async function api(path, opts = {}) {
+  opts.headers = Object.assign({"content-type": "application/json", "x-csrf-token": CSRF}, opts.headers || {});
+  const r = await fetch(BASE + "/api" + path, opts);
+  const t = await r.text();
+  let d; try { d = JSON.parse(t); } catch { d = t; }
+  if (!r.ok) throw new Error((d && d.detail) || r.status);
+  return d;
+}
+function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function num(v, d = 0) { return v == null ? "" : Number(v).toLocaleString("ja-JP", {minimumFractionDigits: d, maximumFractionDigits: d}); }
+function jst(ts) { return ts ? new Date(ts).toLocaleString("ja-JP", {timeZone: "Asia/Tokyo"}) : ""; }
+function table(el, cols, rows) {
+  if (!rows.length) { el.innerHTML = '<p class="muted">該当するものはありません</p>'; return; }
+  el.innerHTML = '<div class="scroll"><table><thead><tr>' + cols.map(c => `<th class="${c.num ? 'num' : ''}">${esc(c.label)}</th>`).join("") +
+    '</tr></thead><tbody>' + rows.map(r => '<tr>' + cols.map(c => `<td class="${c.num ? 'num' : ''}">${c.html ? c.html(r) : esc(c.fmt ? c.fmt(r[c.key], r) : r[c.key])}</td>`).join("") + '</tr>').join("") + '</tbody></table></div>';
+}
+function params(form) { return new URLSearchParams([...new FormData(form)].filter(([k, v]) => v !== "")); }
+</script>
+{% block script %}{% endblock %}
+</body>
+</html>

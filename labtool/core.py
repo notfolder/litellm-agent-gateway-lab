@@ -6,12 +6,14 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import json
 import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -326,13 +328,14 @@ def kapply(*, files: list[Path] | None = None, manifest: str | None = None, name
             tmp.unlink(missing_ok=True)
 
 
-def secret_manifest(name: str, data: dict[str, str]) -> str:
-    """Secret のマニフェスト（JSON は YAML として有効）。キーの順を固定して、差分が出ないようにする。"""
+def secret_manifest(name: str, data: dict[str, str], type_: str = "Opaque") -> str:
+    """Secret のマニフェスト（JSON は YAML として有効）。キーの順を固定して、差分が出ないようにする。
+    CloudNativePG の初期化に渡す Secret は type_="kubernetes.io/basic-auth" にする。"""
     return json.dumps({
         "apiVersion": "v1",
         "kind": "Secret",
         "metadata": {"name": name, "namespace": NS},
-        "type": "Opaque",
+        "type": type_,
         "data": {k: base64.b64encode(v.encode()).decode() for k, v in sorted(data.items())},
     }, indent=2)
 
@@ -344,6 +347,33 @@ def configmap_manifest(name: str, data: dict[str, str]) -> str:
         "metadata": {"name": name, "namespace": NS},
         "data": dict(sorted(data.items())),
     }, indent=2, ensure_ascii=False)
+
+
+@contextlib.contextmanager
+def port_forward(target: str, remote_port: int, namespace: str = NS):
+    """クラスタの中の Service に、その間だけ Mac からつなぐ（./lab は Mac の上で動くため）。
+    with の中では http://127.0.0.1:<空いているポート> を返す。"""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    proc = subprocess.Popen(kc("-n", namespace, "port-forward", target, f"{port}:{remote_port}"),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        start = time.monotonic()
+        while True:
+            with socket.socket() as s:
+                if s.connect_ex(("127.0.0.1", port)) == 0:
+                    break
+            if proc.poll() is not None or time.monotonic() - start > 30:
+                raise LabError(f"{target} への port-forward を張れませんでした")
+            time.sleep(0.3)
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
 
 def rollout(kind_name: str, timeout: int, desc: str) -> None:

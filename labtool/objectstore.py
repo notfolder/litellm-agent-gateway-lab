@@ -1,0 +1,202 @@
+"""オブジェクトストレージ（RustFS）の設定: バケット、利用者、権限（変更設計書 2 章）。
+
+S3 の API（boto3）と RustFS の管理 API（/rustfs/admin/v3。SigV4 で署名）を使う。./lab は Mac の上で動くので、
+呼ぶ側が port_forward で張った接続先（http://127.0.0.1:<ポート>）を渡す。
+どの操作も「無ければ作る、あれば比べて違えば直す」で、何度流しても同じ状態になる。
+"""
+
+from __future__ import annotations
+
+import json
+import time
+import urllib.error
+import urllib.request
+
+from . import render
+from .core import Env, LabError, info, ok
+
+REGION = "us-east-1"
+
+
+def s3_client(endpoint: str, access_key: str, secret_key: str):
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=access_key,
+                        aws_secret_access_key=secret_key, region_name=REGION,
+                        config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 3}))
+
+
+class Admin:
+    """RustFS の管理 API。本文は JSON、署名は SigV4（サービス名 s3）。"""
+
+    def __init__(self, endpoint: str, access_key: str, secret_key: str) -> None:
+        from botocore.credentials import Credentials
+
+        self.endpoint = endpoint
+        self.cred = Credentials(access_key, secret_key)
+
+    def call(self, method: str, path: str, body=None) -> tuple[int, str]:
+        from botocore.auth import S3SigV4Auth
+        from botocore.awsrequest import AWSRequest
+
+        url = self.endpoint + "/rustfs/admin/v3" + path
+        data = json.dumps(body).encode() if body is not None else b""
+        req = AWSRequest(method=method, url=url, data=data, headers={"Content-Type": "application/json"})
+        S3SigV4Auth(self.cred, "s3", REGION).add_auth(req)
+        r = urllib.request.Request(url, data=data if method != "GET" else None, method=method,
+                                   headers=dict(req.headers.items()))
+        try:
+            with urllib.request.urlopen(r, timeout=15) as resp:
+                return resp.status, resp.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    def must(self, method: str, path: str, body=None) -> str:
+        status, text = self.call(method, path, body)
+        if status != 200:
+            raise LabError(f"RustFS の管理 API {method} {path} が失敗しました（{status}）: {text[:300]}")
+        return text
+
+
+def admin_credentials(env: Env) -> tuple[str, str]:
+    return env.get("RUSTFS_ACCESS_KEY"), env.get("RUSTFS_SECRET_KEY")
+
+
+def user_credentials(env: Env, user: str) -> tuple[str, str]:
+    key_name, secret_name = render.s3_env_names(user)
+    return env.get(key_name), env.get(secret_name)
+
+
+def _canon(obj) -> str:
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False)
+
+
+def _lifecycle_rules(s3, bucket: str) -> list[dict]:
+    from botocore.exceptions import ClientError
+
+    try:
+        rules = s3.get_bucket_lifecycle_configuration(Bucket=bucket).get("Rules", [])
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") in ("NoSuchLifecycleConfiguration", "NoSuchBucketLifecycle"):
+            return []
+        raise
+    return sorted(rules, key=lambda r: r.get("ID", ""))
+
+
+def _lock_rule(s3, bucket: str) -> tuple[bool, dict | None]:
+    from botocore.exceptions import ClientError
+
+    try:
+        cfg = s3.get_object_lock_configuration(Bucket=bucket)["ObjectLockConfiguration"]
+    except ClientError:
+        return False, None
+    enabled = cfg.get("ObjectLockEnabled") == "Enabled"
+    return enabled, (cfg.get("Rule") or {}).get("DefaultRetention")
+
+
+def ensure_buckets(env: Env, s3) -> None:
+    from botocore.exceptions import ClientError
+
+    existing = {b["Name"] for b in s3.list_buckets().get("Buckets", [])}
+    for name, spec in render.s3_buckets(env).items():
+        lock = spec["lock"]
+        if name not in existing:
+            s3.create_bucket(Bucket=name, **({"ObjectLockEnabledForBucket": True} if lock else {}))
+            info(f"バケット {name} を作りました" + ("（Object Lock あり）" if lock else ""))
+        if spec["versioning"] and s3.get_bucket_versioning(Bucket=name).get("Status") != "Enabled":
+            s3.put_bucket_versioning(Bucket=name, VersioningConfiguration={"Status": "Enabled"})
+            info(f"バケット {name} のバージョニングを有効にしました")
+        if lock:
+            enabled, current = _lock_rule(s3, name)
+            if not enabled:
+                raise LabError(f"バケット {name} は Object Lock が無効のまま作られています。後から有効にはできないので、"
+                               "./lab rebuild で作り直してください")
+            if current != lock:
+                s3.put_object_lock_configuration(Bucket=name, ObjectLockConfiguration={
+                    "ObjectLockEnabled": "Enabled", "Rule": {"DefaultRetention": lock}})
+                info(f"バケット {name} の既定の保持を {lock['Mode']} {lock['Days']} 日にしました")
+        want = sorted(spec["lifecycle"], key=lambda r: r["ID"])
+        if _canon(_lifecycle_rules(s3, name)) != _canon(want):
+            if want:
+                s3.put_bucket_lifecycle_configuration(Bucket=name, LifecycleConfiguration={"Rules": want})
+            else:
+                try:
+                    s3.delete_bucket_lifecycle(Bucket=name)
+                except ClientError:
+                    pass
+            info(f"バケット {name} のライフサイクルを更新しました")
+    ok("バケットの設定は最新です")
+
+
+def ensure_users(env: Env, admin: Admin) -> None:
+    users = json.loads(admin.must("GET", "/list-users") or "{}")
+    policies = render.s3_policies()
+    for user in render.S3_USERS:
+        access, secret = user_credentials(env, user)
+        if access not in users:
+            admin.must("PUT", f"/add-user?accessKey={access}", {"secretKey": secret, "status": "enabled"})
+            info(f"利用者 {access} を作りました")
+        policy_name = f"lab-{user}"
+        status, text = admin.call("GET", f"/info-canned-policy?name={policy_name}")
+        current = (json.loads(text).get("policy") if status == 200 and text else None)
+        if _canon(current) != _canon(policies[user]):
+            admin.must("PUT", f"/add-canned-policy?name={policy_name}", policies[user])
+            info(f"権限 {policy_name} を更新しました")
+        attached = (users.get(access) or {}).get("policyName")
+        if attached != policy_name:
+            admin.must("PUT", f"/set-user-or-group-policy?policyName={policy_name}&userOrGroup={access}&isGroup=false")
+            info(f"利用者 {access} に権限 {policy_name} を割り当てました")
+    ok("利用者と権限は最新です")
+
+
+def self_check(env: Env, endpoint: str) -> None:
+    """許した操作ができ、許していない操作（原本の読み取り・削除、保持の回避なしの削除）が拒否されることを確かめる。"""
+    from botocore.exceptions import ClientError
+
+    def denied(fn) -> bool:
+        try:
+            fn()
+        except ClientError as e:
+            return e.response.get("Error", {}).get("Code") == "AccessDenied"
+        return False
+
+    admin_s3 = s3_client(endpoint, *admin_credentials(env))
+    writer = s3_client(endpoint, *user_credentials(env, "litellm-writer"))
+    viewer = s3_client(endpoint, *user_credentials(env, "audit-viewer"))
+    key = f"raw/_selfcheck/{time.strftime('%Y%m%dT%H%M%S')}.txt"
+    version = writer.put_object(Bucket=render.AUDIT_RAW, Key=key, Body=b"self-check").get("VersionId")
+    checks = {
+        "書き込み用の利用者は原本を読めない": denied(lambda: writer.get_object(Bucket=render.AUDIT_RAW, Key=key)),
+        "書き込み用の利用者は原本を消せない": denied(
+            lambda: writer.delete_object(Bucket=render.AUDIT_RAW, Key=key, VersionId=version)),
+        "書き込み用の利用者は raw/ の外に書けない": denied(
+            lambda: writer.put_object(Bucket=render.AUDIT_RAW, Key="_selfcheck.txt", Body=b"x")),
+        "管理者でも保持の回避なしには原本を消せない": denied(
+            lambda: admin_s3.delete_object(Bucket=render.AUDIT_RAW, Key=key, VersionId=version)),
+        "検索アプリは原本に書けない": denied(
+            lambda: viewer.put_object(Bucket=render.AUDIT_RAW, Key="raw/_selfcheck/viewer.txt", Body=b"x")),
+        "検索アプリは原本を読める": not denied(lambda: viewer.get_object(Bucket=render.AUDIT_RAW, Key=key)),
+    }
+    failed = [k for k, v in checks.items() if not v]
+    if failed:
+        raise LabError("オブジェクトストレージの自己確認が失敗しました: " + "、".join(failed))
+    ok(f"オブジェクトストレージの自己確認: {len(checks)} 件すべて期待どおり")
+
+
+def snapshot(env: Env, endpoint: str) -> list[str]:
+    """冪等性の試験用: バケットの設定と、利用者と権限を文字列の一覧にする。"""
+    s3 = s3_client(endpoint, *admin_credentials(env))
+    admin = Admin(endpoint, *admin_credentials(env))
+    lines = []
+    for name in sorted(render.s3_buckets(env)):
+        lock = _lock_rule(s3, name)
+        lines.append(f"bucket {name} versioning={s3.get_bucket_versioning(Bucket=name).get('Status')} "
+                     f"lock={_canon(lock)} lifecycle={_canon(_lifecycle_rules(s3, name))}")
+    users = json.loads(admin.must("GET", "/list-users") or "{}")
+    for access, meta in sorted(users.items()):
+        lines.append(f"s3user {access} policy={meta.get('policyName')} status={meta.get('status')}")
+    for user in render.S3_USERS:
+        _, text = admin.call("GET", f"/info-canned-policy?name=lab-{user}")
+        lines.append(f"s3policy lab-{user} {_canon(json.loads(text).get('policy') if text else None)}")
+    return lines

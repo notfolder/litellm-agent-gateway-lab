@@ -36,13 +36,14 @@ LiteLLM の管理画面の Google SSO と、Gmail の MCP（`google_workspace_mc
 ## 3. OAuth クライアント
 
 「クライアント」→「クライアントを作成」で、種類は **ウェブ アプリケーション**。
-「承認済みのリダイレクト URI」に次の 3 つを登録する（ポートは `.env` の `LAB_HTTP_PORT`）。
+「承認済みのリダイレクト URI」に次の 4 つを登録する（ポートは `.env` の `LAB_HTTP_PORT`）。
 
 | URI | 用途 |
 |---|---|
 | `http://localhost:8080/sso/callback` | 管理画面の Google SSO |
 | `http://localhost:8080/callback` | Gmail の MCP のサインイン（LiteLLM が受ける） |
 | `http://localhost:8080/ui/mcp/oauth/callback` | 管理画面から MCP に接続する場合 |
+| `http://localhost:8080/lab-audit/auth/callback` | 利用料と入出力の履歴の検索アプリのサインイン（2026-10-12 追加） |
 
 作成後に表示されるクライアント ID とシークレットを `.env` に入れる。
 
