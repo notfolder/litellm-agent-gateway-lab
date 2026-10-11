@@ -224,3 +224,74 @@ def client_files(env: Env, claude_key: str, codex_key: str, codex_home: Path) ->
         f"export LITELLM_MCP_AUTH='Bearer {codex_key}'\n"
     )
     return files
+
+
+# ---- オブジェクトストレージ（変更設計書 2 章） ----
+AUDIT_RAW, AUDIT_ACCESS, AUDIT_DERIVED, PG_BACKUP = "audit-raw", "audit-access", "audit-derived", "pg-backup"
+S3_USERS = ["litellm-writer", "audit-compactor", "audit-viewer", "pg-backup"]
+
+
+def s3_env_names(user: str) -> tuple[str, str]:
+    """利用者のアクセスキーとシークレットを置く .env の名前（例 S3_LITELLM_WRITER_KEY / _SECRET）。"""
+    base = "S3_" + user.upper().replace("-", "_")
+    return base + "_KEY", base + "_SECRET"
+
+
+def _lifecycle(rule_id: str, prefix: str, days: int | None, noncurrent_days: int | None) -> dict:
+    rule: dict = {"ID": rule_id, "Status": "Enabled", "Filter": {"Prefix": prefix}}
+    if days is not None:
+        rule["Expiration"] = {"Days": days}
+    if noncurrent_days is not None:
+        rule["NoncurrentVersionExpiration"] = {"NoncurrentDays": noncurrent_days}
+    return rule
+
+
+def s3_buckets(env: Env) -> dict[str, dict]:
+    """バケットごとの設定。lock は Object Lock の既定の保持（None なら Object Lock を使わない）。
+    保持の日数 + 1 日で期限切れにする（保持が切れた版から消える）。"""
+    mode = env.get("LAB_AUDIT_LOCK_MODE", "GOVERNANCE")
+    raw_days = int(env.get("LAB_AUDIT_RETENTION_DAYS", "90"))
+    access_days = int(env.get("LAB_AUDIT_ACCESS_RETENTION_DAYS", "400"))
+    return {
+        AUDIT_RAW: {"lock": {"Mode": mode, "Days": raw_days}, "versioning": True,
+                    "lifecycle": [_lifecycle("all", "", raw_days + 1, raw_days + 1)]},
+        AUDIT_ACCESS: {"lock": {"Mode": mode, "Days": access_days}, "versioning": True,
+                       "lifecycle": [_lifecycle("all", "", access_days + 1, access_days + 1)]},
+        # 請求の単位と換算のレート（billing/contracts/、billing/fx_rates/）は、編集のたびに新しいファイルを足し、
+        # 最新のファイルを今の値とする。小さく編集も稀なので消さない
+        AUDIT_DERIVED: {"lock": None, "versioning": True, "lifecycle": [
+            _lifecycle("meta", "meta/", raw_days + 1, 1),
+            _lifecycle("usage-daily", "usage_daily/", 400, 1),
+            _lifecycle("settlement", "billing/settlement/", 400, 400),
+            _lifecycle("synth", "synth/", 7, 1),
+        ]},
+        PG_BACKUP: {"lock": None, "versioning": False, "lifecycle": []},
+    }
+
+
+def _stmt(actions: list[str], resources: list[str]) -> dict:
+    return {"Effect": "Allow", "Action": actions, "Resource": [f"arn:aws:s3:::{r}" for r in resources]}
+
+
+def s3_policies() -> dict[str, dict]:
+    """利用者ごとの権限（必要な操作だけ）。どの利用者にも、原本の削除と保持の回避は許さない。"""
+    def doc(*stmts: dict) -> dict:
+        return {"Version": "2012-10-17", "Statement": list(stmts)}
+
+    read = ["s3:GetObject"]
+    lst = ["s3:ListBucket"]
+    return {
+        "litellm-writer": doc(_stmt(["s3:PutObject"], [f"{AUDIT_RAW}/raw/*"])),
+        "audit-compactor": doc(
+            _stmt(lst, [AUDIT_RAW, AUDIT_DERIVED]),
+            _stmt(read, [f"{AUDIT_RAW}/*", f"{AUDIT_DERIVED}/*"]),
+            _stmt(["s3:PutObject"], [f"{AUDIT_DERIVED}/*"]),
+        ),
+        "audit-viewer": doc(
+            _stmt(lst, [AUDIT_RAW, AUDIT_ACCESS, AUDIT_DERIVED]),
+            _stmt(read, [f"{AUDIT_RAW}/*", f"{AUDIT_ACCESS}/*", f"{AUDIT_DERIVED}/*"]),
+            _stmt(["s3:PutObject"], [f"{AUDIT_ACCESS}/*", f"{AUDIT_DERIVED}/billing/contracts/*",
+                                     f"{AUDIT_DERIVED}/billing/fx_rates/*"]),
+        ),
+        "pg-backup": doc(_stmt(["s3:*"], [PG_BACKUP, f"{PG_BACKUP}/*"])),
+    }

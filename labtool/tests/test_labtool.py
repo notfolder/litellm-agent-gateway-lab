@@ -171,5 +171,33 @@ class ReviewLogTest(unittest.TestCase):
         self.assertIn("t1 codex shell: 削除", text)
 
 
+class ObjectStoreSpecTest(unittest.TestCase):
+    def test_env_names(self):
+        self.assertEqual(render.s3_env_names("litellm-writer"), ("S3_LITELLM_WRITER_KEY", "S3_LITELLM_WRITER_SECRET"))
+
+    def test_buckets_follow_env(self):
+        b = render.s3_buckets(env(LAB_AUDIT_LOCK_MODE="COMPLIANCE", LAB_AUDIT_RETENTION_DAYS="30"))
+        self.assertEqual(b["audit-raw"]["lock"], {"Mode": "COMPLIANCE", "Days": 30})
+        self.assertEqual(b["audit-raw"]["lifecycle"][0]["Expiration"], {"Days": 31})
+        self.assertEqual(b["audit-access"]["lock"]["Days"], 400)
+        self.assertIsNone(b["audit-derived"]["lock"])
+        self.assertFalse(b["pg-backup"]["versioning"])
+
+    def test_no_user_may_delete_or_bypass_audit_records(self):
+        for user, doc in render.s3_policies().items():
+            for st in doc["Statement"]:
+                touches_audit = any(r.startswith(("arn:aws:s3:::audit-raw", "arn:aws:s3:::audit-access"))
+                                    for r in st["Resource"])
+                if touches_audit:
+                    for action in st["Action"]:
+                        self.assertNotIn(action, ("s3:*", "s3:DeleteObject", "s3:DeleteObjectVersion",
+                                                  "s3:BypassGovernanceRetention"), (user, action))
+
+    def test_writer_can_only_append_raw(self):
+        doc = render.s3_policies()["litellm-writer"]
+        self.assertEqual(doc["Statement"], [{"Effect": "Allow", "Action": ["s3:PutObject"],
+                                             "Resource": ["arn:aws:s3:::audit-raw/raw/*"]}])
+
+
 if __name__ == "__main__":
     unittest.main()

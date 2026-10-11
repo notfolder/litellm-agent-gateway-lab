@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script --quiet
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["pyyaml>=6.0"]
+# dependencies = ["pyyaml>=6.0", "boto3>=1.35"]
 # ///
 """検証環境の構築ツール。どのコマンドも何度実行しても同じ結果になる（docs/design.md 14 章）。
 
@@ -24,6 +24,7 @@ def up() -> None:
     stages.cluster(env)
     stages.images(env)
     stages.secrets_(env)
+    stages.objectstore(env)
     stages.datastores(env)
     stages.mcp(env)
     stages.litellm(env)
@@ -54,6 +55,7 @@ COMMANDS: dict[str, tuple[str, object]] = {
     "cluster": ("[段階] イメージの置き場、k3d クラスタ、Traefik", stage(stages.cluster)),
     "images": ("[段階] 検証用 LiteLLM イメージのビルドと push", stage(stages.images)),
     "secrets": ("[段階] .env の生成と k8s の Secret", stage(stages.secrets_)),
+    "objectstore": ("[段階] オブジェクトストレージ（RustFS）、バケット、利用者と権限", stage(stages.objectstore)),
     "datastores": ("[段階] PostgreSQL と Redis", stage(stages.datastores)),
     "mcp": ("[段階] 試験用の偽 LLM と google_workspace_mcp", stage(stages.mcp)),
     "litellm": ("[段階] プロキシ設定、LiteLLM（Helm）、入口", stage(stages.litellm)),

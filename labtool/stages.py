@@ -6,12 +6,13 @@ import json
 import shutil
 import sys
 
+from . import objectstore as objstore
 from . import render
 from .core import (
     BUILD_DIR, CACHE_HOST_PORT, CACHE_NAME, CLUSTER, ENV_EXAMPLE, ENV_FILE, HELM_RELEASE, K3S_IMAGE,
     LITELLM_CHART, NS, REGISTRY_HOST_PORT, REGISTRY_IN_CLUSTER, REGISTRY_NAME, ROOT, Env, LabError,
     admin_api, cluster_exists, configmap_manifest, container_running, gen_key, gen_secret, helm, http,
-    http_ok, info, json_output, kapply, kc, kn, ok, output, registry_exists, render_template,
+    http_ok, info, json_output, kapply, kc, kn, ok, output, port_forward, registry_exists, render_template,
     require_commands, rollout, run, secret_manifest, short_hash, step, succeeds, wait_until, warn,
     write_if_changed,
 )
@@ -166,10 +167,19 @@ def secrets_(env: Env) -> Env:
     env.fill("REDIS_PASSWORD", gen_secret(16))
     for k in USER_KEYS:
         env.fill(k, gen_key())
+    # オブジェクトストレージの管理者と、用途ごとの利用者（アクセスキーは利用者の名前、シークレットは生成）
+    env.fill("RUSTFS_ACCESS_KEY", "lab-admin")
+    env.fill("RUSTFS_SECRET_KEY", gen_secret(20))
+    for user in render.S3_USERS:
+        key_name, secret_name = render.s3_env_names(user)
+        env.fill(key_name, user)
+        env.fill(secret_name, gen_secret(20))
 
     kapply(manifest=secret_manifest("postgres", {"username": "litellm", "password": env.get("POSTGRES_PASSWORD")}))
     kapply(manifest=secret_manifest("redis", {"password": env.get("REDIS_PASSWORD")}))
     kapply(manifest=secret_manifest("litellm-secrets", render.secrets_for_litellm(env)))
+    kapply(manifest=secret_manifest("rustfs", {"access-key": env.get("RUSTFS_ACCESS_KEY"),
+                                               "secret-key": env.get("RUSTFS_SECRET_KEY")}))
     if env.has_google():
         kapply(manifest=secret_manifest("workspace-mcp", {
             "GOOGLE_OAUTH_CLIENT_ID": env.get("GOOGLE_OAUTH_CLIENT_ID"),
@@ -177,6 +187,29 @@ def secrets_(env: Env) -> Env:
         }))
     ok("Secret を反映しました")
     return env
+
+
+def objectstore(env: Env) -> None:
+    """S3 互換のオブジェクトストレージ（RustFS）と、バケット、利用者、権限（変更設計書 2 章）。
+    最後に、許した操作ができ、許していない操作が拒否されることを確かめる。"""
+    step("objectstore オブジェクトストレージ")
+    kapply(files=[K8S / "rustfs.yaml"])
+    rollout("statefulset/rustfs", 180, "RustFS の起動")
+    with port_forward("svc/rustfs", 9000) as endpoint:
+        s3 = objstore.s3_client(endpoint, *objstore.admin_credentials(env))
+
+        def ready() -> bool:
+            try:
+                s3.list_buckets()
+                return True
+            except Exception:  # noqa: BLE001 起動直後は応答しないことがある
+                return False
+
+        wait_until(60, "RustFS の S3 の応答", ready)
+        objstore.ensure_buckets(env, s3)
+        objstore.ensure_users(env, objstore.Admin(endpoint, *objstore.admin_credentials(env)))
+        objstore.self_check(env, endpoint)
+    ok("オブジェクトストレージの準備ができました")
 
 
 def datastores(env: Env) -> None:

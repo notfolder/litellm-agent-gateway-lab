@@ -1,0 +1,71 @@
+# S3 互換のオブジェクトストレージ（RustFS、1 台 1 ディスク）。監査ログと PostgreSQL のバックアップの置き場。
+# server ノードに固定する（障害の試験で止めるのは agent ノードだけなので、試験で止まらない）。
+# 中身はクラスタ内の PVC にあり、./lab down で消える（検証環境だけの振る舞い）。
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustfs
+  namespace: litellm-lab
+spec:
+  selector:
+    app: rustfs
+  ports:
+    - name: s3
+      port: 9000
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rustfs
+  namespace: litellm-lab
+spec:
+  serviceName: rustfs
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rustfs
+  template:
+    metadata:
+      labels:
+        app: rustfs
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: k3d-litellm-server-0
+      securityContext:
+        fsGroup: 10001
+      containers:
+        - name: rustfs
+          image: rustfs/rustfs:1.0.1
+          env:
+            - name: RUSTFS_VOLUMES
+              value: /data
+            - name: RUSTFS_ADDRESS
+              value: "0.0.0.0:9000"
+            - name: RUSTFS_CONSOLE_ENABLE
+              value: "false"
+            - name: RUSTFS_ACCESS_KEY
+              valueFrom:
+                secretKeyRef: { name: rustfs, key: access-key }
+            - name: RUSTFS_SECRET_KEY
+              valueFrom:
+                secretKeyRef: { name: rustfs, key: secret-key }
+          ports:
+            - containerPort: 9000
+          readinessProbe:
+            tcpSocket: { port: 9000 }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 10Gi
