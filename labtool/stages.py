@@ -32,6 +32,8 @@ BARMAN_PLUGIN_VERSION = "v0.15.1"
 BARMAN_PLUGIN_URL = ("https://github.com/cloudnative-pg/plugin-barman-cloud/releases/download/"
                      f"{BARMAN_PLUGIN_VERSION}/manifest.yaml")
 USER_KEYS = ["LAB_KEY_USER1_CLAUDE", "LAB_KEY_USER1_CODEX", "LAB_KEY_USER2_CLAUDE", "LAB_KEY_USER2_CODEX"]
+# 審査を外したキー（ユーザー 1 の検証用。LAB_NOREVIEW_KEYS=true のときだけ作る。docs/manual-check.md）
+NOREVIEW_KEYS = ["LAB_KEY_USER1_CLAUDE_NOREVIEW", "LAB_KEY_USER1_CODEX_NOREVIEW"]
 
 
 def preflight() -> Env:
@@ -229,6 +231,9 @@ def secrets_(env: Env) -> Env:
     env.fill("SENTINEL_PASSWORD", gen_secret(16))
     for k in USER_KEYS:
         env.fill(k, gen_key())
+    if render.noreview_enabled(env):
+        for k in NOREVIEW_KEYS:
+            env.fill(k, gen_key())
     # オブジェクトストレージの管理者と、用途ごとの利用者（アクセスキーは利用者の名前、シークレットは生成）
     env.fill("RUSTFS_ACCESS_KEY", "lab-admin")
     env.fill("RUSTFS_SECRET_KEY", gen_secret(20))
@@ -509,18 +514,22 @@ def bootstrap(env: Env) -> None:
             raise LabError(f"ユーザー {email} を作れませんでした（{res.status}）: {res.body[:300]}")
         ok(f"ユーザー {email} を作りました（役割 {role}）")
 
-    def ensure_key(email: str, alias: str, key: str) -> None:
+    def ensure_key(email: str, alias: str, key: str, metadata: dict | None = None) -> None:
+        body: dict = {"key": key, "object_permission": perm}
+        if metadata is not None:
+            body["metadata"] = metadata
         found = admin_api(env, "GET", "/key/info?" + _q(key=key)).json() or {}
         info_ = found.get("info") or {}
-        if info_.get("key_alias") or info_.get("token"):
-            admin_api(env, "POST", "/key/update", {"key": key, "object_permission": perm})
-            info(f"キー {alias} は作成済みです（MCP: {perm['mcp_servers']}）")
+        note = "、審査なし" if metadata and metadata.get("opted_out_global_guardrails") else ""
+        # status が active のときだけ「作成済み」。削除済み（status=deleted）は key/info に別名が残るので作り直す
+        if info_.get("status") == "active":
+            admin_api(env, "POST", "/key/update", body)
+            info(f"キー {alias} は作成済みです（MCP: {perm['mcp_servers']}{note}）")
             return
-        res = admin_api(env, "POST", "/key/generate",
-                        {"key": key, "user_id": email, "key_alias": alias, "object_permission": perm})
+        res = admin_api(env, "POST", "/key/generate", {**body, "user_id": email, "key_alias": alias})
         if not (res.json() or {}).get("key"):
             raise LabError(f"キー {alias} を作れませんでした（{res.status}）: {res.body[:300]}")
-        ok(f"キー {alias} を作りました（MCP: {perm['mcp_servers']}）")
+        ok(f"キー {alias} を作りました（MCP: {perm['mcp_servers']}{note}）")
 
     users = [("1", env.get("LAB_USER1_EMAIL"), "proxy_admin")]
     if env.get("LAB_USER2_EMAIL"):
@@ -529,6 +538,22 @@ def bootstrap(env: Env) -> None:
         ensure_user(email, role)
         ensure_key(email, f"user{n}-claude", env.get(f"LAB_KEY_USER{n}_CLAUDE"))
         ensure_key(email, f"user{n}-codex", env.get(f"LAB_KEY_USER{n}_CODEX"))
+    # 審査を外したキー（ユーザー 1 のみ。LAB_NOREVIEW_KEYS=true のときだけ。docs/manual-check.md）
+    nr_aliases = ["user1-claude-noreview", "user1-codex-noreview"]
+    if render.noreview_enabled(env):
+        u1 = env.get("LAB_USER1_EMAIL")
+        nr = {"opted_out_global_guardrails": ["tool-call-review"]}
+        ensure_key(u1, "user1-claude-noreview", env.get("LAB_KEY_USER1_CLAUDE_NOREVIEW"), nr)
+        ensure_key(u1, "user1-codex-noreview", env.get("LAB_KEY_USER1_CODEX_NOREVIEW"), nr)
+    else:
+        # 無効に戻したら、審査を通らずに使えるキーを残さない（別名で削除。無ければ何もしない）
+        for alias, key in zip(nr_aliases, [env.get("LAB_KEY_USER1_CLAUDE_NOREVIEW"), env.get("LAB_KEY_USER1_CODEX_NOREVIEW")]):
+            if not key:
+                continue
+            found = admin_api(env, "GET", "/key/info?" + _q(key=key)).json() or {}
+            if (found.get("info") or {}).get("status") == "active":
+                admin_api(env, "POST", "/key/delete", {"keys": [key]})
+                info(f"審査なしキー {alias} を削除しました（LAB_NOREVIEW_KEYS=false）")
     ok("初期データの投入が終わりました")
 
 
@@ -609,6 +634,13 @@ def clients(env: Env) -> None:
         dest = codex_home / "config.toml" if name == "codex-config.toml" else out / name
         if write_if_changed(dest, content, mode=0o600):
             info(f"{dest.relative_to(ROOT)} を更新しました")
+    if not render.noreview_enabled(env):
+        # 審査なしが無効なら、起動用の設定を残さない
+        for name in ("noreview-codex.env", "noreview-claude.env", "noreview-mcp.json"):
+            p = out / name
+            if p.exists():
+                p.unlink()
+                info(f"{p.relative_to(ROOT)} を削除しました（LAB_NOREVIEW_KEYS=false）")
     ok(f"クライアントの設定ができました（ユーザー {user}）: clients/claude-lab、clients/codex-lab で起動します")
     if not env.has_chatgpt():
         warn("ChatGPT のトークンが無いので、Codex はまだ使えません（./lab chatgpt-login）")

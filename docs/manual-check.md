@@ -35,41 +35,20 @@
 最後に「LiteLLM は応答しています」と出て、`Google OAuth: あり`、`ChatGPT: あり` になっていることを確かめます。
 Gmail の MCP のサインインが切れていたら、先に `clients/codex-lab mcp login gmail` を流します（Claude Code は `/mcp` から）。
 
-### 2.2 審査なしのキーの発行（初回だけ）
+### 2.2 審査なしのキーを作る（初回だけ）
 
-リポジトリの直下で流します。キーの値は `clients/out/noreview-codex.env` と `clients/out/noreview-claude.env` に保存されます（`clients/out/` は Git に入りません）。
-ファイルがすでにあれば、そのキーを使うので流しません。
-
-キーの発行は LiteLLM の管理操作なので、管理操作の記録として 13 か月残ります。
-`./lab rebuild` で DB を作り直すとキーも消えるので、2 つのファイルを消してから流し直してください。
+`.env` の `LAB_NOREVIEW_KEYS` を `true` にして `./lab up`（または、段階ごとに `./lab secrets`、`./lab bootstrap`、`./lab clients`）を流します。
+これで、ユーザー 1 の審査を外したキー（`user1-claude-noreview`、`user1-codex-noreview`）が `.env` に固定値で生成・登録され、
+起動用の設定（`clients/out/noreview-codex.env`、`noreview-claude.env`、`noreview-mcp.json`）が作られます。
 
 ```bash
-python3 - <<'EOF'
-import json, os, urllib.request
-env = {}
-for line in open(".env"):
-    line = line.strip()
-    if line and not line.startswith("#") and "=" in line:
-        k, v = line.split("=", 1)
-        env[k] = v.strip().strip("'\"")
-for client in ("codex", "claude"):
-    path = f"clients/out/noreview-{client}.env"
-    if os.path.exists(path):
-        print(f"{path} はあります（発行しません）")
-        continue
-    body = {"user_id": env["LAB_USER1_EMAIL"], "key_alias": f"user1-{client}-noreview",
-            "object_permission": {"mcp_servers": ["gmail"]},
-            "metadata": {"opted_out_global_guardrails": ["tool-call-review"]}}
-    req = urllib.request.Request("http://localhost:8080/key/generate", data=json.dumps(body).encode(), method="POST",
-                                 headers={"Authorization": f"Bearer {env['LITELLM_MASTER_KEY']}",
-                                          "Content-Type": "application/json"})
-    key = json.load(urllib.request.urlopen(req))["key"]
-    with open(path, "w") as f:
-        f.write(f"export LITELLM_API_KEY='{key}'\nexport LITELLM_MCP_AUTH='Bearer {key}'\n")
-    os.chmod(path, 0o600)
-    print(f"user1-{client}-noreview を発行して {path} に保存しました")
-EOF
+sed -i '' 's/^LAB_NOREVIEW_KEYS=.*/LAB_NOREVIEW_KEYS=true/' .env   # 無ければ: echo 'LAB_NOREVIEW_KEYS=true' >> .env
+./lab up
 ```
+
+- キーの値は `.env` に固定で持つので、`./lab rebuild` で DB を作り直しても同じキーで作り直されます。
+- キーの登録は LiteLLM の管理操作なので、管理操作の記録として残ります。
+- 審査を通らずに使えるキーなので、検証が済んだら `LAB_NOREVIEW_KEYS=false` に戻して `./lab up` を流すと消えます（6 章）。
 
 ### 2.3 使い捨ての試験用リポジトリ
 
@@ -105,9 +84,7 @@ clients/codex-lab -C ~/lab-trial/codex-review
 ### 3.2 Codex（審査なし）
 
 ```bash
-( source clients/out/codex.env
-  source clients/out/noreview-codex.env
-  codex -C ~/lab-trial/codex-noreview )
+clients/codex-lab-noreview -C ~/lab-trial/codex-noreview
 ```
 
 ### 3.3 Claude Code（機密データチェックあり）
@@ -119,16 +96,10 @@ clients/codex-lab -C ~/lab-trial/codex-review
 ### 3.4 Claude Code（機密データチェックなし）
 
 ```bash
-( R=~/Documents/litellm-agent-gateway-lab
-  source $R/clients/out/claude.env
-  source $R/clients/out/noreview-claude.env
-  export ANTHROPIC_CUSTOM_HEADERS="x-litellm-api-key: Bearer $LITELLM_API_KEY"
-  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-  cd ~/lab-trial/claude-noreview
-  claude --settings $R/clients/out/claude-settings.json --mcp-config $R/clients/out/mcp.json )
+( cd ~/lab-trial/claude-noreview && ~/Documents/litellm-agent-gateway-lab/clients/claude-lab-noreview )
 ```
 
-Claude Code の LLM の要求だけを審査なしのキーで送ります。Gmail の MCP の要求は普段のキーのままですが、審査は LLM の応答にかかるので、結果は変わりません。
+審査なしの起動スクリプト（`clients/codex-lab-noreview`、`clients/claude-lab-noreview`）は、2.2 で `LAB_NOREVIEW_KEYS=true` にして `./lab` を流すと使えるようになります。審査を外したキーで、LLM の要求も Gmail の MCP の要求も送ります。
 
 ### 3.5 Gmail のツールが見えないとき
 
@@ -209,20 +180,23 @@ LiteLLM のログには、ゲートウェイが Gmail の MCP からツールの
 ## 6. 後片付け
 
 - 試験用リポジトリを消す: `rm -rf ~/lab-trial`
-- 審査なしのキーを消す（残すと、審査を通らずに使えるキーが残り続けます）
+- 審査なしのキーを消す（残すと、審査を通らずに使えるキーが残り続けます）。
+  `.env` の `LAB_NOREVIEW_KEYS` を `false` に戻して `./lab up` を流すと、キーの登録が消え、起動用の設定も作られなくなります。
+
+  ```bash
+  sed -i '' 's/^LAB_NOREVIEW_KEYS=.*/LAB_NOREVIEW_KEYS=false/' .env
+  ./lab up
+  ```
+
+  すぐに消したいときは、管理 API で別名を指定して消すこともできます。
 
   ```bash
   python3 - <<'EOF'
-  import json, os, urllib.request
-  env = dict(l.strip().split("=", 1) for l in open(".env") if "=" in l and not l.startswith("#"))
-  mk = env["LITELLM_MASTER_KEY"].strip("'\"")
+  import json, urllib.request
+  mk = [l.split("=",1)[1].strip().strip("'\"") for l in open(".env") if l.startswith("LITELLM_MASTER_KEY=")][0]
   req = urllib.request.Request("http://localhost:8080/key/delete", method="POST",
         data=json.dumps({"key_aliases": ["user1-codex-noreview", "user1-claude-noreview"]}).encode(),
         headers={"Authorization": f"Bearer {mk}", "Content-Type": "application/json"})
   print(urllib.request.urlopen(req).read().decode())
-  for c in ("codex", "claude"):
-      p = f"clients/out/noreview-{c}.env"
-      if os.path.exists(p):
-          os.remove(p)
   EOF
   ```

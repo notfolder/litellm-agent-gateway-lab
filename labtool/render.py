@@ -182,6 +182,16 @@ def isolated_review_enabled(env: Env) -> bool:
     return env.get("LAB_ISOLATED_REVIEW", "true").lower() == "true"
 
 
+def noreview_enabled(env: Env) -> bool:
+    """審査を外したキー（ユーザー 1 の検証用）を作るか。既定は false。"""
+    return env.get("LAB_NOREVIEW_KEYS", "false").lower() == "true"
+
+
+def noreview_keys(env: Env) -> tuple[str | None, str | None]:
+    """審査を外したキー（Claude Code 用、Codex 用）。固定値は .env に生成される。"""
+    return env.get("LAB_KEY_USER1_CLAUDE_NOREVIEW"), env.get("LAB_KEY_USER1_CODEX_NOREVIEW")
+
+
 def isolated_policy(env: Env) -> str:
     """文脈独立審査の判定基準の文章（LAB_ISOLATED_POLICY_FILE。相対パスはリポジトリから）。空ならエラー。"""
     path = Path(env.get("LAB_ISOLATED_POLICY_FILE") or DEFAULT_ISOLATED_POLICY)
@@ -330,6 +340,28 @@ def client_files(env: Env, claude_key: str, codex_key: str, codex_home: Path) ->
         f"export LITELLM_API_KEY='{codex_key}'\n"
         f"export LITELLM_MCP_AUTH='Bearer {codex_key}'\n"
     )
+    # 審査を外したキー（LAB_NOREVIEW_KEYS=true のときだけ。検証用。docs/manual-check.md）
+    if noreview_enabled(env):
+        nr_claude, nr_codex = noreview_keys(env)
+        if nr_codex:
+            files["noreview-codex.env"] = (
+                "# clients/codex-lab-noreview が読み込む（審査を外したキー。生成物）\n"
+                f"export CODEX_HOME='{codex_home}'\n"
+                f"export LITELLM_API_KEY='{nr_codex}'\n"
+                f"export LITELLM_MCP_AUTH='Bearer {nr_codex}'\n"
+            )
+        if nr_claude:
+            files["noreview-claude.env"] = (
+                "# clients/claude-lab-noreview が読み込む（審査を外したキー。生成物）\n"
+                f"export ANTHROPIC_BASE_URL='{base}'\n"
+                f"export ANTHROPIC_CUSTOM_HEADERS='x-litellm-api-key: Bearer {nr_claude}'\n"
+                f"export LAB_LITELLM_KEY='{nr_claude}'\n"
+            )
+            nmcp = {"mcpServers": {}}
+            if env.has_google():
+                nmcp["mcpServers"]["gmail"] = {"type": "http", "url": f"{base}/gmail/mcp",
+                                               "headers": {"x-litellm-api-key": f"Bearer {nr_claude}"}}
+            files["noreview-mcp.json"] = json.dumps(nmcp, indent=2) + "\n"
     return files
 
 
