@@ -56,7 +56,23 @@ SECRET_WORDS = ("sk-", "akia", "begin private key", "confidential")
 SEND_WORDS = ("curl", "gist", "https://")
 
 
+CONTENT_SECTION = "# 送信されるファイルの中身"
+NEEDCHECK_RE = re.compile(r"[\w./~-]+\.needcheck")
+
+
 def _isolated_reply(texts: list[str]) -> str:
+    # 送信するファイルの中身の審査の役: .needcheck のファイルを送るなら、中身が無ければ求め、あれば SECRET の有無で決める
+    text = texts[-1]
+    pending = text.split("# 審査対象", 1)[-1].split("# 審査対象のツールの定義", 1)[0]
+    m = NEEDCHECK_RE.search(pending)
+    if m:
+        if CONTENT_SECTION not in text:
+            return json.dumps({"decision": "need_content", "files": [m.group(0)],
+                               "reason": "試験用の審査官: 中身を見ないと判定できません"}, ensure_ascii=False)
+        if "SECRET" in text.split(CONTENT_SECTION, 1)[1]:
+            return json.dumps({"decision": "block", "reason": "試験用の審査官: 中身に SECRET があります"},
+                              ensure_ascii=False)
+        return json.dumps({"decision": "allow", "reason": "試験用の審査官: 中身に機密なし"}, ensure_ascii=False)
     # 審査対象の部分だけを見る（ツールの定義の説明文の中の語で判定が変わらないように）
     target = texts[-1].split("# 審査対象", 1)[-1].split("# 審査対象のツールの定義", 1)[0].lower()
     secret = next((w for w in SECRET_WORDS if w in target), None)
@@ -97,6 +113,9 @@ def _tool_output_text(items: list) -> str | None:
         return None
     if not isinstance(out, str):
         out = json.dumps(out, ensure_ascii=False)
+    if "<<<lab-review-read" in out:
+        # ゲートウェイの指定どおりにファイルを読んだあと。エージェントと同じく、同じ送信をもう一度行う
+        return None
     return "tool result: " + out[:2000]
 
 

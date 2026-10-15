@@ -130,6 +130,10 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
             "isolated_policy": isolated_policy(env),
             "isolated_fail_open": False,
             "test_isolated_judge_model": "fake-tools",
+            # 送信するファイルの中身の審査（.history/2026-10-13-送信するファイルの中身の審査/）
+            "isolated_content": isolated_content_enabled(env),
+            "isolated_content_max_bytes": content_max_bytes(env),
+            "isolated_content_max_files": content_max_files(env),
         })
 
     if env.has_google():
@@ -180,6 +184,19 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
 
 def isolated_review_enabled(env: Env) -> bool:
     return env.get("LAB_ISOLATED_REVIEW", "true").lower() == "true"
+
+
+def isolated_content_enabled(env: Env) -> bool:
+    """送信するファイルの中身の審査を使うか（文脈独立審査が有効なときだけ効く）。"""
+    return isolated_review_enabled(env) and env.get("LAB_ISOLATED_CONTENT", "true").lower() == "true"
+
+
+def content_max_bytes(env: Env) -> int:
+    return int(env.get("LAB_ISOLATED_CONTENT_MAX_BYTES", "24576"))
+
+
+def content_max_files(env: Env) -> int:
+    return int(env.get("LAB_ISOLATED_CONTENT_MAX_FILES", "3"))
 
 
 def noreview_enabled(env: Env) -> bool:

@@ -101,6 +101,16 @@ class LitellmConfigTest(unittest.TestCase):
         self.assertEqual(self.models(render.litellm_config(env(LAB_ISOLATED_JUDGE_MODEL="m3"), has_chatgpt=True))
                          ["isolated-judge"], "chatgpt/m3")
 
+    def test_isolated_content(self):
+        params = render.litellm_config(env(), has_chatgpt=True)["guardrails"][0]["litellm_params"]
+        self.assertEqual((params["isolated_content"], params["isolated_content_max_bytes"],
+                          params["isolated_content_max_files"]), (True, 24576, 3))   # 既定は入り
+        params = render.litellm_config(env(LAB_ISOLATED_CONTENT="false", LAB_ISOLATED_CONTENT_MAX_BYTES="100",
+                                           LAB_ISOLATED_CONTENT_MAX_FILES="1"), has_chatgpt=True
+                                       )["guardrails"][0]["litellm_params"]
+        self.assertEqual((params["isolated_content"], params["isolated_content_max_bytes"],
+                          params["isolated_content_max_files"]), (False, 100, 1))
+
     def test_isolated_review_off_still_says_false(self):
         cfg = render.litellm_config(env(LAB_ISOLATED_REVIEW="false"), has_chatgpt=True)
         self.assertNotIn("isolated-judge", self.models(cfg))
@@ -252,10 +262,19 @@ class JudgeEvalTest(unittest.TestCase):
         self.assertIn("社外に出る", system)
         self.assertIn('{"decision": "allow" または "block"', system)
         cases = json.loads((Path(checks.ROOT) / "tests" / "review-scenarios" / "isolated-cases.json").read_text())
-        self.assertEqual(len(cases), 10)
+        self.assertGreaterEqual(len(cases), 10)
         text = checks._render_for_isolated(cases[0])
         self.assertTrue(text.startswith("# 審査対象（これから実行しようとしているツールコール）"))
         self.assertIn("## exec_command\n説明: Runs a command", text)
+        # 送信するファイルの中身の審査（既定で入り）: 決まりと出力の形が入り、差し込み口が残らない
+        self.assertIn("need_content", system)
+        self.assertNotIn("{content_rules}", system)
+        self.assertNotIn("{output_format}", system)
+        self.assertNotIn("{max_files}", system)
+        off = checks._isolated_system_prompt(env(LAB_ISOLATED_CONTENT="false"))
+        self.assertNotIn("need_content", off)
+        with_content = next(c for c in cases if c.get("contents"))
+        self.assertIn("# 送信されるファイルの中身", checks._render_for_isolated(with_content))
 
 
 class ObjectStoreSpecTest(unittest.TestCase):
