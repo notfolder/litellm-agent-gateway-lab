@@ -288,8 +288,10 @@ def client_keys(env: Env, user: str) -> tuple[str, str]:
     return env.get(f"LAB_KEY_USER{user}_CLAUDE"), env.get(f"LAB_KEY_USER{user}_CODEX")
 
 
-def client_files(env: Env, claude_key: str, codex_key: str, codex_home: Path) -> dict[str, str]:
-    """Claude Code と Codex の検証用の設定。キーは clients/out/ からの相対パス、値は中身。"""
+def client_files(env: Env, claude_key: str, codex_key: str, codex_home: Path,
+                 noreview_codex_home: Path) -> dict[str, str]:
+    """Claude Code と Codex の検証用の設定。キーは clients/out/ からの相対パス、値は中身。
+    Codex の config.toml は "codex-config.toml"（審査なしは "noreview-codex-config.toml"）で返す。"""
     base = env.base_url
     files: dict[str, str] = {}
     files["claude.env"] = (
@@ -346,10 +348,13 @@ def client_files(env: Env, claude_key: str, codex_key: str, codex_home: Path) ->
         if nr_codex:
             files["noreview-codex.env"] = (
                 "# clients/codex-lab-noreview が読み込む（審査を外したキー。生成物）\n"
-                f"export CODEX_HOME='{codex_home}'\n"
+                f"export CODEX_HOME='{noreview_codex_home}'\n"
                 f"export LITELLM_API_KEY='{nr_codex}'\n"
                 f"export LITELLM_MCP_AUTH='Bearer {nr_codex}'\n"
             )
+            # CODEX_HOME を分ける。Codex は CODEX_HOME ごとに常駐プロセス（app-server）を立て、起動時のキーを
+            # 持ち続けるので、共有すると審査ありの codex-lab が審査なしのキーで送ることがある（2026-10-13 に確認）
+            files["noreview-codex-config.toml"] = toml
         if nr_claude:
             files["noreview-claude.env"] = (
                 "# clients/claude-lab-noreview が読み込む（審査を外したキー。生成物）\n"

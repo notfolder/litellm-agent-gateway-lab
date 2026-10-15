@@ -67,14 +67,14 @@ def clean_all(assume_yes: bool) -> None:
     step("clean-all 全削除")
     print(f"""次を削除します:
   - クラスタ {CLUSTER}（DB を含む）
-  - clients/out/、.codex-lab/、.build/
+  - clients/out/、.codex-lab/、.codex-lab-noreview/、.build/
   - ローカルの litellm-lab イメージ
 残すもの: .env、ChatGPT のトークン、イメージの置き場""")
     if not assume_yes and input("よろしいですか？ [y/N] ").strip().lower() != "y":
         info("中止しました")
         return
     down()
-    for d in (ROOT / "clients" / "out", ROOT / ".codex-lab", BUILD_DIR):
+    for d in (ROOT / "clients" / "out", ROOT / ".codex-lab", ROOT / ".codex-lab-noreview", BUILD_DIR):
         shutil.rmtree(d, ignore_errors=True)
     images = output(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"], check=False).split()
     targets = [i for i in images if i.split(":")[0].split("/")[-1] == "litellm-lab"]

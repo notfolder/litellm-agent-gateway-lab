@@ -159,17 +159,26 @@ class ClientFilesTest(unittest.TestCase):
         self.assertEqual(render.client_keys(e, "2"), ("c2", "x2"))
 
     def test_gmail_only_with_google(self):
-        files = render.client_files(env(), "kc", "kx", Path("/tmp/codex"))
+        files = render.client_files(env(), "kc", "kx", Path("/tmp/codex"), Path("/tmp/codex-nr"))
         self.assertEqual(json.loads(files["mcp.json"]), {"mcpServers": {}})
         self.assertNotIn("mcp_servers.gmail", files["codex-config.toml"])
         files = render.client_files(env(GOOGLE_OAUTH_CLIENT_ID="c", GOOGLE_OAUTH_CLIENT_SECRET="s"),
-                                    "kc", "kx", Path("/tmp/codex"))
+                                    "kc", "kx", Path("/tmp/codex"), Path("/tmp/codex-nr"))
         self.assertEqual(json.loads(files["mcp.json"])["mcpServers"]["gmail"]["url"],
                          "http://localhost:8080/gmail/mcp")
         self.assertIn("[mcp_servers.gmail]", files["codex-config.toml"])
         self.assertIn("LITELLM_API_KEY='kx'", files["codex.env"])
         # MCP のツールの一覧を最初のターンの前に待つ（待たないと gmail のツールが使えない回がある）
         self.assertIn("mcp_optional_startup_grace_ms = 10000", files["codex-config.toml"])
+
+    def test_noreview_codex_uses_its_own_codex_home(self):
+        # Codex は CODEX_HOME ごとに常駐プロセスを立てて起動時のキーを持ち続けるので、審査なしは別にする
+        files = render.client_files(env(LAB_NOREVIEW_KEYS="true", LAB_KEY_USER1_CODEX_NOREVIEW="nx"),
+                                    "kc", "kx", Path("/tmp/codex"), Path("/tmp/codex-nr"))
+        self.assertIn("CODEX_HOME='/tmp/codex-nr'", files["noreview-codex.env"])
+        self.assertIn("LITELLM_API_KEY='nx'", files["noreview-codex.env"])
+        self.assertEqual(files["noreview-codex-config.toml"], files["codex-config.toml"])
+        self.assertNotIn("noreview-codex.env", render.client_files(env(), "kc", "kx", Path("/a"), Path("/b")))
 
 
 class TemplateTest(unittest.TestCase):
