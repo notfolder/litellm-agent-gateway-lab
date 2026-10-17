@@ -108,7 +108,8 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
             "guardrail_name": "tool-call-review",
             "litellm_params": {
                 "guardrail": "tool_call_review.ToolCallReview",
-                "mode": ["post_call"],
+                # 中身の審査が入りなら、要求に方針を足す pre_call も使う（変更設計書 3.9 節）
+                "mode": ["pre_call", "post_call"] if isolated_content_enabled(env) else ["post_call"],
                 "default_on": True,
                 "use_jev": use_jev,
                 "jev_model": "typesafe/jev-latest",
@@ -130,6 +131,12 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
             "isolated_policy": isolated_policy(env),
             "isolated_fail_open": False,
             "test_isolated_judge_model": "fake-tools",
+            # 送信するファイルの中身の審査（.history/2026-10-13-送信するファイルの中身の審査/）
+            "isolated_content": isolated_content_enabled(env),
+            "isolated_content_max_bytes": content_max_bytes(env),
+            "isolated_content_max_files": content_max_files(env),
+            # 送信の宛先の許可リスト（変更仕様書 7.4 節）
+            "isolated_destinations": isolated_destinations(env),
         })
 
     if env.has_google():
@@ -180,6 +187,24 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
 
 def isolated_review_enabled(env: Env) -> bool:
     return env.get("LAB_ISOLATED_REVIEW", "true").lower() == "true"
+
+
+def isolated_content_enabled(env: Env) -> bool:
+    """送信するファイルの中身の審査を使うか（文脈独立審査が有効なときだけ効く）。"""
+    return isolated_review_enabled(env) and env.get("LAB_ISOLATED_CONTENT", "true").lower() == "true"
+
+
+def content_max_bytes(env: Env) -> int:
+    return int(env.get("LAB_ISOLATED_CONTENT_MAX_BYTES", "24576"))
+
+
+def content_max_files(env: Env) -> int:
+    return int(env.get("LAB_ISOLATED_CONTENT_MAX_FILES", "5"))
+
+
+def isolated_destinations(env: Env) -> list[str]:
+    """送信の宛先の許可リスト（LAB_ISOLATED_DESTINATIONS。カンマ区切り。既定は private）。"""
+    return [s.strip() for s in env.get("LAB_ISOLATED_DESTINATIONS", "private").split(",") if s.strip()]
 
 
 def noreview_enabled(env: Env) -> bool:
@@ -288,8 +313,10 @@ def client_keys(env: Env, user: str) -> tuple[str, str]:
     return env.get(f"LAB_KEY_USER{user}_CLAUDE"), env.get(f"LAB_KEY_USER{user}_CODEX")
 
 
-def client_files(env: Env, claude_key: str, codex_key: str, codex_home: Path) -> dict[str, str]:
-    """Claude Code と Codex の検証用の設定。キーは clients/out/ からの相対パス、値は中身。"""
+def client_files(env: Env, claude_key: str, codex_key: str, codex_home: Path,
+                 noreview_codex_home: Path) -> dict[str, str]:
+    """Claude Code と Codex の検証用の設定。キーは clients/out/ からの相対パス、値は中身。
+    Codex の config.toml は "codex-config.toml"（審査なしは "noreview-codex-config.toml"）で返す。"""
     base = env.base_url
     files: dict[str, str] = {}
     files["claude.env"] = (
@@ -346,10 +373,13 @@ def client_files(env: Env, claude_key: str, codex_key: str, codex_home: Path) ->
         if nr_codex:
             files["noreview-codex.env"] = (
                 "# clients/codex-lab-noreview が読み込む（審査を外したキー。生成物）\n"
-                f"export CODEX_HOME='{codex_home}'\n"
+                f"export CODEX_HOME='{noreview_codex_home}'\n"
                 f"export LITELLM_API_KEY='{nr_codex}'\n"
                 f"export LITELLM_MCP_AUTH='Bearer {nr_codex}'\n"
             )
+            # CODEX_HOME を分ける。Codex は CODEX_HOME ごとに常駐プロセス（app-server）を立て、起動時のキーを
+            # 持ち続けるので、共有すると審査ありの codex-lab が審査なしのキーで送ることがある（2026-10-13 に確認）
+            files["noreview-codex-config.toml"] = toml
         if nr_claude:
             files["noreview-claude.env"] = (
                 "# clients/claude-lab-noreview が読み込む（審査を外したキー。生成物）\n"

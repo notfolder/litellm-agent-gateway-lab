@@ -117,7 +117,13 @@ class Env:
     def load(cls) -> "Env":
         if not ENV_FILE.exists():
             raise LabError(".env がありません。./lab up（preflight）で作られます")
-        return cls(parse_env(ENV_FILE.read_text()))
+        env = cls(parse_env(ENV_FILE.read_text()))
+        # 設定は .env だけから読む。コマンドの前に付けた値は効かないので、食い違えば知らせる
+        shell = os.environ.get("LAB_NOREVIEW_KEYS", "").strip()
+        if shell and shell.lower() != env.get("LAB_NOREVIEW_KEYS", "false").lower():
+            warn(f"シェルの LAB_NOREVIEW_KEYS={shell} は使いません。.env の値"
+                 f"（{env.get('LAB_NOREVIEW_KEYS', 'false')}）で動きます。変えるときは .env を書き換えてください")
+        return env
 
     def get(self, key: str, default: str = "") -> str:
         return self.values.get(key, "").strip() or default

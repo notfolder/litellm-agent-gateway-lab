@@ -617,7 +617,8 @@ def chatgpt_login(env: Env) -> None:
 
 def clients(env: Env) -> None:
     """Claude Code と Codex の検証用の設定を生成する。利用者の普段の設定（~/.claude、~/.codex）は書き換えない。
-    生成先: clients/out/（Claude Code）、.codex-lab/（Codex の CODEX_HOME）。
+    生成先: clients/out/（Claude Code）、.codex-lab/（Codex の CODEX_HOME）、
+    .codex-lab-noreview/（審査を外したキーの Codex の CODEX_HOME）。
     どのユーザーのキーを使うかは .env の LAB_CLIENT_USER（1 か 2、既定 1）で選ぶ。"""
     step("clients クライアントの設定")
     user = env.get("LAB_CLIENT_USER", "1")
@@ -627,17 +628,21 @@ def clients(env: Env) -> None:
 
     out = ROOT / "clients" / "out"
     codex_home = ROOT / ".codex-lab"
-    for d in (out, codex_home):
+    noreview_codex_home = ROOT / ".codex-lab-noreview"
+    dirs = [out, codex_home] + ([noreview_codex_home] if render.noreview_enabled(env) else [])
+    for d in dirs:
         d.mkdir(parents=True, exist_ok=True)
         d.chmod(0o700)
-    for name, content in render.client_files(env, claude_key, codex_key, codex_home).items():
-        dest = codex_home / "config.toml" if name == "codex-config.toml" else out / name
+    dests = {"codex-config.toml": codex_home / "config.toml",
+             "noreview-codex-config.toml": noreview_codex_home / "config.toml"}
+    for name, content in render.client_files(env, claude_key, codex_key, codex_home, noreview_codex_home).items():
+        dest = dests.get(name, out / name)
         if write_if_changed(dest, content, mode=0o600):
             info(f"{dest.relative_to(ROOT)} を更新しました")
     if not render.noreview_enabled(env):
         # 審査なしが無効なら、起動用の設定を残さない
-        for name in ("noreview-codex.env", "noreview-claude.env", "noreview-mcp.json"):
-            p = out / name
+        for p in (out / "noreview-codex.env", out / "noreview-claude.env", out / "noreview-mcp.json",
+                  noreview_codex_home / "config.toml"):
             if p.exists():
                 p.unlink()
                 info(f"{p.relative_to(ROOT)} を削除しました（LAB_NOREVIEW_KEYS=false）")

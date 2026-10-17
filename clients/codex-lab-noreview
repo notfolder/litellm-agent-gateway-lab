@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 # 審査を外したキー（user1-codex-noreview）で Codex を起動する（検証用。docs/manual-check.md）。
 # .env の LAB_NOREVIEW_KEYS=true にして ./lab up（または ./lab clients）を流すと使えるようになる。
-# CODEX_HOME は clients/codex-lab と同じ .codex-lab を使う（サインインを共有する）。
+# CODEX_HOME は clients/codex-lab とは別の .codex-lab-noreview を使う。Codex は CODEX_HOME ごとに常駐プロセス
+# （app-server）を立てて起動時のキーを持ち続けるので、共有すると審査ありの codex-lab が審査なしのキーで送る。
+# Gmail の MCP を初めて使うときは、先に: clients/codex-lab-noreview mcp login gmail
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-[[ -f "$here/out/codex.env" ]] || { echo "clients/out/codex.env がありません。./lab clients を実行してください" >&2; exit 1; }
 [[ -f "$here/out/noreview-codex.env" ]] || {
   echo "clients/out/noreview-codex.env がありません。.env の LAB_NOREVIEW_KEYS=true にして ./lab up を実行してください" >&2
   exit 1
 }
 # shellcheck disable=SC1091
-source "$here/out/codex.env"            # CODEX_HOME
-# shellcheck disable=SC1091
-source "$here/out/noreview-codex.env"   # 審査を外したキーで上書き
+source "$here/out/noreview-codex.env"
+# mcp login のときは LiteLLM のキーを付けない（理由は clients/codex-lab）
+if [[ "${1:-}" == "mcp" && "${2:-}" == "login" ]]; then
+  unset LITELLM_MCP_AUTH
+fi
 exec codex "$@"

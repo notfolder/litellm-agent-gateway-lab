@@ -101,6 +101,22 @@ class LitellmConfigTest(unittest.TestCase):
         self.assertEqual(self.models(render.litellm_config(env(LAB_ISOLATED_JUDGE_MODEL="m3"), has_chatgpt=True))
                          ["isolated-judge"], "chatgpt/m3")
 
+    def test_isolated_content(self):
+        params = render.litellm_config(env(), has_chatgpt=True)["guardrails"][0]["litellm_params"]
+        self.assertEqual((params["isolated_content"], params["isolated_content_max_bytes"],
+                          params["isolated_content_max_files"]), (True, 24576, 5))   # 既定は入り
+        self.assertEqual(params["isolated_destinations"], ["private"])
+        self.assertEqual(params["mode"], ["pre_call", "post_call"])              # 方針の差し込みに pre_call が要る
+        cfg = render.litellm_config(env(LAB_ISOLATED_CONTENT="false", LAB_ISOLATED_CONTENT_MAX_BYTES="100",
+                                        LAB_ISOLATED_CONTENT_MAX_FILES="1",
+                                        LAB_ISOLATED_DESTINATIONS="private, corp.example,203.0.113.0/24"),
+                                    has_chatgpt=True)
+        params = cfg["guardrails"][0]["litellm_params"]
+        self.assertEqual((params["isolated_content"], params["isolated_content_max_bytes"],
+                          params["isolated_content_max_files"]), (False, 100, 1))
+        self.assertEqual(params["isolated_destinations"], ["private", "corp.example", "203.0.113.0/24"])
+        self.assertEqual(params["mode"], ["post_call"])
+
     def test_isolated_review_off_still_says_false(self):
         cfg = render.litellm_config(env(LAB_ISOLATED_REVIEW="false"), has_chatgpt=True)
         self.assertNotIn("isolated-judge", self.models(cfg))
@@ -159,17 +175,26 @@ class ClientFilesTest(unittest.TestCase):
         self.assertEqual(render.client_keys(e, "2"), ("c2", "x2"))
 
     def test_gmail_only_with_google(self):
-        files = render.client_files(env(), "kc", "kx", Path("/tmp/codex"))
+        files = render.client_files(env(), "kc", "kx", Path("/tmp/codex"), Path("/tmp/codex-nr"))
         self.assertEqual(json.loads(files["mcp.json"]), {"mcpServers": {}})
         self.assertNotIn("mcp_servers.gmail", files["codex-config.toml"])
         files = render.client_files(env(GOOGLE_OAUTH_CLIENT_ID="c", GOOGLE_OAUTH_CLIENT_SECRET="s"),
-                                    "kc", "kx", Path("/tmp/codex"))
+                                    "kc", "kx", Path("/tmp/codex"), Path("/tmp/codex-nr"))
         self.assertEqual(json.loads(files["mcp.json"])["mcpServers"]["gmail"]["url"],
                          "http://localhost:8080/gmail/mcp")
         self.assertIn("[mcp_servers.gmail]", files["codex-config.toml"])
         self.assertIn("LITELLM_API_KEY='kx'", files["codex.env"])
         # MCP のツールの一覧を最初のターンの前に待つ（待たないと gmail のツールが使えない回がある）
         self.assertIn("mcp_optional_startup_grace_ms = 10000", files["codex-config.toml"])
+
+    def test_noreview_codex_uses_its_own_codex_home(self):
+        # Codex は CODEX_HOME ごとに常駐プロセスを立てて起動時のキーを持ち続けるので、審査なしは別にする
+        files = render.client_files(env(LAB_NOREVIEW_KEYS="true", LAB_KEY_USER1_CODEX_NOREVIEW="nx"),
+                                    "kc", "kx", Path("/tmp/codex"), Path("/tmp/codex-nr"))
+        self.assertIn("CODEX_HOME='/tmp/codex-nr'", files["noreview-codex.env"])
+        self.assertIn("LITELLM_API_KEY='nx'", files["noreview-codex.env"])
+        self.assertEqual(files["noreview-codex-config.toml"], files["codex-config.toml"])
+        self.assertNotIn("noreview-codex.env", render.client_files(env(), "kc", "kx", Path("/a"), Path("/b")))
 
 
 class TemplateTest(unittest.TestCase):
@@ -243,10 +268,34 @@ class JudgeEvalTest(unittest.TestCase):
         self.assertIn("社外に出る", system)
         self.assertIn('{"decision": "allow" または "block"', system)
         cases = json.loads((Path(checks.ROOT) / "tests" / "review-scenarios" / "isolated-cases.json").read_text())
-        self.assertEqual(len(cases), 10)
+        self.assertGreaterEqual(len(cases), 10)
         text = checks._render_for_isolated(cases[0])
         self.assertTrue(text.startswith("# 審査対象（これから実行しようとしているツールコール）"))
         self.assertIn("## exec_command\n説明: Runs a command", text)
+        # 送信するファイルの中身の審査（既定で入り）: 決まりと出力の形が入り、差し込み口が残らない
+        self.assertIn("need_content", system)
+        self.assertNotIn("{content_rules}", system)
+        self.assertNotIn("{output_format}", system)
+        self.assertNotIn("{max_files}", system)
+        off = checks._isolated_system_prompt(env(LAB_ISOLATED_CONTENT="false"))
+        self.assertNotIn("need_content", off)
+        self.assertIn("設定: プライベートアドレス", system)
+        self.assertIn("corp.example（とその下位のドメイン）",
+                      checks._isolated_system_prompt(env(LAB_ISOLATED_DESTINATIONS="private,corp.example")))
+        with_content = next(c for c in cases if c.get("contents"))
+        self.assertIn("# ゲートウェイが確かめた読み取り", checks._render_for_isolated(with_content))
+        with_env = next(c for c in cases if any(x["path"].startswith("env:") for x in c.get("contents") or []))
+        self.assertIn("## env:CRM_IMPORT_URL", checks._render_for_isolated(with_env))
+
+    def test_judge_case_mark(self):
+        case = {"expect_destination": "10.20.3.20", "expect_runs": ["a.py"], "expect_env": ["URL"]}
+        self.assertEqual(checks.judge_case_mark(case, {"decision": "allow", "destination": "http://10.20.3.20:8080/x",
+                                                       "runs": ["a.py", "b"], "env": ["URL"]}, ["allow"]), "allow")
+        mark = checks.judge_case_mark(case, {"decision": "block", "destination": "", "runs": [], "env": ["URL"]}, ["allow"])
+        self.assertTrue(mark.startswith("block×(") and "decision" in mark and "destination=空" in mark and "runs=[]" in mark)
+        self.assertEqual(checks.judge_case_mark({"expect_destination": ""}, {"decision": "allow"}, ["allow"]), "allow")
+        self.assertEqual(checks.judge_case_mark({"expect_destination": "unknown"}, {"decision": "block", "destination": "unknown"},
+                                                ["block"]), "block")
 
 
 class ObjectStoreSpecTest(unittest.TestCase):

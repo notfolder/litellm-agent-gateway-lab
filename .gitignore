@@ -4,6 +4,7 @@
 # スクリプトの生成物
 .build/
 .codex-lab/
+.codex-lab-noreview/
 clients/out/
 
 # Python
