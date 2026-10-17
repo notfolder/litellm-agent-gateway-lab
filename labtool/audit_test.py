@@ -227,8 +227,13 @@ def audit_test(env: Env) -> None:
                     and k["isolated"]["allowed"] is False and k["context"]["allowed"] is True
                     and k["isolated"]["judge_model_group"] == "fake-tools"))
                 if env.get("LAB_ISOLATED_CLAUDE_CODE", "true").lower() == "true":
-                    c.check("文脈独立審査: Claude Code の要求には、isolated の記録だけが残る",
-                            lambda: list(kinds(ids["messages_claude_leak"])) == ["isolated"])
+                    if render.context_review_claude_code(env):
+                        c.check("Claude Code の要求に、審査ごとの記録（context と isolated）が 1 件ずつ残る"
+                                "（LAB_CONTEXT_REVIEW_CLAUDE_CODE=true）",
+                                lambda: sorted(kinds(ids["messages_claude_leak"])) == ["context", "isolated"])
+                    else:
+                        c.check("文脈独立審査: Claude Code の要求には、isolated の記録だけが残る",
+                                lambda: list(kinds(ids["messages_claude_leak"])) == ["isolated"])
             mine = {cid for cid in ids.values()}
             no_user = [r for r in rows if r.get("type") == "request" and not r.get("user_id")]
             c.check("審査官の呼び出しは要求として記録されない（利用者なしの記録は、マスターキーの 1 件だけ）",

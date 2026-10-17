@@ -122,6 +122,57 @@ class ReviewTest(unittest.TestCase):
         g3 = tcr.ToolCallReview(use_jev=False, isolated_review=False, guardrail_name="t")
         self.assertIsNone(g3._plan(request(CLAUDE_UA), "anthropic_messages"))
         self.assertEqual(g3._plan(request(), "aresponses"), (True, False))
+        # Claude Code への文脈あり審査（context_review_claude_code。既定は切り）
+        g4 = self.make(context_review_claude_code=True)
+        self.assertEqual(g4._plan(request(CLAUDE_UA), "anthropic_messages"), (True, True))
+        self.assertEqual(g4._plan(request(), "aresponses"), (True, True))          # ほかのクライアントは変わらない
+        g5 = self.make(context_review_claude_code=True, isolated_review_claude_code=False)
+        self.assertEqual(g5._plan(request(CLAUDE_UA), "anthropic_messages"), (True, False))
+        g6 = tcr.ToolCallReview(use_jev=False, isolated_review=False, context_review_claude_code=True, guardrail_name="t")
+        self.assertEqual(g6._plan(request(CLAUDE_UA), "anthropic_messages"), (True, False))
+
+    def test_claude_code_context_review_when_enabled(self):
+        g = self.make(context=("block", "削除の許可が無い"), context_review_claude_code=True)
+        d = self.run_review(g, request(CLAUDE_UA), "anthropic_messages")
+        self.assertEqual((d.allowed, d.blocked_by, d.reason), (False, ["context"], "削除の許可が無い"))
+        self.assertEqual(sorted(c[0] for c in self.calls), ["context", "isolated"])
+        self.assertEqual(sorted(r["review_kind"] for r in self.audit.records), ["context", "isolated"])
+
+    def test_anthropic_stream_passes_unknown_events_unchanged_when_allowed(self):
+        """allow のときは溜めたチャンクを一字一句そのまま流す（auto mode のサーバー側審査の結果など、
+        ゲートウェイが知らないイベントが tool_use のあとに来ても壊さない）。block のときは文と end_turn に差し替える。"""
+        def sse(event, payload):
+            return f"event: {event}\ndata: {json.dumps(payload)}\n\n".encode()
+        chunks = [
+            sse("message_start", {"type": "message_start", "message": {"id": "m1"}}),
+            sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                        "content_block": {"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}}),
+            sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                        "delta": {"type": "input_json_delta", "partial_json": "{\"command\":\"git push\"}"}}),
+            sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            sse("safeguard_result", {"type": "safeguard_result", "tool_use_id": "t1", "verdict": "allow"}),
+            sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 9},
+                                  "safeguards": [{"tool_use_id": "t1", "decision": "allow"}]}),
+            sse("message_stop", {"type": "message_stop"}),
+        ]
+        data = {**request(CLAUDE_UA), "messages": [{"role": "user", "content": "push して"}],
+                "proxy_server_request": {"headers": {"User-Agent": CLAUDE_UA}, "url": "http://x/v1/messages"}}
+
+        async def stream():
+            for c in chunks:
+                yield c
+
+        async def collect(g):
+            return [c async for c in g.async_post_call_streaming_iterator_hook(Key(), stream(), dict(data))]
+
+        g = self.make(context_review_claude_code=True)
+        self.assertEqual(asyncio.run(collect(g)), chunks)
+        g = self.make(context=("block", "許可が無い"), context_review_claude_code=True)
+        got = b"".join(asyncio.run(collect(g))).decode()
+        self.assertEqual(got.count("event: message_start"), 1)
+        self.assertIn("拒否: 許可が無い", got)
+        self.assertIn('"stop_reason": "end_turn"', got)
+        self.assertNotIn("tool_use", got.split("message_start", 1)[1].split("content_block_start", 1)[1][:60])
 
     def test_claude_code_only_isolated(self):
         g = self.make(isolated=("block", "キー"))

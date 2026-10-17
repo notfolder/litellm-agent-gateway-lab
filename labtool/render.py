@@ -121,6 +121,8 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
                 "test_judge_model": "fake-tools",
                 # 無効のときも必ず出す（ガードレールの既定は true で、判定基準が空だと起動しなくなるため）
                 "isolated_review": isolated,
+                # Claude Code にも文脈あり審査を掛けるか（既定は切り。auto mode を外した運用の守り）
+                "context_review_claude_code": context_review_claude_code(env),
             },
         }],
     }
@@ -183,6 +185,11 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
         "disable_spend_logs": True,
     }
     return config
+
+
+def context_review_claude_code(env: Env) -> bool:
+    """Claude Code にも文脈あり審査を掛けるか（LAB_CONTEXT_REVIEW_CLAUDE_CODE。既定は false）。"""
+    return env.get("LAB_CONTEXT_REVIEW_CLAUDE_CODE", "false").lower() == "true"
 
 
 def isolated_review_enabled(env: Env) -> bool:

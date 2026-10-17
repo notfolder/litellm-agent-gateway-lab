@@ -20,7 +20,7 @@
 
 審査なしのキーは、キーの metadata に `opted_out_global_guardrails: ["tool-call-review"]` を入れて、審査のガードレールをそのキーだけ外したものです。
 
-- キーごとに外せるのは、ガードレール全体（監査と機密データチェックの両方）です。片方だけを外すことはキーごとにはできません。クラスタ全体の設定（`.env` の `LAB_ISOLATED_REVIEW` と `LAB_ISOLATED_CLAUDE_CODE`）で変えます。
+- キーごとに外せるのは、ガードレール全体（監査と機密データチェックの両方）です。片方だけを外すことはキーごとにはできません。クラスタ全体の設定（`.env` の `LAB_ISOLATED_REVIEW` と `LAB_ISOLATED_CLAUDE_CODE`、Claude Code に監査も掛けるなら `LAB_CONTEXT_REVIEW_CLAUDE_CODE=true`）で変えます。
 - 審査を外しても、監査ログ（入出力の記録）には残ります。
 - Gmail の MCP は、どのキーでも同じユーザーのサインインを使います。
 

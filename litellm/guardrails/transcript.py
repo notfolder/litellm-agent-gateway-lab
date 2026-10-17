@@ -47,18 +47,25 @@ def _clip(text: str) -> str:
     return text if len(text) <= MAX_TEXT else text[:MAX_TEXT] + f"…（{len(text) - MAX_TEXT} 文字省略）"
 
 
-def _text_of_content(content: Any) -> str:
-    """content（文字列、またはパーツの配列）から文章だけを取り出す。"""
+def _texts_of_content(content: Any) -> list[str]:
+    """content（文字列、またはパーツの配列）から文章のパーツだけを取り出す（空のものは除く）。
+    パーツごとに返す。結合して 1 件にすると、先頭のパーツが長いときに後ろのパーツ（利用者の指示）が
+    文字数の上限で切り落とされるため（Claude Code は system-reminder の数千字のあとに利用者の指示を置く）。"""
     content = to_dict(content)
     if isinstance(content, str):
-        return content
+        return [content] if content else []
     parts: list[str] = []
     for p in content or []:
         if not isinstance(p, dict):
             continue
-        if p.get("type") in ("input_text", "text", "output_text") and isinstance(p.get("text"), str):
+        if p.get("type") in ("input_text", "text", "output_text") and isinstance(p.get("text"), str) and p["text"]:
             parts.append(p["text"])
-    return "\n".join(parts)
+    return parts
+
+
+def _user_entries(content: Any) -> list[dict]:
+    """ユーザー役の content を、文章のパーツごとに 1 件の判定入力にする。"""
+    return [{"user": _clip(t)} for t in _texts_of_content(content)]
 
 
 def _args_str(args: Any) -> str:
@@ -106,9 +113,7 @@ def _from_responses_input(inp: Any) -> list[dict]:
         if not isinstance(item, dict):
             continue
         if item.get("role") == "user" and item.get("type", "message") == "message":
-            text = _text_of_content(item.get("content"))
-            if text:
-                out.append({"user": _clip(text)})
+            out.extend(_user_entries(item.get("content")))
             continue
         call = responses_item_to_call(item)
         if call:
@@ -122,9 +127,7 @@ def _from_chat_messages(messages: Any) -> list[dict]:
         if not isinstance(m, dict):
             continue
         if m.get("role") == "user":
-            text = _text_of_content(m.get("content"))
-            if text:
-                out.append({"user": _clip(text)})
+            out.extend(_user_entries(m.get("content")))
         elif m.get("role") == "assistant":
             for tc in m.get("tool_calls") or []:
                 fn = (tc or {}).get("function") or {}
@@ -139,10 +142,8 @@ def _from_anthropic_messages(messages: Any) -> list[dict]:
             continue
         content = m.get("content")
         if m.get("role") == "user":
-            # tool_result は「ツールの結果」なので捨て、文章だけを残す
-            text = _text_of_content(content)
-            if text:
-                out.append({"user": _clip(text)})
+            # tool_result は「ツールの結果」なので捨て、文章だけを残す（パーツごとに 1 件）
+            out.extend(_user_entries(content))
         elif m.get("role") == "assistant" and isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_use":

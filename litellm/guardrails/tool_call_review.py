@@ -7,6 +7,8 @@
   - Claude Code（Anthropic 形式 かつ User-Agent が Claude Code）には行わない（auto mode に任せる）
 - 文脈独立審査: 会話を見ず、審査対象のツール名・引数・ツールの定義だけで、機密情報の持ち出しを見る
   （判定基準は設定 isolated_policy。Claude Code にも行う。isolated_review_claude_code で外せる）
+- Claude Code への文脈あり審査は既定では行わない（auto mode に任せる）。context_review_claude_code で掛けられる
+  （auto mode を外した運用〔bypassPermissions〕でもゲートウェイで守るため）
   - 審査官が抜き出した送信の宛先を、許可リスト（isolated_destinations）と照合し、無ければ中身に関わらず止める
   - 中身の審査（isolated_content）: 要求（pre_call）のシステムプロンプト相当に方針を足し、送るファイル・
     動かすプログラムを指定の形で先に読むようモデル自身に求める。応答（post_call）では、会話の最後のツールコールが
@@ -416,6 +418,7 @@ class ToolCallReview(CustomGuardrail):
         test_judge_model: str | None = None,
         isolated_review: Any = True,
         isolated_review_claude_code: Any = True,
+        context_review_claude_code: Any = False,
         isolated_judge_model: str = "isolated-judge",
         isolated_policy: str = "",
         isolated_fail_open: Any = False,
@@ -438,6 +441,8 @@ class ToolCallReview(CustomGuardrail):
         # 文脈独立審査（足した設定には環境変数による上書きを設けない）
         self.isolated_review = _as_bool(isolated_review, True)
         self.isolated_review_claude_code = _as_bool(isolated_review_claude_code, True)
+        # Claude Code への文脈あり審査（既定は切り。auto mode を外した運用の守りとして設定で入れる）
+        self.context_review_claude_code = _as_bool(context_review_claude_code, False)
         self.isolated_judge_model = isolated_judge_model
         self.isolated_policy = isolated_policy or ""
         self.isolated_fail_open = _as_bool(isolated_fail_open, False)
@@ -463,6 +468,7 @@ class ToolCallReview(CustomGuardrail):
         print(f"{LOG_PREFIX}: init use_jev={self.use_jev} jev_model={self.jev_model} "
               f"threshold={self.jev_threshold} judge_model={self.judge_model} fail_open={self.fail_open} "
               f"isolated_review={self.isolated_review} isolated_claude_code={self.isolated_review_claude_code} "
+              f"context_claude_code={self.context_review_claude_code} "
               f"isolated_judge_model={self.isolated_judge_model} isolated_fail_open={self.isolated_fail_open} "
               f"isolated_content={self.isolated_content} content_max_bytes={self.content_max_bytes} "
               f"content_max_files={self.content_max_files} destinations={self.destinations.describe()}",
@@ -472,8 +478,10 @@ class ToolCallReview(CustomGuardrail):
     def _plan(self, data: dict, call_type: str) -> tuple[bool, bool] | None:
         """(文脈あり審査をするか, 文脈独立審査をするか)。どちらもしないなら None（素通し）。"""
         if call_type in tr.ANTHROPIC_CALL_TYPES and _is_claude_code(_user_agent(data)):
-            if self.isolated_review and self.isolated_review_claude_code:
-                return False, True
+            do_context = self.context_review_claude_code
+            do_isolated = self.isolated_review and self.isolated_review_claude_code
+            if do_context or do_isolated:
+                return do_context, do_isolated
             self._log({"event": "pass_through", "client": "claude-code"})
             return None
         return True, self.isolated_review

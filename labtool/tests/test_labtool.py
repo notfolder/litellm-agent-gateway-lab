@@ -90,6 +90,7 @@ class LitellmConfigTest(unittest.TestCase):
         params = cfg["guardrails"][0]["litellm_params"]
         self.assertTrue(params["isolated_review"])
         self.assertTrue(params["isolated_review_claude_code"])
+        self.assertFalse(params["context_review_claude_code"])   # 既定は切り（auto mode に任せる）
         self.assertEqual(params["isolated_judge_model"], "isolated-judge")
         self.assertEqual(params["test_isolated_judge_model"], "fake-tools")
         self.assertFalse(params["isolated_fail_open"])
@@ -100,6 +101,14 @@ class LitellmConfigTest(unittest.TestCase):
         self.assertFalse(cfg["guardrails"][0]["litellm_params"]["isolated_review_claude_code"])
         self.assertEqual(self.models(render.litellm_config(env(LAB_ISOLATED_JUDGE_MODEL="m3"), has_chatgpt=True))
                          ["isolated-judge"], "chatgpt/m3")
+
+    def test_context_review_claude_code(self):
+        # LAB_CONTEXT_REVIEW_CLAUDE_CODE=true で Claude Code にも文脈あり審査を掛ける（文脈独立審査の有無に関わらず出す）
+        cfg = render.litellm_config(env(LAB_CONTEXT_REVIEW_CLAUDE_CODE="true"), has_chatgpt=False)
+        self.assertTrue(cfg["guardrails"][0]["litellm_params"]["context_review_claude_code"])
+        cfg = render.litellm_config(env(LAB_CONTEXT_REVIEW_CLAUDE_CODE="true", LAB_ISOLATED_REVIEW="false"),
+                                    has_chatgpt=False)
+        self.assertTrue(cfg["guardrails"][0]["litellm_params"]["context_review_claude_code"])
 
     def test_isolated_content(self):
         params = render.litellm_config(env(), has_chatgpt=True)["guardrails"][0]["litellm_params"]

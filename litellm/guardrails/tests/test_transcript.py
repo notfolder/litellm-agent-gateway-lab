@@ -70,6 +70,46 @@ class AnthropicTranscript(unittest.TestCase):
         self.assertEqual(len(got), 2)
 
 
+class TextPartsBecomeSeparateEntries(unittest.TestCase):
+    """ユーザー役の content が複数の文章のパーツなら、パーツごとに 1 件にする。
+    Claude Code は最初の user メッセージに system-reminder（数千字）を複数置き、利用者の指示を最後のパーツに置く
+    （2026-10-17 の実機: 6,858 字・865 字・581 字のあとに 132 字の指示）。結合して先頭 2,000 字で切ると指示が落ちる。"""
+
+    def test_anthropic_claude_code_shape(self):
+        reminder = "<system-reminder>\n" + "x" * 7000 + "\n</system-reminder>"
+        data = {"messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": reminder},
+                {"type": "text", "text": "<system-reminder>\nAttribution …\n</system-reminder>"},
+                {"type": "text", "text": "顧客一覧.csv は消えてよいので、許可します。削除してください。"},
+            ]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "rm 顧客一覧.csv"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+                                         {"type": "text", "text": "<system-reminder>\nmemory\n</system-reminder>"}]},
+        ]}
+        got = tr.transcript_from_request("anthropic_messages", data)
+        users = [e["user"] for e in got if "user" in e]
+        self.assertEqual(len(users), 4)
+        self.assertTrue(users[0].startswith("<system-reminder>") and len(users[0]) < 2100)   # 切り詰めは件ごと
+        self.assertEqual(users[2], "顧客一覧.csv は消えてよいので、許可します。削除してください。")   # 指示が丸ごと残る
+        self.assertEqual(got[3]["tool_call"]["name"], "Bash")
+        self.assertTrue(users[3].startswith("<system-reminder>\nmemory"))                     # tool_result は落ち、文章は残る
+        text = tr.render_for_judge(got, [])
+        self.assertIn("許可します", text)
+
+    def test_chat_and_responses_parts(self):
+        chat = {"messages": [{"role": "user", "content": [{"type": "text", "text": "a" * 3000}, {"type": "text", "text": "指示"}]}]}
+        got = tr.transcript_from_request("acompletion", chat)
+        self.assertEqual([len(e["user"]) < 2100 for e in got], [True, True])
+        self.assertEqual(got[1], {"user": "指示"})
+        resp = {"input": [{"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "<environment_context>…</environment_context>"},
+            {"type": "input_text", "text": ""},
+            {"type": "input_text", "text": "テストして"}]}]}
+        got = tr.transcript_from_request("aresponses", resp)
+        self.assertEqual(got, [{"user": "<environment_context>…</environment_context>"}, {"user": "テストして"}])
+
+
 class Limits(unittest.TestCase):
     def test_long_text_is_clipped(self):
         got = tr.transcript_from_request("aresponses", {"input": "a" * 5000})
