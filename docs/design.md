@@ -626,7 +626,7 @@ def host_of(destination: str) -> str: ...      # URL・"host:port"・"[v6]:port"
 *照合*（`verified_reads(call_type, data, pending, max_bytes)`）:
 
 1. 会話の最後のツールコールと、その出力を取り出す（Responses: 同じ `call_id` の `*_call_output`。Anthropic: 次の利用者の発言の同じ `tool_use_id` の `tool_result`。Chat: 同じ `tool_call_id` の `role: tool`）。無ければ読み取りは無い
-2. 引数の値の文字列を深さ優先で候補にし（JSON の文字列は読んでから）、`spec_of_command` に通す。引数が `const r = await tools.exec_command(` で始まる Codex のプログラムなら、直後のオブジェクトを読み、残りが `);` と `text(r.output);` だけで、キーが `cmd`、`workdir`、`yield_time_ms`、`max_output_tokens` だけのときに `cmd` を候補にする。審査対象の `workdir` が 1 つに決まるときは一致を求める
+2. 引数の値の文字列を深さ優先で集め（JSON の辞書・配列を書いた文字列は開いてから）、空でない文字列が 1 種類だけのときに、それを `spec_of_command` に通す。説明など、ほかの文字列があれば読み取りとみなさない（実行されない項目にコマンドを書き、実行される項目で偽の出力を作れないようにする）。引数が `const r = await tools.exec_command(` で始まる Codex のプログラムなら、直後のオブジェクトを読み、残りが `);` と `text(r.output);` だけで、キーが `cmd`、`workdir`、`yield_time_ms`、`max_output_tokens` だけのときに `cmd` を候補にする。審査対象の `workdir` が 1 つに決まるときは一致を求める
 3. ファイルの項目のうち少なくとも 1 つが審査対象の引数の文字列に現れること、相対パスの項目があるなら引数に作業フォルダを変える指定（語としての `cd`、`pushd`、`popd`、オプションの `-C`、`--directory`、`--chdir`）が無いことを確かめる。外れたら読み取りは無い
 4. 出力を解析し、項目ごとに `in_args`（引数に現れたか。環境変数は常に偽）を付ける
 

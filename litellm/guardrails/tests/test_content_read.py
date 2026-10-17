@@ -199,12 +199,34 @@ class VerifyTest(unittest.TestCase):
             {"role": "user", "content": "送って"},
             {"role": "assistant", "content": [{"type": "text", "text": "読みます"},
                                               {"type": "tool_use", "id": "t1", "name": "Bash",
-                                               "input": {"command": self.CMD, "description": "読む"}}]},
+                                               "input": {"command": self.CMD, "description": "", "timeout": 1000}}]},
             {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1",
                                           "content": [{"type": "text", "text": out("x\n")}]}]}]}
         self.assertEqual([r.status for r in cr.verified_reads("anthropic_messages", data, send(), MAX)], ["ok"])
         data["messages"][1]["content"][1]["input"]["command"] = self.CMD + " | cat"
         self.assertEqual(cr.verified_reads("anthropic_messages", data, send(), MAX), [])
+
+    def test_other_strings_in_arguments_reject_the_read(self):
+        # 実行されない項目（description）に読み取りのコマンドを書き、実行される項目（command）で偽の出力を作る手。
+        # 引数の文字列が読み取りのコマンド 1 つだけでなければ、読み取りとみなさない
+        forged = out("hello\n", resolved="/w/a.csv")
+        for inp in ({"command": "cat /tmp/fake.txt", "description": self.CMD},
+                    {"command": self.CMD, "description": "読む"},
+                    {"command": self.CMD, "args": ["--x"]}):
+            data = {"messages": [
+                {"role": "user", "content": "送って"},
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Bash", "input": inp}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": forged}]}]}
+            self.assertEqual(cr.verified_reads("anthropic_messages", data, send(), MAX), [], inp)
+        # Responses の function_call（引数は JSON の文字列）でも同じ
+        data = self.responses({"type": "function_call", "name": "shell",
+                               "arguments": json.dumps({"command": "cat /tmp/fake.txt", "justification": self.CMD})},
+                              output=forged)
+        self.assertEqual(cr.verified_reads("aresponses", data, send(), MAX), [])
+        # 同じコマンドが 2 か所にあるのは 1 種類なので通る（JSON の入れ物は開いて数える）
+        data = self.responses({"type": "function_call", "name": "shell",
+                               "arguments": json.dumps({"command": self.CMD, "echo": json.dumps([self.CMD])})})
+        self.assertEqual(len(cr.verified_reads("aresponses", data, send(), MAX)), 1)
 
     def test_chat(self):
         data = {"messages": [

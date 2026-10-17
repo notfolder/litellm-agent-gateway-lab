@@ -294,6 +294,23 @@ def last_tool_call(call_type: str, data: dict) -> tuple[Any, str] | None:
     return _last_chat(data.get("messages"))
 
 
+def _free_strings(v: Any) -> list[str]:
+    """引数の中の、入れ物（JSON の辞書・配列を書いた文字列）を開いた先の文字列だけ。
+    読み取りのツールコールの照合に使う: 引数の文字列がすべて読み取りのコマンド（か空）でなければ、読み取りとみなさない。
+    実行されない項目（説明など）にコマンドを書き、実行される項目で偽の出力を作る手を防ぐ。"""
+    if isinstance(v, str):
+        try:
+            decoded = json.loads(v)
+        except ValueError:
+            return [v]
+        return _free_strings(decoded) if isinstance(decoded, (dict, list)) else [v]
+    if isinstance(v, dict):
+        return [s for x in v.values() for s in _free_strings(x)]
+    if isinstance(v, list):
+        return [s for x in v for s in _free_strings(x)]
+    return []
+
+
 def _strings(v: Any) -> list[str]:
     """引数の中の文字列をすべて（JSON の文字列なら読んでから）。"""
     if isinstance(v, str):
@@ -422,10 +439,11 @@ def verified_reads(call_type: str, data: dict, pending: list[dict], max_bytes: i
         if spec and len(wds) == 1 and prog.get("workdir") != next(iter(wds)) and any(is_relative(f) for f in spec.files):
             return []
     else:
-        for s in _strings(args_in):
-            spec = spec_of_command(s, max_bytes)
-            if spec:
-                break
+        # 引数の文字列は、読み取りのコマンド 1 つ（と空文字列）だけでなければならない。説明などの実行されない項目に
+        # コマンドを書き、実行される項目で偽の出力を作れないようにする（変更設計書 4.2 節）
+        candidates = {s for s in _free_strings(args_in) if s}
+        if len(candidates) == 1:
+            spec = spec_of_command(next(iter(candidates)), max_bytes)
     if not spec:
         return []
     args = _arg_strings(pending)
