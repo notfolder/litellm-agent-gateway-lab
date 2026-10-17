@@ -7,6 +7,7 @@ OpenAI 互換の 2 つの API を、ストリーミングあり・なしの両�
 最後のユーザー発言に次の形の指示があれば、ツールコールを返す。なければ短い文章を返す。
     TOOL:<ツール名>:<引数の JSON>
 例: TOOL:shell:{"command":["git","push","origin","--delete","old"]}
+要求のシステムプロンプト相当（instructions / system メッセージ）にゲートウェイの方針の印があれば、文章に policy:yes を含める。
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 TOOL_RE = re.compile(r"TOOL:([A-Za-z0-9_\-]+):(\{.*\})", re.DOTALL)
+POLICY_MARKER = "[[lab-review-policy]]"
 
 
 def _last_user_text_chat(messages: list) -> str:
@@ -44,6 +46,16 @@ def _last_user_text_responses(inp) -> str:
     return ""
 
 
+def _has_policy_chat(messages: list) -> bool:
+    for m in messages or []:
+        if m.get("role") in ("system", "developer"):
+            c = m.get("content")
+            text = c if isinstance(c, str) else " ".join(p.get("text", "") for p in c or [] if isinstance(p, dict))
+            if POLICY_MARKER in text:
+                return True
+    return False
+
+
 JUDGE_MARKER = "[[tool-call-review]]"
 # 審査官の役: 審査対象にこれらの語があれば block を返す（試験用の単純な規則）
 BLOCK_WORDS = ("--delete", "rm -rf", "\"rm\",\"-rf\"", "gist", "| bash", "|bash", "--force", "push -f",
@@ -56,32 +68,79 @@ SECRET_WORDS = ("sk-", "akia", "begin private key", "confidential")
 SEND_WORDS = ("curl", "gist", "https://")
 
 
-CONTENT_SECTION = "# 送信されるファイルの中身"
+CONTENT_SECTION = "# ゲートウェイが確かめた読み取り"
 NEEDCHECK_RE = re.compile(r"[\w./~-]+\.needcheck")
+NEEDRUN_RE = re.compile(r"[\w./~-]+\.needrun")
+URL_RE = re.compile(r"https?://([A-Za-z0-9.\-]+)")
+ITEM_RE = re.compile(r"^## (\S+)（(\d+) バイト。(.*?)）$", re.M)
+
+
+def _section_items(text: str) -> dict[str, dict]:
+    """「ゲートウェイが確かめた読み取り」の節を、{指定: {"text", "binary"}} にする。"""
+    if CONTENT_SECTION not in text:
+        return {}
+    section = text.split(CONTENT_SECTION, 1)[1]
+    items: dict[str, dict] = {}
+    matches = list(ITEM_RE.finditer(section))
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(section)
+        body = section[m.end():end]
+        inner = ""
+        if "<<<中身の始め" in body:
+            inner = body.split(">>>\n", 1)[1].rsplit("\n<<<中身の終わり", 1)[0]
+        items[m.group(1)] = {"text": inner, "binary": "文字として読めない" in m.group(3)}
+    return items
 
 
 def _isolated_reply(texts: list[str]) -> str:
-    # 送信するファイルの中身の審査の役: .needcheck のファイルを送るなら、中身が無ければ求め、あれば SECRET の有無で決める
+    """中身の審査の役（変更設計書 6 章の規則）。"""
     text = texts[-1]
     pending = text.split("# 審査対象", 1)[-1].split("# 審査対象のツールの定義", 1)[0]
-    m = NEEDCHECK_RE.search(pending)
+    items = _section_items(text)
+
+    def answer(decision: str, reason: str, **extra) -> str:
+        obj = {"decision": decision, "destination": destination, "reason": "試験用の審査官: " + reason}
+        direct = [p for p, it in items.items() if it["binary"] and p.startswith("./")]
+        if direct:
+            obj["direct"] = direct
+        obj.update(extra)
+        return json.dumps(obj, ensure_ascii=False)
+
+    # 宛先: 引数の URL → 渡された中身（環境変数の値、プログラム）の URL → unknown.needcheck なら unknown → 空
+    m = URL_RE.search(pending)
     if m:
-        if CONTENT_SECTION not in text:
-            return json.dumps({"decision": "need_content", "files": [m.group(0)],
-                               "reason": "試験用の審査官: 中身を見ないと判定できません"}, ensure_ascii=False)
-        if "SECRET" in text.split(CONTENT_SECTION, 1)[1]:
-            return json.dumps({"decision": "block", "reason": "試験用の審査官: 中身に SECRET があります"},
-                              ensure_ascii=False)
-        return json.dumps({"decision": "allow", "reason": "試験用の審査官: 中身に機密なし"}, ensure_ascii=False)
+        destination = m.group(1)
+    else:
+        m = next((URL_RE.search(it["text"]) for it in items.values() if URL_RE.search(it["text"])), None)
+        destination = m.group(1) if m else ("unknown" if "unknown.needcheck" in pending else "")
+
+    # 送るファイル（.needcheck）と動かすプログラム（.needrun）の中身が無ければ求める。渡されたプログラムの中身が
+    # 環境変数（ENV:名前）や別のファイル（FILE:パス）を参照していれば、無い分も一度に求める
+    need_files = [f for f in NEEDCHECK_RE.findall(pending) if f not in items]
+    need_runs = [f for f in NEEDRUN_RE.findall(pending) if f not in items]
+    need_env: list[str] = []
+    for it in items.values():
+        for line in it["text"].splitlines():
+            if line.startswith("ENV:") and f"env:{line[4:].strip()}" not in items:
+                need_env.append(line[4:].strip())
+            if line.startswith("FILE:") and line[5:].strip() not in items:
+                need_runs.append(line[5:].strip())
+    if need_files or need_runs or need_env:
+        extra: dict = {"files": need_files, "runs": need_runs, "env": need_env}
+        if any(r.startswith("./") for r in need_runs):
+            extra["direct"] = [r for r in need_runs if r.startswith("./")]
+        return answer("need_content", "中身を見ないと判定できません", **extra)
+    if items:
+        if any("SECRET" in it["text"] for it in items.values()):
+            return answer("block", "中身に SECRET があります")
+        return answer("allow", "中身に機密なし")
     # 審査対象の部分だけを見る（ツールの定義の説明文の中の語で判定が変わらないように）
-    target = texts[-1].split("# 審査対象", 1)[-1].split("# 審査対象のツールの定義", 1)[0].lower()
+    target = pending.lower()
     secret = next((w for w in SECRET_WORDS if w in target), None)
     send = next((w for w in SEND_WORDS if w in target), None)
     if secret and send:
-        return json.dumps({"decision": "block",
-                           "reason": f"試験用の審査官: 機密の語「{secret}」を「{send}」で外部に送る操作は止めます"},
-                          ensure_ascii=False)
-    return json.dumps({"decision": "allow", "reason": "試験用の審査官: 機密の持ち出しなし"}, ensure_ascii=False)
+        return answer("block", f"機密の語「{secret}」を「{send}」で外部に送る操作は止めます")
+    return answer("allow", "機密の持ち出しなし")
 
 
 def _judge_reply(messages: list) -> str | None:
@@ -113,8 +172,8 @@ def _tool_output_text(items: list) -> str | None:
         return None
     if not isinstance(out, str):
         out = json.dumps(out, ensure_ascii=False)
-    if "<<<lab-review-read" in out:
-        # ゲートウェイの指定どおりにファイルを読んだあと。エージェントと同じく、同じ送信をもう一度行う
+    if "<<<lab-review-read" in out or "<<<lab-review-env" in out:
+        # ゲートウェイの指定どおりに読んだあと。エージェントと同じく、同じ操作をもう一度行う
         return None
     return "tool result: " + out[:2000]
 
@@ -127,11 +186,11 @@ def _tool_names(tools: list) -> list[str]:
     return names
 
 
-def _plan(text: str):
+def _plan(text: str, has_policy: bool):
     m = TOOL_RE.search(text)
     if m:
         return ("tool", m.group(1), m.group(2))
-    return ("text", "fake response", None)
+    return ("text", "fake response" + (" policy:yes" if has_policy else ""), None)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -184,7 +243,8 @@ class Handler(BaseHTTPRequestHandler):
     # ---- Chat Completions ----
     def _chat(self, req) -> None:
         judged = _judge_reply(req.get("messages")) or _tool_output_text(req.get("messages"))
-        kind, a, b = ("text", judged, None) if judged else _plan(_last_user_text_chat(req.get("messages")))
+        kind, a, b = (("text", judged, None) if judged
+                      else _plan(_last_user_text_chat(req.get("messages")), _has_policy_chat(req.get("messages"))))
         cid = "chatcmpl-" + uuid.uuid4().hex[:12]
         created = int(time.time())
         model = req.get("model", "fake-tools")
@@ -226,7 +286,8 @@ class Handler(BaseHTTPRequestHandler):
             print("fake-llm: tools offered:", ",".join(_tool_names(req["tools"]))[:3000], flush=True)
         inp = req.get("input")
         result = _tool_output_text(inp) if isinstance(inp, list) else None
-        kind, a, b = ("text", result, None) if result else _plan(_last_user_text_responses(inp))
+        has_policy = POLICY_MARKER in str(req.get("instructions") or "")
+        kind, a, b = ("text", result, None) if result else _plan(_last_user_text_responses(inp), has_policy)
         rid = "resp_" + uuid.uuid4().hex[:12]
         created = int(time.time())
         model = req.get("model", "fake-tools")

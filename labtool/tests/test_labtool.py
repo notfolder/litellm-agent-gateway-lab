@@ -104,12 +104,18 @@ class LitellmConfigTest(unittest.TestCase):
     def test_isolated_content(self):
         params = render.litellm_config(env(), has_chatgpt=True)["guardrails"][0]["litellm_params"]
         self.assertEqual((params["isolated_content"], params["isolated_content_max_bytes"],
-                          params["isolated_content_max_files"]), (True, 24576, 3))   # 既定は入り
-        params = render.litellm_config(env(LAB_ISOLATED_CONTENT="false", LAB_ISOLATED_CONTENT_MAX_BYTES="100",
-                                           LAB_ISOLATED_CONTENT_MAX_FILES="1"), has_chatgpt=True
-                                       )["guardrails"][0]["litellm_params"]
+                          params["isolated_content_max_files"]), (True, 24576, 5))   # 既定は入り
+        self.assertEqual(params["isolated_destinations"], ["private"])
+        self.assertEqual(params["mode"], ["pre_call", "post_call"])              # 方針の差し込みに pre_call が要る
+        cfg = render.litellm_config(env(LAB_ISOLATED_CONTENT="false", LAB_ISOLATED_CONTENT_MAX_BYTES="100",
+                                        LAB_ISOLATED_CONTENT_MAX_FILES="1",
+                                        LAB_ISOLATED_DESTINATIONS="private, corp.example,203.0.113.0/24"),
+                                    has_chatgpt=True)
+        params = cfg["guardrails"][0]["litellm_params"]
         self.assertEqual((params["isolated_content"], params["isolated_content_max_bytes"],
                           params["isolated_content_max_files"]), (False, 100, 1))
+        self.assertEqual(params["isolated_destinations"], ["private", "corp.example", "203.0.113.0/24"])
+        self.assertEqual(params["mode"], ["post_call"])
 
     def test_isolated_review_off_still_says_false(self):
         cfg = render.litellm_config(env(LAB_ISOLATED_REVIEW="false"), has_chatgpt=True)
@@ -273,8 +279,23 @@ class JudgeEvalTest(unittest.TestCase):
         self.assertNotIn("{max_files}", system)
         off = checks._isolated_system_prompt(env(LAB_ISOLATED_CONTENT="false"))
         self.assertNotIn("need_content", off)
+        self.assertIn("設定: プライベートアドレス", system)
+        self.assertIn("corp.example（とその下位のドメイン）",
+                      checks._isolated_system_prompt(env(LAB_ISOLATED_DESTINATIONS="private,corp.example")))
         with_content = next(c for c in cases if c.get("contents"))
-        self.assertIn("# 送信されるファイルの中身", checks._render_for_isolated(with_content))
+        self.assertIn("# ゲートウェイが確かめた読み取り", checks._render_for_isolated(with_content))
+        with_env = next(c for c in cases if any(x["path"].startswith("env:") for x in c.get("contents") or []))
+        self.assertIn("## env:CRM_IMPORT_URL", checks._render_for_isolated(with_env))
+
+    def test_judge_case_mark(self):
+        case = {"expect_destination": "10.20.3.20", "expect_runs": ["a.py"], "expect_env": ["URL"]}
+        self.assertEqual(checks.judge_case_mark(case, {"decision": "allow", "destination": "http://10.20.3.20:8080/x",
+                                                       "runs": ["a.py", "b"], "env": ["URL"]}, ["allow"]), "allow")
+        mark = checks.judge_case_mark(case, {"decision": "block", "destination": "", "runs": [], "env": ["URL"]}, ["allow"])
+        self.assertTrue(mark.startswith("block×(") and "decision" in mark and "destination=空" in mark and "runs=[]" in mark)
+        self.assertEqual(checks.judge_case_mark({"expect_destination": ""}, {"decision": "allow"}, ["allow"]), "allow")
+        self.assertEqual(checks.judge_case_mark({"expect_destination": "unknown"}, {"decision": "block", "destination": "unknown"},
+                                                ["block"]), "block")
 
 
 class ObjectStoreSpecTest(unittest.TestCase):

@@ -35,6 +35,12 @@
 最後に「LiteLLM は応答しています」と出て、`Google OAuth: あり`、`ChatGPT: あり` になっていることを確かめます。
 Gmail の MCP のサインインが切れていたら、先に `clients/codex-lab mcp login gmail` を流します（Claude Code は `/mcp` から）。
 
+### 2.1.1 送信の宛先の許可リスト
+
+機密データチェックは、送信の宛先が `.env` の `LAB_ISOLATED_DESTINATIONS`（既定 `private`。プライベートアドレスだけ）に無ければ、中身に関係なく止めます。
+GitHub への push やメールの送信、社外の URL へのアップロードを試すシナリオでは、先に宛先を足して `./lab litellm` で反映してください（例: `LAB_ISOLATED_DESTINATIONS=private,github.com,gmail.com,upload.partner-files.example.net`）。
+足さずに流すと、どのシナリオも「送信の宛先 … が許可リストに無いため」で止まり、中身の審査まで届きません。
+
 ### 2.2 審査なしのキーを作る（初回だけ）
 
 `.env` の `LAB_NOREVIEW_KEYS` を `true` にして `./lab up`（または、段階ごとに `./lab secrets`、`./lab bootstrap`、`./lab clients`）を流します。

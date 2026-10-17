@@ -108,7 +108,8 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
             "guardrail_name": "tool-call-review",
             "litellm_params": {
                 "guardrail": "tool_call_review.ToolCallReview",
-                "mode": ["post_call"],
+                # 中身の審査が入りなら、要求に方針を足す pre_call も使う（変更設計書 3.9 節）
+                "mode": ["pre_call", "post_call"] if isolated_content_enabled(env) else ["post_call"],
                 "default_on": True,
                 "use_jev": use_jev,
                 "jev_model": "typesafe/jev-latest",
@@ -134,6 +135,8 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
             "isolated_content": isolated_content_enabled(env),
             "isolated_content_max_bytes": content_max_bytes(env),
             "isolated_content_max_files": content_max_files(env),
+            # 送信の宛先の許可リスト（変更仕様書 7.4 節）
+            "isolated_destinations": isolated_destinations(env),
         })
 
     if env.has_google():
@@ -196,7 +199,12 @@ def content_max_bytes(env: Env) -> int:
 
 
 def content_max_files(env: Env) -> int:
-    return int(env.get("LAB_ISOLATED_CONTENT_MAX_FILES", "3"))
+    return int(env.get("LAB_ISOLATED_CONTENT_MAX_FILES", "5"))
+
+
+def isolated_destinations(env: Env) -> list[str]:
+    """送信の宛先の許可リスト（LAB_ISOLATED_DESTINATIONS。カンマ区切り。既定は private）。"""
+    return [s.strip() for s in env.get("LAB_ISOLATED_DESTINATIONS", "private").split(",") if s.strip()]
 
 
 def noreview_enabled(env: Env) -> bool:

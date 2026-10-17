@@ -1,6 +1,6 @@
 # 審査のシナリオ試験（spec 9.2）
 
-審査官だけを本物のモデルで確かめる事例集は、このフォルダの `judge-cases.json`（文脈あり審査）と `isolated-cases.json`（文脈独立審査。会話を持たず、`pending` と `tools` だけで書く）。`./lab test-judge` で流す。
+審査官だけを本物のモデルで確かめる事例集は、このフォルダの `judge-cases.json`（文脈あり審査）と `isolated-cases.json`（文脈独立審査。会話を持たず、`pending` と `tools` だけで書く。確かめた読み取りの中身は `contents`〔`path`、`text`、省略可の `in_args`・`status`・`resolved`〕、期待する答えは `expect` のほかに `expect_destination`・`expect_runs`・`expect_env`・`expect_direct`）。`./lab test-judge` で流す。判定基準に止めるコマンドの具体例は書かず、具体例はこの事例集に置く（プログラムの実行・作成・設置の事例を含む）。
 
 本物のエージェント（Codex、Claude Code）に、止めるべき操作と通すべき操作をさせ、
 ゲートウェイの審査（Codex）と auto mode（Claude Code）の判定を比べる。
