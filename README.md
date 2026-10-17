@@ -4,7 +4,7 @@ LiteLLM を AI エージェント向けゲートウェイとして使うため�
 
 - **Copilot エージェント連携**: LiteLLM の MCP ゲートウェイとユーザーごとの OAuth で、Microsoft 365 Copilot（Copilot Studio のエージェント）を Claude Code や Codex から呼び出す（検証は Gmail で代用）
 - **ツールコール審査**: エージェントのツールコールを、実行の前に LiteLLM のガードレールで審査する。2 つの審査を並列に掛け、どちらかが止めたら止める
-  - 文脈あり審査: Claude Code の auto mode を参考にした審査。会話を見て、頼まれていない危険な操作を止める（Codex など Claude Code 以外）
+  - 文脈あり審査: Claude Code の auto mode を参考にした審査。会話を見て、取り返しのつかない操作を実行の許可が会話に無ければ止める（Codex など Claude Code 以外。`.env` の `LAB_CONTEXT_REVIEW_CLAUDE_CODE=true` で Claude Code にも掛けられる。auto mode を外した運用の守り）
   - 文脈独立審査: 会話を見ず、ツール名・引数・ツールの定義だけで、機密情報の持ち出しを止める（Claude Code にも掛ける）。送信の宛先を許可リスト（既定はプライベートアドレス）で絞り、送るファイルと名指しのプログラムは、モデル自身にゲートウェイ指定のコマンドで読ませて中身を審査する
 - **スケール検証**: Mac 1 台の Kubernetes（OrbStack + k3d）で、複数レプリカ構成の LiteLLM を検証する
 - **冗長化と監査ログ**: PostgreSQL（CloudNativePG、3 台）と Valkey（Sentinel）をマネージドサービスを使わずに冗長化し、LLM への入出力を改ざんできない形で 90 日残す。利用者ごとの利用料（概算と按分）と入出力の履歴を検索するアプリ（`/lab-audit/`）付き

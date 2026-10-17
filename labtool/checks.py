@@ -185,8 +185,13 @@ def smoke(env: Env) -> None:
         check(f"Messages(stream={s}, 他のクライアント): 危険な操作は拒否",
               lambda: "拒否: " in messages(BAD, stream, "other-agent/1.0"))
         check(f"Messages(stream={s}, User-Agent なし): 審査される", lambda: "拒否: " in messages(BAD, stream, ""))
-        check(f"Messages(stream={s}, Claude Code): 文脈あり審査はされない（機密を含まない操作は通る）",
-              lambda: "tool_use" in messages(BAD, stream, CLAUDE_UA))
+        if render.context_review_claude_code(env):
+            check(f"Messages(stream={s}, Claude Code): 文脈あり審査で危険な操作は拒否（LAB_CONTEXT_REVIEW_CLAUDE_CODE=true）",
+                  lambda: (b := messages(BAD, stream, CLAUDE_UA)) and "拒否: " in b and ISOLATED_PREFIX not in b
+                  and "tool_use" not in b)
+        else:
+            check(f"Messages(stream={s}, Claude Code): 文脈あり審査はされない（機密を含まない操作は通る）",
+                  lambda: "tool_use" in messages(BAD, stream, CLAUDE_UA))
         if render.isolated_content_enabled(env):
             content_checks(stream)
         if env.get("LAB_ISOLATED_REVIEW", "true").lower() == "true":
