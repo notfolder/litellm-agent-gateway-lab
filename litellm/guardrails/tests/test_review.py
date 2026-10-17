@@ -283,6 +283,23 @@ class ReviewTest(unittest.TestCase):
         self.assertIsNotNone(d.read_request)
         self.assertEqual(self.iso_record()["content_reads"], None)
 
+    def test_truncated_read_blocks_instead_of_asking_again(self):
+        # 出力が途中で切れた読み取り（ツールの出力の上限）は、もう一度読ませても同じ所で切れる。読み直しを案内せず止める
+        g = self.make(isolated=("need_content", "名前から分からない", {"files": ["report.csv"]}))
+        full = out("x" * 60)
+        d = self.run_review(g, self.with_read(["report.csv"], full[:-40]), pending=self.SEND)
+        self.assertEqual((d.allowed, d.blocked_by), (False, ["isolated"]))
+        self.assertIsNone(d.read_request)
+        self.assertIn("途中で切れていて", d.reason)
+        self.assertIn("減らす", d.reason)
+        iso = self.iso_record()
+        self.assertEqual((iso["isolated_decision"], iso["need_content_files"]), ("block", None))
+        self.assertEqual([c["status"] for c in iso["content_reads"]], ["unreadable"])
+        # 切れていても、審査官が中身を求めなければ（宛先が社内など）止めない
+        g = self.make(isolated=("allow", "社内"))
+        d = self.run_review(g, self.with_read(["report.csv"], full[:-40]), pending=self.SEND)
+        self.assertTrue(d.allowed)
+
     def test_binary_send_file_blocks_even_if_judge_allows(self):
         g = self.make(isolated=("allow", "ok"))
         d = self.run_review(g, self.with_read(["report.csv"], out("a\x00b")), pending=self.SEND)

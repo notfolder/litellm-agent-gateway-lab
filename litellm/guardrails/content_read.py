@@ -28,8 +28,9 @@ _CODEX_KEYS = {"cmd", "workdir", "yield_time_ms", "max_output_tokens"}
 _CODEX_SUFFIX = re.compile(r"\);\s*text\(r\.output\);\s*")
 # 文字として読めないとみなす文字（改行・復帰・タブ以外の制御文字、DEL、置換文字）
 _BAD_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f�]")
-# 作業フォルダを変える指定（相対パスのファイルを読ませる前に確かめる。変更仕様書 7.2 節の 5）
-_CHDIR = re.compile(r"(?:^|[\s;&|(`{])(?:cd|pushd|popd)(?=$|[\s;&|)`}])|(?:^|\s)(?:-C|--directory|--chdir)(?=$|[\s=])")
+# 作業フォルダを変える指定（相対パスのファイルを読ませる前に確かめる。変更仕様書 7.2 節の 5）。
+# 語の前後には引用符も含める（`bash -c 'cd s && …'` のように、引用符の中に書いた cd も見つける）
+_CHDIR = re.compile(r"(?:^|[\s;&|(`{'\"])(?:cd|pushd|popd)(?=$|[\s;&|)`}'\"])|(?:^|[\s'\"])(?:-C|--directory|--chdir)(?=$|[\s='\"])")
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # 止めたときに添える直し方の案内（審査官が advice の種類を返し、ゲートウェイが文を持つ。変更設計書 4.4 節）
@@ -423,12 +424,11 @@ def _in_args(item: str, args: list[str]) -> bool:
     return any(item in s for s in args)
 
 
-def verified_reads(call_type: str, data: dict, pending: list[dict], max_bytes: int) -> list[ContentRead]:
-    """会話の最後のツールコールが、指定どおりの読み取りなら、その結果を返す。そうでなければ空（変更仕様書 6.2 節）。
-    項目ごとに、審査対象の引数に現れるか（in_args）を付ける。ファイルの項目が 1 つも引数に無い読み取りは使わない。"""
+def _matched_read(call_type: str, data: dict, pending: list[dict], max_bytes: int) -> tuple[ReadSpec, str] | None:
+    """会話の最後のツールコールが、審査対象に対する指定どおりの読み取りなら、その指定と出力を返す（出力の中身はまだ見ない）。"""
     last = last_tool_call(call_type, data)
     if last is None:
-        return []
+        return None
     args_in, output = last
     wds = codex_workdirs(pending)
     spec = None
@@ -437,7 +437,7 @@ def verified_reads(call_type: str, data: dict, pending: list[dict], max_bytes: i
         spec = spec_of_command(prog["cmd"], max_bytes)
         # 実行する場所（workdir）が審査対象と違う読み取りは、相対パスの項目があるときだけ外す（絶対パスは場所に依らない）
         if spec and len(wds) == 1 and prog.get("workdir") != next(iter(wds)) and any(is_relative(f) for f in spec.files):
-            return []
+            return None
     else:
         # 引数の文字列は、読み取りのコマンド 1 つ（と空文字列）だけでなければならない。説明などの実行されない項目に
         # コマンドを書き、実行される項目で偽の出力を作れないようにする（変更設計書 4.2 節）
@@ -445,22 +445,63 @@ def verified_reads(call_type: str, data: dict, pending: list[dict], max_bytes: i
         if len(candidates) == 1:
             spec = spec_of_command(next(iter(candidates)), max_bytes)
     if not spec:
-        return []
+        return None
     args = _arg_strings(pending)
-    flags = [_in_args(f, args) for f in spec.files]
-    if not any(flags):
-        return []
+    if not any(_in_args(f, args) for f in spec.files):
+        return None
     if any(is_relative(f) for f in spec.files) and changes_directory(pending):
+        return None
+    return spec, output
+
+
+def verified_reads(call_type: str, data: dict, pending: list[dict], max_bytes: int) -> list[ContentRead]:
+    """会話の最後のツールコールが、指定どおりの読み取りなら、その結果を返す。そうでなければ空（変更仕様書 6.2 節）。
+    項目ごとに、審査対象の引数に現れるか（in_args）を付ける。ファイルの項目が 1 つも引数に無い読み取りは使わない。"""
+    m = _matched_read(call_type, data, pending, max_bytes)
+    if m is None:
         return []
+    spec, output = m
     reads = parse_output(output, spec, max_bytes)
     if any(r.status == "unreadable" for r in reads):
         # 出力が壊れている（途中で切れた、形が違う、エージェントがエラーの文を返した）ときは、読み取りが無かったものとして扱う。
-        # 送信や実行なら審査官が中身を求め、読み直しの案内になる。読み取りの後の無関係な操作を止めないため
+        # 送信や実行なら審査官が中身を求め、読み直しの案内になる。読み取りの後の無関係な操作を止めないため。
+        # ただし途中で切れたもの（truncated_read）は、もう一度読ませても同じ所で切れるので、中身の要求の段階で止める
         return []
+    args = _arg_strings(pending)
     for r in reads:
         if r.kind == "file":
             r.in_args = _in_args(r.path, args)
     return reads
+
+
+@dataclass
+class TruncatedRead:
+    """指定どおりに行われたが、出力が途中で切れた読み取り。received は受け取れたバイト数、reads は項目ごとの状態。"""
+    spec: ReadSpec
+    received: int
+    reads: list[ContentRead]
+
+
+def truncated_read(call_type: str, data: dict, pending: list[dict], max_bytes: int) -> TruncatedRead | None:
+    """会話の最後のツールコールが指定どおりの読み取りで、出力が途中で切れている（始まりの区切りはあるが、終わりの印が無い）
+    ときに、その読み取りを返す。エージェントのツールの出力の上限に当たった印で、もう一度読ませても同じ所で切れる。
+    エージェントがエラーの文を返したもの（始まりの区切りが無い）や、形が違うもの（終わりの印はある）は当たらない。"""
+    m = _matched_read(call_type, data, pending, max_bytes)
+    if m is None:
+        return None
+    spec, output = m
+    b = output.encode("utf-8", "surrogatepass")
+    first = _HEAD if spec.files else _ENV_HEAD
+    started = b.find(first) >= 0 or b.startswith(first[1:])
+    if not started or _END in b:
+        return None
+    return TruncatedRead(spec, len(b), parse_output(output, spec, max_bytes))
+
+
+def truncated_reason(t: TruncatedRead) -> str:
+    """途中で切れた読み取りで止めるときの理由（どのクライアントでも、出力の上限に当たったときの動きは同じ）。"""
+    return (f"読み取りの出力が途中で切れていて（{t.spec.count()} 項目を読ませ、受け取れたのは {t.received} バイト）、"
+            "中身を確かめられないため。ツールの出力の上限に収まるよう、一度に送るファイルを減らすか、操作を分けてください")
 
 
 def changes_directory(pending: list[dict]) -> bool:
@@ -537,4 +578,7 @@ def status_reason(r: ContentRead, max_bytes: int) -> str:
         return f"ファイル {r.path} を読めず、中身を確かめられないため"
     if r.status == "binary":
         return f"{r.path} を文字として読めず、中身を確かめられないため。{ADVICE['script']}"
+    if r.status == "binary_artifact":
+        # 通す側の状態。ほかの理由（宛先など）で止めた操作の読み取りを説明するときに備える
+        return f"{r.path} は文字として読めない生成物（審査官がパスの直接実行と分類）のため、中身は確かめていない"
     return f"{r.path} の読み取りの出力が壊れていて（途中で切れた、形が違う）、中身を確かめられないため"   # 今は呼ばれない（壊れた読み取りは無かったものとして扱う）
