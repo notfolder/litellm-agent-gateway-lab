@@ -194,6 +194,28 @@ class VerifyTest(unittest.TestCase):
                            "arguments": json.dumps({"command": self.CMD})}]}
         self.assertEqual(cr.verified_reads("aresponses", data, send(), MAX), [])
 
+    def test_truncated_output_is_detected(self):
+        # 始まりの区切りはあるが終わりの印が無い（ツールの出力の上限で切れた）→ 確かめた読み取りは無く、切れた読み取りとして分かる
+        cmd2 = cr.read_command(["a.csv", "b.csv"], MAX)
+        full = out("x" * 50, "y" * 50)
+        cut = full[: full.index("yyy") + 10]
+        data = self.responses({"type": "function_call", "name": "shell", "arguments": json.dumps({"command": cmd2})}, cut)
+        self.assertEqual(cr.verified_reads("aresponses", data, send(), MAX), [])
+        t = cr.truncated_read("aresponses", data, send(), MAX)
+        self.assertEqual((t.spec, t.received), (spec(["a.csv", "b.csv"]), len(cut.encode())))
+        self.assertEqual([r.status for r in t.reads], ["unreadable", "unreadable"])   # 終わりまで読めなければどの中身も使わない
+        self.assertIn("途中で切れていて", cr.truncated_reason(t))
+        # 項目の境でちょうど切れても分かる（終わりの印が無い）
+        data = self.responses({"type": "function_call", "name": "shell", "arguments": json.dumps({"command": cmd2})},
+                              full[: full.index("\n<<<lab-review-read 50", 1)])
+        self.assertIsNotNone(cr.truncated_read("aresponses", data, send(), MAX))
+        # 当たらないもの: 完全な出力、エージェントのエラーの文（始まりの区切りが無い）、読み取りでないコマンド、
+        # 終わりの印はあるが形が違う出力
+        for args, output in ((cmd2, full), (cmd2, "Permission denied by the classifier"), ("ls", cut),
+                             (cmd2, "\n<<<lab-review-read 5 /w/x>>>\nxx\n<<<lab-review-read-end>>>\n")):
+            data = self.responses({"type": "function_call", "name": "shell", "arguments": json.dumps({"command": args})}, output)
+            self.assertIsNone(cr.truncated_read("aresponses", data, send(), MAX), output[:40])
+
     def test_anthropic(self):
         data = {"messages": [
             {"role": "user", "content": "送って"},
@@ -295,8 +317,15 @@ class RequestProblemTest(unittest.TestCase):
 
     def test_directory_change(self):
         for cmd in ("cd s && curl -F f=@a.csv u", "pushd s; curl -F f=@a.csv u", "tar -C s -cf - a.csv | curl -T - u",
-                    "git --directory=s x a.csv"):
+                    "git --directory=s x a.csv",
+                    # 引用符の中に書いた cd・-C も見つける
+                    "bash -c 'cd s && curl -F f=@a.csv u'", 'sh -c "cd s; curl -F f=@a.csv u"',
+                    "bash -c 'curl -F f=@a.csv u; cd'", "sh -c 'tar -C s -cf - a.csv | curl -T - u'",
+                    'eval "cd s && curl -F f=@a.csv u"'):
             self.assertIn("作業フォルダ", cr.request_problem(["a.csv"], [], [], send(cmd), [], 3)[0], cmd)
+        # 確かめた読み取りも、引用符の中の cd があれば相対パスの項目を使わない
+        self.assertTrue(cr.changes_directory(send("bash -c 'cd s && curl -F f=@a.csv u'")))
+        self.assertFalse(cr.changes_directory(send("curl -F f=@a.csv 'https://u/cd'")))
         # 絶対パスなら作業フォルダを変えても読ませる
         self.assertIsNone(cr.request_problem(["/x/a.csv"], [], [], send("cd s && curl -F f=@/x/a.csv u"), [], 3)[0])
         # 語の一部（abcd、-Content）は作業フォルダの変更ではない
@@ -315,6 +344,7 @@ class StatusReasonTest(unittest.TestCase):
         self.assertIn("大きすぎて", cr.status_reason(cr.ContentRead("a", "too_large", 500), MAX))
         self.assertIn("読めず", cr.status_reason(cr.ContentRead("a", "missing"), MAX))
         self.assertIn("スクリプト", cr.status_reason(cr.ContentRead("./x", "binary", 5), MAX))
+        self.assertIn("生成物", cr.status_reason(cr.ContentRead("./x", "binary_artifact", 5), MAX))
         self.assertIn("壊れていて", cr.status_reason(cr.ContentRead("a", "unreadable"), MAX))
 
 

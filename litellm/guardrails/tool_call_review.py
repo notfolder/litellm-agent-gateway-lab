@@ -666,8 +666,15 @@ class ToolCallReview(CustomGuardrail):
                 verdict.content_reads = [r.summary() for r in reads]
             # 3. 判定
             if ans.decision == "need_content":
-                problem, spec = cr.request_problem(ans.files, ans.runs, ans.env, pending, reads, self.content_max_files)
                 verdict.allowed = False
+                # 直前の読み取りが指定どおりで、出力が途中で切れていた（ツールの出力の上限）なら、もう一度読ませても
+                # 同じ所で切れる。読み直しを案内せず、項目を減らす案内で止める（どのクライアントでも同じ扱い）
+                cut = cr.truncated_read(call_type, data, pending, self.content_max_bytes) if not reads else None
+                if cut is not None:
+                    verdict.decision, verdict.reason = "block", cr.truncated_reason(cut)
+                    verdict.content_reads = [r.summary() for r in cut.reads]
+                    return verdict
+                problem, spec = cr.request_problem(ans.files, ans.runs, ans.env, pending, reads, self.content_max_files)
                 if problem:
                     verdict.decision, verdict.reason = "block", problem
                 else:
