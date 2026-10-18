@@ -46,6 +46,17 @@ def _guardrail_module(name: str):
     return importlib.import_module(name)
 
 
+# 疎通確認の要求に付けるツールの定義（方針はツールの定義を持つ要求にだけ足される。偽 LLM は定義に関わらずツールコールを返す）
+SMOKE_TOOLS = {
+    "responses": [{"type": "function", "name": "exec_command", "description": "Run a command",
+                   "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}}],
+    "chat": [{"type": "function", "function": {"name": "exec_command", "description": "Run a command",
+                                               "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}}}],
+    "anthropic": [{"name": "Bash", "description": "Run a command",
+                   "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}],
+}
+
+
 def smoke(env: Env) -> None:
     """疎通確認。偽 LLM（fake-tools）を使うので、ChatGPT や Claude の利用枠を使わない。
     1. 入口から LiteLLM に届く
@@ -76,19 +87,19 @@ def smoke(env: Env) -> None:
         return http("POST", f"{base}/v1/responses", timeout=60, headers={
             "Authorization": f"Bearer {key}", "User-Agent": "codex_cli_rs/0.162.1 (smoke)",
             "session-id": "smoke-test-0001",
-        }, body={"model": "fake-tools", "stream": stream,
+        }, body={"model": "fake-tools", "stream": stream, "tools": SMOKE_TOOLS["responses"],
                  "input": [{"role": "user", "content": [{"type": "input_text", "text": text}]}]}).body
 
     def chat(text: str, stream: bool, api_key: str = key) -> str:
         return http("POST", f"{base}/v1/chat/completions", timeout=60,
                     headers={"Authorization": f"Bearer {api_key}"},
-                    body={"model": "fake-tools", "stream": stream,
+                    body={"model": "fake-tools", "stream": stream, "tools": SMOKE_TOOLS["chat"],
                           "messages": [{"role": "user", "content": text}]}).body
 
     def messages(text: str, stream: bool, ua: str) -> str:
         return http("POST", f"{base}/v1/messages", timeout=60, headers={
             "x-litellm-api-key": f"Bearer {key}", "anthropic-version": "2023-06-01", "User-Agent": ua,
-        }, body={"model": "fake-tools", "max_tokens": 100, "stream": stream,
+        }, body={"model": "fake-tools", "max_tokens": 100, "stream": stream, "tools": SMOKE_TOOLS["anthropic"],
                  "messages": [{"role": "user", "content": text}]}).body
 
     def content_checks(stream: bool) -> None:
@@ -108,7 +119,7 @@ def smoke(env: Env) -> None:
             cmd = cr.read_command(files, max_bytes, env_names)
             return http("POST", f"{base}/v1/responses", timeout=60, headers={
                 "Authorization": f"Bearer {key}", "User-Agent": "codex_cli_rs/0.162.1 (smoke)"},
-                body={"model": "fake-tools", "stream": stream, "input": [
+                body={"model": "fake-tools", "stream": stream, "tools": SMOKE_TOOLS["responses"], "input": [
                     {"role": "user", "content": [{"type": "input_text", "text": text}]},
                     {"type": "function_call", "call_id": "r1", "name": "exec_command",
                      "arguments": json.dumps({"cmd": cmd})},
@@ -118,7 +129,7 @@ def smoke(env: Env) -> None:
             cmd = cr.read_command(files, max_bytes, env_names)
             return http("POST", f"{base}/v1/messages", timeout=60, headers={
                 "x-litellm-api-key": f"Bearer {key}", "anthropic-version": "2023-06-01", "User-Agent": CLAUDE_UA,
-            }, body={"model": "fake-tools", "max_tokens": 100, "stream": stream, "messages": [
+            }, body={"model": "fake-tools", "max_tokens": 100, "stream": stream, "tools": SMOKE_TOOLS["anthropic"], "messages": [
                 {"role": "user", "content": text},
                 {"role": "assistant", "content": [{"type": "tool_use", "id": "r1", "name": "Bash",
                                                    "input": {"command": cmd}}]},

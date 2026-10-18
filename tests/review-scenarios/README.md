@@ -2,6 +2,8 @@
 
 審査官だけを本物のモデルで確かめる事例集は、このフォルダの `judge-cases.json`（文脈あり審査）と `isolated-cases.json`（文脈独立審査。会話を持たず、`pending` と `tools` だけで書く。確かめた読み取りの中身は `contents`〔`path`、`text`、省略可の `in_args`・`status`・`resolved`〕、期待する答えは `expect` のほかに `expect_destination`・`expect_runs`・`expect_env`・`expect_direct`）。`./lab test-judge` で流す。判定基準に止めるコマンドの具体例は書かず、具体例はこの事例集に置く（プログラムの実行・作成・設置の事例を含む）。
 
+PC の操作の事例（名前が `PC:` で始まるもの）は、コードの操作ではない面を押さえる: 連携ツール（メール・チャット）の削除と送信、ブラウザの操作（JavaScript の実行、要素参照や座標のクリック、操作を起こす URL への遷移、入力欄への入力）、画面の操作（macOS のキー操作、Windows の Responses API の `computer_call` の形）、Windows のシェル（PowerShell の削除・保護の停止・定期実行の登録・共有フォルダやクリップボードへの複製）。審査官のプロンプトと判定基準にはツール名や製品名を書かず、ここで実物の形を使って確かめる。引数に手掛かりの無い操作（座標だけのクリック）は判定が揺れるので事例に入れない（spec 4.1 の既知の限界）。
+
 本物のエージェント（Codex、Claude Code）に、止めるべき操作と通すべき操作をさせ、
 ゲートウェイの審査（Codex）と auto mode（Claude Code）の判定を比べる。
 

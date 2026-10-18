@@ -94,6 +94,16 @@ class ReviewTest(unittest.TestCase):
     def iso_record(self):
         return next(r for r in self.audit.records if r["review_kind"] == "isolated")
 
+    # ---- 組み込みの画面操作（Responses の computer_call）----
+    def test_computer_call_is_replaced_like_function_call(self):
+        from types import SimpleNamespace
+        resp = SimpleNamespace(output=[{"type": "computer_call", "call_id": "c1", "actions": [{"type": "screenshot"}]},
+                                       {"type": "message", "role": "assistant", "content": []}])
+        tcr.replace_response("aresponses", resp, "拒否: x")
+        self.assertEqual([i.get("type") if isinstance(i, dict) else i["type"] for i in resp.output], ["message", "message"])
+        chunk = SimpleNamespace(type="response.output_item.added", item={"type": "computer_call"}, output_index=0)
+        self.assertTrue(tcr.ResponsesStream().starts_tool(chunk))
+
     # ---- 組み合わせ ----
     def test_both_allow(self):
         d = self.run_review(self.make(), request())
@@ -436,8 +446,11 @@ class ReviewTest(unittest.TestCase):
 
     def test_policy_is_injected_in_each_format(self):
         g = self.make()
+        rt = [{"type": "function", "name": "exec_command", "parameters": {"type": "object"}}]        # Responses
+        at = [{"name": "Bash", "input_schema": {"type": "object"}}]                                     # Anthropic
+        ct = [{"type": "function", "function": {"name": "exec_command", "parameters": {"type": "object"}}}]  # Chat
         # Responses: instructions の末尾
-        data = {**request(), "instructions": "You are Codex."}
+        data = {**request(), "tools": rt, "instructions": "You are Codex."}
         out_ = self.hook(g, data, "aresponses")
         self.assertTrue(out_["instructions"].startswith("You are Codex.\n\n" + tcr.REVIEW_POLICY_MARKER))
         self.assertIn("tools.exec_command", out_["instructions"])            # Codex にはプログラムの形
@@ -447,25 +460,39 @@ class ReviewTest(unittest.TestCase):
         before = out_["instructions"]
         self.assertEqual(self.hook(g, out_, "aresponses")["instructions"], before)
         # Anthropic: system が文字列・配列・無し
-        data = {**request(CLAUDE_UA), "system": "You are Claude Code."}
+        data = {**request(CLAUDE_UA), "tools": at, "system": "You are Claude Code."}
         self.assertTrue(self.hook(g, data, "anthropic_messages")["system"].endswith(tcr.REVIEW_POLICY_TEMPLATE.splitlines()[-1]))
         self.assertNotIn("tools.exec_command", data["system"])
-        data = {**request(CLAUDE_UA), "system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}]}
+        data = {**request(CLAUDE_UA), "tools": at, "system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}]}
         self.hook(g, data, "aanthropic_messages")
         self.assertEqual([b["type"] for b in data["system"]], ["text", "text"])
         self.assertIn(tcr.REVIEW_POLICY_MARKER, data["system"][1]["text"])
         self.assertNotIn("cache_control", data["system"][1])
-        data = {**request(CLAUDE_UA)}
+        data = {**request(CLAUDE_UA), "tools": at}
         data.pop("input")
         self.assertIn(tcr.REVIEW_POLICY_MARKER, self.hook(g, data, "anthropic_messages")["system"])
         # Chat: system メッセージがあれば末尾、無ければ先頭に足す
-        data = {"model": "fake-tools", "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]}
+        data = {"model": "fake-tools", "tools": ct, "messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]}
         self.hook(g, data, "acompletion")
         self.assertTrue(data["messages"][0]["content"].startswith("s\n\n" + tcr.REVIEW_POLICY_MARKER))
-        data = {"model": "fake-tools", "messages": [{"role": "user", "content": "u"}]}
+        data = {"model": "fake-tools", "tools": ct, "messages": [{"role": "user", "content": "u"}]}
         self.hook(g, data, "completion")
         self.assertEqual(data["messages"][0]["role"], "system")
         self.assertIn(tcr.REVIEW_POLICY_MARKER, data["messages"][0]["content"])
+
+    def test_policy_is_not_injected_without_tools(self):
+        """ツールの定義を持たない要求（審査官を直接呼ぶ試験、題名の生成など）はツールコールを起こせないので、方針を足さない。"""
+        g = self.make()
+        data = {**request(), "instructions": "You are Codex."}
+        data.pop("tools")
+        self.assertIsNone(self.hook(g, data, "aresponses"))
+        self.assertEqual(data["instructions"], "You are Codex.")
+        data = {"model": "fake-tools", "messages": [{"role": "system", "content": "[[tool-call-review]] 審査官"}, {"role": "user", "content": "u"}]}
+        self.assertIsNone(self.hook(g, data, "acompletion"))
+        self.assertEqual(data["messages"][0]["content"], "[[tool-call-review]] 審査官")
+        # Codex が input の additional_tools でツールを送る形は、ツールありとして扱う
+        data = {**request(), "instructions": "i", "input": [{"type": "additional_tools", "tools": [{"type": "function", "name": "exec_command"}]}]}
+        self.assertIn(tcr.REVIEW_POLICY_MARKER, self.hook(g, data, "aresponses")["instructions"])
 
     def test_policy_is_not_injected_when_off_or_not_applicable(self):
         self.assertIsNone(self.hook(self.make(isolated_content=False), {**request(), "instructions": "x"}, "aresponses"))
