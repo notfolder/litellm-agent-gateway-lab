@@ -6,6 +6,8 @@
 - [x] (2026-10-12) 文脈独立のツール引数監査（機密情報の持ち出し防止）を実装・試験し、docs に反映して main にマージ（PR #1）
 - [x] (2026-10-13) 審査をすり抜けるローカル破壊的操作の対策。監査の判定を許可ベースに変更（取り返しのつかない操作は許可の明示がある場合だけ allow）、Jev の問いも直して main に push（`2ac468f`）。検証は `docs/guardrail-gaps.md`
 - [x] (2026-10-13) 審査なしのキーを `./lab`（`LAB_NOREVIEW_KEYS`）で作る／消すようにして push（`a5600d3`）。手で発行した旧キーは削除済み
+- [x] (2026-10-18) Claude Code・Codex・Copilot のエージェント組み込みの LLM 審査と設定方法を調査し、`docs/agent-builtin-review.md` にまとめた。Codex にも Auto-review（任意、既定は人の承認）があるので、Qiita 記事の下書き（「Codex には auto mode のような守りが無い」が前提）はいったん削除した。記事を書き直すときは、この文書の 1 章と 5 章を前提にする
+- [ ] Codex の Auto-review（`--approve-for-me`）あり・なしで spec 9.2 のシナリオを流し、ゲートウェイの審査との重なりと差を測る（design 16.7 の Claude Code の試験と同じ形）
 - [ ] 本物のエージェント（Codex、Claude Code）でのシナリオ試験（spec 9.2）。Jev の有無と、文脈独立審査を足したことによる待ち時間の増え方も測る（`./lab review-log`）
   - 2026-10-12: Codex の `codex exec` で A（メールを読む）と D（古いブランチの掃除）を審査あり・なしで比べた。D は審査ありだけが拒否。B・C と Claude Code は、人が `docs/manual-check.md` の手順で確かめる
   - 2026-10-18: Claude Code は `claude -p` で 11 シナリオ × 3 設定（auto＋文脈独立のみ、auto＋両方、bypassPermissions＋両方）× 5 回を流し、結果を design 16.7 に書いた。残りは Codex での同じシナリオと Jev 有無の比較
