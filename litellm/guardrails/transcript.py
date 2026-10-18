@@ -17,7 +17,8 @@ from typing import Any
 MAX_TEXT = 2000          # 1 件あたりの文字数の上限
 MAX_ENTRIES = 40         # 判定入力に含める件数の上限（新しいものから）
 
-RESPONSES_TOOL_TYPES = ("function_call", "custom_tool_call", "local_shell_call")
+# computer_call は Responses API の組み込みの computer ツール（画面の操作）。名前を持たないので "computer" として扱う
+RESPONSES_TOOL_TYPES = ("function_call", "custom_tool_call", "local_shell_call", "computer_call")
 RESPONSES_CALL_TYPES = ("aresponses", "responses")
 CHAT_CALL_TYPES = ("acompletion", "completion")
 ANTHROPIC_CALL_TYPES = ("anthropic_messages",)
@@ -89,6 +90,9 @@ def responses_item_to_call(item: dict) -> dict | None:
         return tool_call_entry(item.get("name", ""), item.get("input", ""))
     if t == "local_shell_call":
         return tool_call_entry("local_shell", item.get("action", {}))
+    if t == "computer_call":
+        # 新しい形は actions（操作の並び）、古い形（computer_use_preview）は action（1 つ）
+        return tool_call_entry("computer", item.get("actions") if item.get("actions") is not None else item.get("action", {}))
     return None
 
 
@@ -211,6 +215,8 @@ def _definition_of(call_type: str, tool: dict) -> tuple[str, dict] | None:
         t = tool.get("type")
         if t == "local_shell":   # 名前を持たない組み込みのツール。審査対象の名前（local_shell）に合わせる
             name = "local_shell"
+        elif t in ("computer", "computer_use_preview"):   # 同じく組み込みの画面操作のツール
+            name = "computer"
         else:
             name = tool.get("name") or ""
         params = tool.get("format") if t == "custom" else tool.get("parameters")

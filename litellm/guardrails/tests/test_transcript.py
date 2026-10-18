@@ -40,6 +40,35 @@ class ResponsesTranscript(unittest.TestCase):
         self.assertEqual([c["tool_call"]["name"] for c in calls], ["shell"])
 
 
+class ResponsesComputerCall(unittest.TestCase):
+    """Responses API の組み込みの computer ツール（画面の操作）は名前を持たない computer_call で届く。"""
+
+    def test_response_actions(self):
+        resp = {"output": [{"type": "computer_call", "call_id": "c1", "status": "completed",
+                            "actions": [{"type": "click", "button": "left", "x": 405, "y": 157},
+                                        {"type": "type", "text": "penguin"}]}]}
+        calls = tr.tool_calls_from_response("aresponses", resp)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["tool_call"]["name"], "computer")
+        self.assertIn('"penguin"', calls[0]["tool_call"]["arguments"])
+
+    def test_request_old_shape_and_output_dropped(self):
+        data = {"input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "x"}]},
+            {"type": "computer_call", "call_id": "c1", "action": {"type": "keypress", "keys": ["CTRL", "A"]}},
+            {"type": "computer_call_output", "call_id": "c1",
+             "output": {"type": "computer_screenshot", "image_url": "data:image/png;base64,AAAA"}}]}
+        entries = tr.transcript_from_request("aresponses", data)
+        self.assertEqual(entries[0], {"user": "x"})
+        self.assertEqual(entries[1]["tool_call"]["name"], "computer")
+        self.assertIn("keypress", entries[1]["tool_call"]["arguments"])
+        self.assertEqual(len(entries), 2)   # 画面の画像（ツールの結果）は捨てる
+
+    def test_definition_of_builtin_tool(self):
+        data = {"tools": [{"type": "computer", "display_width": 1024, "display_height": 768}]}
+        self.assertIn("computer", tr.tool_definitions("aresponses", data, ["computer"]))
+
+
 class ChatTranscript(unittest.TestCase):
     def test_chat(self):
         data = {"messages": [

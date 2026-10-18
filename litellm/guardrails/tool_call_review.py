@@ -130,6 +130,8 @@ ISOLATED_DESTINATION_RULES = """
 - 審査対象が、手元のデータを利用者の PC の外へ送る操作なら、宛先が社内でも、allow でも、必ず destination に宛先のホスト名か
   IP アドレスを入れてください（URL ならホストの部分だけ。スキーム、ポート、パスは除く）。宛先が引数や渡された中身から分からない
   （スクリプトの中にある、変数で組み立てている など）ときは "unknown" にしてください。空にしてよいのは、外へ送る操作でないときだけです。
+  外へ送る操作とは、手元のファイルや判定基準の機密情報を PC の外へ出す操作です。引数に書かれた機密でない文字をそのまま入力・表示する操作、
+  公開の場所を開く・取得するだけの操作、PC の中で完結する操作は外へ送る操作ではないので、destination は空にしてください。
 - 送ってよい宛先は組織の設定で決まっていて、無い宛先はゲートウェイが止めます。設定: {destinations}。
   このうちプライベートアドレスと localhost は社内として扱ってください。それ以外の設定の宛先は、送信が許されているだけで、
   社内かどうかは判定基準の「社内の宛先」で決めてください（取引先のアップロード先などは社外です）。"""
@@ -137,6 +139,8 @@ ISOLATED_DESTINATION_RULES = """
 # 中身の審査を使うときだけ、固定部分に足す決まり（{max_files} に上限の数が入る）
 ISOLATED_CONTENT_RULES = """
 - need_content は、名前と引数だけでは allow か block かを決められないときだけに使ってください。
+  宛先を読み取りで確かめられるのは、渡されたプログラムが取り込むファイル・設定ファイル・環境変数に宛先があるときだけです。
+  画面や入力欄の先のように読み取りでは確かめられない宛先を理由に、need_content を返さないでください。
   中身を求める（need_content）ときは、destination はまだ決めずに空にしてかまいません。
   宛先が社内で、判定基準が社内への送信を許しているなら、中身が何であっても判定は変わらないので、中身を求めずに allow にしてください。
   ファイルの名前や引数（題名、宛先、説明など）から、判定基準の機密情報が社外に出ると分かるときは、中身を求めずに block にしてください。
@@ -501,6 +505,10 @@ class ToolCallReview(CustomGuardrail):
         if ct is None:
             return None
         if ct in tr.ANTHROPIC_CALL_TYPES and _is_claude_code(_user_agent(data)) and not self.isolated_review_claude_code:
+            return None
+        if not tr.request_tools(ct, data):
+            # ツールの定義を持たない要求はツールコールを起こせないので、方針は要らない（審査官を直接呼ぶ試験や、
+            # 題名の生成のような小さな要求に、エージェント向けの方針を混ぜない）
             return None
         text = review_policy_text(_client_kind(_user_agent(data)), self.content_max_bytes, self.content_max_files)
         inject_policy(ct, data, text)
