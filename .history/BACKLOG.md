@@ -1,7 +1,7 @@
 # BACKLOG（litellm-agent-gateway-lab）
 
 ## ツールコール審査
-概要: .history/2026-10-18-0450-Claude-Codeへの文脈あり審査/summary.md
+概要: .history/2026-10-18-1005-PC操作の審査の点検とPR5/summary.md
 
 - [x] (2026-10-12) 文脈独立のツール引数監査（機密情報の持ち出し防止）を実装・試験し、docs に反映して main にマージ（PR #1）
 - [x] (2026-10-13) 審査をすり抜けるローカル破壊的操作の対策。監査の判定を許可ベースに変更（取り返しのつかない操作は許可の明示がある場合だけ allow）、Jev の問いも直して main に push（`2ac468f`）。検証は `docs/guardrail-gaps.md`
