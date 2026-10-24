@@ -225,20 +225,21 @@ class DataStack(cdk.Stack):
             subnet_ids=[s.subnet_id for s in vpc.private_subnets], cache_subnet_group_name=f"{prefix}-valkey")
         sg = ec2.SecurityGroup(self, "ValkeySg", vpc=vpc, description="ElastiCache for Valkey (lab)")
         sg.add_ingress_rule(ec2.Peer.ipv4(vpc.vpc_cidr_block), ec2.Port.tcp(6379), "from inside the VPC")
-        # メモリが溢れても黙ってデータを消さない（仕様書 5.2）
+        # メモリが溢れても黙ってデータを消さない（仕様書 5.2）。min-replicas-to-write 1 は Mac の Valkey と同じ条件
+        # （replica が 1 台も追従していなければ書き込みを拒む）。ElastiCache の durability（2 AZ に複製してから返す）は
+        # Graviton の M/R/C 系の .large 以上とクラスターモード有効が必須で検証の規模に合わないので使わない（2026-10-24）
         params = elasticache.CfnParameterGroup(
-            self, "ValkeyParams", cache_parameter_group_family="valkey9", description="noeviction (lab)",
-            properties={"maxmemory-policy": "noeviction"})
+            self, "ValkeyParams", cache_parameter_group_family="valkey9",
+            description="noeviction, min-replicas-to-write 1 (lab)",
+            properties={"maxmemory-policy": "noeviction", "min-replicas-to-write": "1", "min-replicas-max-lag": "10"})
         group = elasticache.CfnReplicationGroup(
             self, "Valkey",
             replication_group_id=f"{prefix}-valkey",
-            replication_group_description="LiteLLM Redis-compatible store (Valkey 9, 1 primary + 2 replicas, durability sync)",
+            replication_group_description="LiteLLM Redis-compatible store (Valkey 9, 1 primary + 2 replicas, min-replicas-to-write 1)",
             engine="valkey", engine_version="9.0",
             cache_node_type=spec["valkey_node_type"],
             num_cache_clusters=3,
             automatic_failover_enabled=True, multi_az_enabled=True,
-            # 書き込みを 2 AZ 以上に複製してから返す（仕様書 5.2 の min-replicas-to-write 1 に相当）
-            durability="sync",
             cache_parameter_group_name=params.ref,
             cache_subnet_group_name=subnets.ref,
             security_group_ids=[sg.security_group_id],

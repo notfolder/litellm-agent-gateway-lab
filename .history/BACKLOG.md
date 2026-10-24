@@ -41,7 +41,7 @@
 - [ ] Pod Identity のロールごとの権限（許した操作ができ、許していない操作が拒否される）を、クラスタの中で各 ServiceAccount の Pod から試す試験を `./lab test-audit` に足す（Mac からは IAM ロールを借りられないので今は省いている。変更設計書 10 章）（追加 2026-10-24、重要 中）
 - [ ] Codex 用のモデル（Bedrock Mantle の gpt-oss か GPT-5.x、Bedrock の Claude の変換経由、Azure OpenAI）を決める。決まるまで AWS でも `chatgpt/` を使う（トークンは EFS の PVC で共有）（追加 2026-10-24、重要 中）
 - [ ] 配備の後、AWS の試験の結果と費用の実測を変更設計書に書き足し、変更仕様書 12 章・変更設計書 12 章の表に従って `docs/spec.md` と `docs/design.md` に反映する（追加 2026-10-24、重要 中）
-- [ ] ElastiCache の `durability: sync` が `cache.t4g.micro` で使えるか配備で確かめる（使えなければノードの種類を上げる）（追加 2026-10-24、重要 低）
+- [x] (2026-10-24) ElastiCache の `durability: sync` は `cache.t4g.micro` で使えなかった（Graviton `.large` 以上とクラスターモード有効が必須）。`min-replicas-to-write 1` に変更（ユーザー回答 1A）
 - [x] (2026-10-24) 変更設計書 `.history/2026-10-24-AWS構成/変更設計書.md` を書く
 - [x] (2026-10-24) 実装: `LAB_TARGET` の切り替え、`labtool/aws.py`、`cdk/`、S3 の資格情報チェーンとバケット名の接頭辞、ESO、ALB の Ingress、Bedrock のモデル登録、障害試験の AWS の場面。単体テスト（labtool 52、監査 19、監査ログ 12）と CDK の synth が通り、Mac の `./lab up` を流し直して確認
 

@@ -418,7 +418,7 @@ def datastores(env: Env) -> None:
         if g["Status"] != "available":
             raise LabError(f"ElastiCache {out['ValkeyReplicationGroupId']} が available ではありません（{g['Status']}）")
         ok(f"Aurora（writer {aws.aurora_writer(env, out)}）と ElastiCache for Valkey"
-           f"（primary {aws.valkey_primary(env, out)}、durability {g.get('EffectiveDurability', '?')}）は使えます")
+           f"（primary {aws.valkey_primary(env, out)}、Multi-AZ {g.get('MultiAZ', '?')}）は使えます")
         return
     # 1 台の PostgreSQL（以前の構成）を消す。中身は引き継がない（変更仕様書 4 章）
     _delete_if_present("statefulset/postgres", "service/postgres", "pvc/data-postgres-0", "secret/postgres")
