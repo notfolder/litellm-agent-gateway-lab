@@ -37,6 +37,7 @@
   - 2026-10-24: 回答待ちのまま実装に入った。コードは東京・GOVERNANCE・Google SSO の前提（`.env` で変えられる）
 - [ ] AWS に配備して試す（資格情報の用意が先。手順は変更設計書 7 章）: `LAB_TARGET=aws` で `./lab up` → `test-smoke` → `test-idempotency` → `test-audit` → `test-failover`（litellm-drain、aurora-failover、valkey-failover）→ `test-judge`（Haiku 4.5 の審査官の評価セットの差を記録）→ `./lab down` で計算資源を消して作り直し、S3 と Aurora のデータが残ることを確かめる（追加 2026-10-24、重要 高）
   - 2026-10-24: IAM Identity Center を東京に有効化（単一リージョン、組織インスタンス。Organizations も同時に作成）、利用者 `notfolder` と許可セット `AdministratorAccess`（セッション 12 時間）を作ってアカウントに割り当てた。残りは招待メールの承諾・MFA、`aws configure sso`、Bedrock のモデルアクセス
+  - 2026-10-24: `aws configure sso`（プロファイル `litellm-lab`）まで完了。Bedrock はアカウント全体が `Error 002: Access to Bedrock models is not allowed for this account`（Nova でも、東京・バージニアでも同じ。SCP は既定のみ）で、Anthropic の利用目的フォームも「not authorized」。サポートケース 179284818700912（アカウントと請求 / Account / Other Account Issues、英語、ウェブ）で解除を依頼中。解除後に利用目的フォーム（個人開発者、GitHub の URL、Software as a Service、Internal users）を送り直す
 - [ ] Pod Identity のロールごとの権限（許した操作ができ、許していない操作が拒否される）を、クラスタの中で各 ServiceAccount の Pod から試す試験を `./lab test-audit` に足す（Mac からは IAM ロールを借りられないので今は省いている。変更設計書 10 章）（追加 2026-10-24、重要 中）
 - [ ] Codex 用のモデル（Bedrock Mantle の gpt-oss か GPT-5.x、Bedrock の Claude の変換経由、Azure OpenAI）を決める。決まるまで AWS でも `chatgpt/` を使う（トークンは EFS の PVC で共有）（追加 2026-10-24、重要 中）
 - [ ] 配備の後、AWS の試験の結果と費用の実測を変更設計書に書き足し、変更仕様書 12 章・変更設計書 12 章の表に従って `docs/spec.md` と `docs/design.md` に反映する（追加 2026-10-24、重要 中）
