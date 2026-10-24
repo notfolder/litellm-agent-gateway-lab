@@ -404,3 +404,149 @@ class PricingAndPinningTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AwsTargetTest(unittest.TestCase):
+    """LAB_TARGET=aws のときの描画（変更仕様書 2026-10-24-AWS構成 2.3 節）。local の振る舞いは上のテストで変わらないこと。"""
+
+    OUT = {"AuroraWriterEndpoint": "pg.cluster-x.ap-northeast-1.rds.amazonaws.com",
+           "AuroraSecretName": "litellm-lab/aurora", "ValkeyPrimaryEndpoint": "master.v.cache.amazonaws.com",
+           "ValkeyPort": "6379", "ValkeyAuthSecretName": "litellm-lab/valkey-auth",
+           "CertificateArn": "arn:aws:acm:ap-northeast-1:1:certificate/abc", "EfsFileSystemId": "fs-1"}
+
+    def aws(self, **extra):
+        e = env(LAB_TARGET="aws", LAB_AWS_HOSTNAME="lab.example.test", TYPESAFE_API_KEY="t", **extra)
+        e.values["LAB_AWS_BUCKET_PREFIX"] = render.bucket_prefix(e, "111111111111")
+        return e
+
+    def test_target_and_urls(self):
+        self.assertEqual(env().target, "local")
+        self.assertEqual(env().base_url, "http://localhost:8080")
+        a = self.aws()
+        self.assertTrue(a.is_aws)
+        self.assertEqual(a.base_url, "https://lab.example.test")
+        self.assertEqual(a.public_host, "lab.example.test")
+        self.assertEqual(a.aws_cluster_name, "litellm-lab-eks")
+        with self.assertRaises(Exception):
+            _ = env(LAB_TARGET="aws").aws_hostname   # ホスト名が無いと止まる
+
+    def test_bucket_names(self):
+        self.assertEqual(render.bucket_name(env(), "audit-raw"), "audit-raw")
+        self.assertEqual(render.bucket_prefix(env(), "1"), "")
+        a = self.aws()
+        self.assertEqual(render.bucket_name(a, "audit-raw"), "litellm-lab-111111111111-audit-raw")
+
+    def test_models_are_bedrock_and_jev_is_off(self):
+        cfg = render.litellm_config(self.aws(), has_chatgpt=False)
+        models = {m["model_name"]: m["litellm_params"] for m in cfg["model_list"]}
+        self.assertIn("claude-sonnet-4-5", models)
+        self.assertTrue(models["claude-sonnet-4-5"]["model"].startswith("bedrock/jp.anthropic.claude-sonnet-4-5"))
+        self.assertEqual(models["claude-sonnet-4-5"]["aws_region_name"], "ap-northeast-1")
+        self.assertNotIn("claude-opus-4-6", models)          # 日本内のプロファイルが無いので既定では登録しない
+        self.assertNotIn("anthropic/*", models)              # Claude Max のトークン転送は使わない
+        self.assertTrue(models["review-judge"]["model"].startswith("bedrock/jp.anthropic.claude-haiku-4-5"))
+        self.assertTrue(models["isolated-judge"]["model"].startswith("bedrock/jp.anthropic.claude-haiku-4-5"))
+        self.assertFalse(cfg["guardrails"][0]["litellm_params"]["use_jev"])   # Jev の鍵があっても使わない
+        # Codex の chatgpt/ はトークンがあれば Mac と同じ
+        cfg2 = render.litellm_config(self.aws(), has_chatgpt=True)
+        self.assertIn("gpt-5.6-terra", {m["model_name"] for m in cfg2["model_list"]})
+
+    def test_opus_can_be_added_by_env(self):
+        cfg = render.litellm_config(self.aws(LAB_BEDROCK_OPUS="global.anthropic.claude-opus-4-6-v1"), has_chatgpt=False)
+        self.assertIn("claude-opus-4-6", {m["model_name"] for m in cfg["model_list"]})
+        envs = render.claude_code_model_env(self.aws())
+        self.assertEqual(envs["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-sonnet-4-5")   # 無ければ Sonnet に落とす
+        self.assertEqual(envs["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "claude-haiku-4-5")
+
+    def test_helm_overrides(self):
+        local = render.helm_overrides(env(), "r", "t", "h")
+        self.assertIn("REDIS_SENTINEL_NODES", local["envVars"])
+        self.assertEqual(local["db"]["endpoint"], "litellm-pg-pooler-rw")
+        a = render.helm_overrides(self.aws(LAB_DB_POOLER="pooler"), "r", "t", "h", self.OUT)
+        ev = a["envVars"]
+        self.assertNotIn("REDIS_SENTINEL_NODES", ev)
+        self.assertEqual((ev["REDIS_HOST"], ev["REDIS_PORT"], ev["REDIS_SSL"]), (self.OUT["ValkeyPrimaryEndpoint"], "6379", "True"))
+        self.assertEqual(ev["AUDIT_S3_ENDPOINT"], "")
+        self.assertEqual(ev["AUDIT_S3_BUCKET"], "litellm-lab-111111111111-audit-raw")
+        self.assertEqual(ev["AUDIT_S3_CREDENTIAL_CHAIN"], "true")
+        self.assertNotIn("DATABASE_DISABLE_PREPARED_STATEMENTS", ev)    # AWS は直結のみ
+        self.assertEqual(a["db"]["endpoint"], self.OUT["AuroraWriterEndpoint"])
+        self.assertIn("sslmode=require", a["db"]["url"])
+        self.assertEqual(a["serviceAccount"], {"create": True, "name": "litellm"})
+        self.assertEqual(a["volumes"][0]["persistentVolumeClaim"]["claimName"], "chatgpt-token")
+
+    def test_external_secrets(self):
+        docs = list(yaml.safe_load_all(render.external_secrets_manifest(self.aws(GOOGLE_OAUTH_CLIENT_ID="g", GOOGLE_OAUTH_CLIENT_SECRET="s"), self.OUT)))
+        names = {d["metadata"]["name"] for d in docs}
+        self.assertEqual(names, {"litellm-secrets", "litellm-pg-app", "litellm-migrate-db", "audit-viewer-session",
+                                 "audit-viewer-oidc", "workspace-mcp"})
+        migrate = next(d for d in docs if d["metadata"]["name"] == "litellm-migrate-db")
+        url = migrate["spec"]["target"]["template"]["data"]["DATABASE_URL"]
+        self.assertIn("sslmode=require", url)
+        self.assertIn("urlquery", url)
+        self.assertEqual(migrate["spec"]["dataFrom"][0]["extract"]["key"], "litellm-lab/aurora")
+        lit = next(d for d in docs if d["metadata"]["name"] == "litellm-secrets")
+        self.assertEqual(lit["spec"]["data"][0]["remoteRef"]["key"], "litellm-lab/valkey-auth")
+        for d in docs:
+            self.assertEqual(d["spec"]["secretStoreRef"]["name"], render.ESO_STORE)
+
+    def test_alb_ingress_order_and_actions(self):
+        docs = list(yaml.safe_load_all(render.alb_ingress_manifest(self.aws(), self.OUT, viewer=True)))
+        ing = next(d for d in docs if d["kind"] == "Ingress")
+        ann = ing["metadata"]["annotations"]
+        self.assertEqual(json.loads(ann["alb.ingress.kubernetes.io/actions.deny-passthrough"])["fixedResponseConfig"]["statusCode"], "403")
+        self.assertEqual(json.loads(ann["alb.ingress.kubernetes.io/actions.mcp-get-not-allowed"])["fixedResponseConfig"]["statusCode"], "405")
+        paths = [p["path"] for p in ing["spec"]["rules"][0]["http"]["paths"]]
+        # 素通しの拒否 → MCP の GET → 検索アプリ → 残りは LiteLLM、の順
+        self.assertIn("/anthropic/*", paths)
+        self.assertLess(paths.index("/anthropic/*"), paths.index("/*/mcp"))
+        self.assertLess(paths.index("/*/mcp"), paths.index("/lab-audit/*"))
+        self.assertEqual(paths[-1], "/*")
+        self.assertTrue(all(f"/{p}/*" in paths for p in render.PASSTHROUGH_PROVIDERS))
+        params = next(d for d in docs if d["kind"] == "IngressClassParams")
+        self.assertEqual(params["spec"]["certificateARNs"], [self.OUT["CertificateArn"]])
+        without = list(yaml.safe_load_all(render.alb_ingress_manifest(self.aws(), self.OUT, viewer=False)))
+        self.assertNotIn("/lab-audit/*", [p["path"] for p in next(d for d in without if d["kind"] == "Ingress")["spec"]["rules"][0]["http"]["paths"]])
+
+    def test_traefik_regex_lists_the_same_providers(self):
+        # Traefik（k8s/ingress.yaml）の正規表現と ALB の一覧がずれない
+        text = (Path(__file__).resolve().parents[2] / "k8s" / "ingress.yaml").read_text()
+        import re
+        m = re.search(r"PathRegexp\(`\^/\((.+?)\)\(/\|\$\)`\)", text)
+        self.assertIsNotNone(m)
+        traefik = {p.replace("\\.", ".") for p in m.group(1).split("|")}
+        self.assertEqual(traefik, set(render.PASSTHROUGH_PROVIDERS))
+
+    def test_client_files_point_to_https_and_pin_models(self):
+        files = render.client_files(self.aws(LAB_USER1_EMAIL="a@example.com", LAB_KEY_USER1_CLAUDE="sk-c", LAB_KEY_USER1_CODEX="sk-x"),
+                                    "sk-c", "sk-x", Path("/tmp/c"), Path("/tmp/n"))
+        self.assertIn("export ANTHROPIC_BASE_URL='https://lab.example.test'", files["claude.env"])
+        self.assertIn("export ANTHROPIC_DEFAULT_SONNET_MODEL='claude-sonnet-4-5'", files["claude.env"])
+        self.assertIn("lab.example.test", files["claude-settings.json"])
+        self.assertIn('base_url = "https://lab.example.test/v1"', files["codex-config.toml"])
+        local = render.client_files(env(), "k", "k", Path("/tmp/c"), Path("/tmp/n"))
+        self.assertNotIn("ANTHROPIC_DEFAULT_SONNET_MODEL", local["claude.env"])
+
+    def test_initial_contracts(self):
+        c = render.initial_contracts(self.aws())
+        ids = {x["id"]: x for x in c["contracts"]}
+        self.assertEqual(ids["bedrock"]["kind"], "invoice")
+        self.assertIn("review-judge", ids["bedrock"]["models"])
+        self.assertEqual(ids["chatgpt-plus"]["models"], ["gpt-5.6-terra"])
+        self.assertIn("claude-max", {x["id"] for x in render.initial_contracts(env())["contracts"]})
+
+    def test_nodepool_and_efs_and_service_accounts(self):
+        np = yaml.safe_load(render.nodepool_manifest(self.aws()))
+        reqs = {r["key"]: r["values"] for r in np["spec"]["template"]["spec"]["requirements"]}
+        self.assertEqual(reqs["kubernetes.io/arch"], ["arm64"])
+        efs = list(yaml.safe_load_all(render.efs_manifests(self.OUT)))
+        self.assertEqual(efs[0]["parameters"]["fileSystemId"], "fs-1")
+        self.assertEqual(efs[1]["spec"]["accessModes"], ["ReadWriteMany"])
+        sas = list(yaml.safe_load_all(render.service_accounts_manifest()))
+        self.assertEqual({d["metadata"]["name"] for d in sas}, {"audit-compactor", "audit-viewer"})
+
+    def test_operator_principal_arn(self):
+        from labtool import aws
+        self.assertEqual(aws.operator_principal_arn({"Account": "1", "Arn": "arn:aws:sts::1:assumed-role/AWSReservedSSO_Admin_x/me"}),
+                         "arn:aws:iam::1:role/AWSReservedSSO_Admin_x")
+        self.assertEqual(aws.operator_principal_arn({"Account": "1", "Arn": "arn:aws:iam::1:user/me"}), "arn:aws:iam::1:user/me")

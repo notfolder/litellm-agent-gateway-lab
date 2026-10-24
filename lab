@@ -44,9 +44,9 @@ def rebuild() -> None:
 def test_failover(pooler: str | None, scenario: str) -> None:
     """障害の試験。--pooler を付けたら、その接続先に切り替えて試し、終わったら元に戻す。"""
     env = Env.load()
-    scenarios = failover.SCENARIOS if scenario == "all" else [scenario]
+    scenarios = failover.scenarios_for(env) if scenario == "all" else [scenario]
     original = env.get("LAB_DB_POOLER", "pooler")
-    switch = pooler is not None and pooler != original
+    switch = pooler is not None and pooler != original and not env.is_aws
     if switch:
         env.set("LAB_DB_POOLER", pooler)
         stages.litellm(env)
@@ -65,16 +65,16 @@ def stage(fn):
 
 COMMANDS: dict[str, tuple[str, object]] = {
     "up": ("全段階を順に流す（何度でも可）", up),
-    "down": ("クラスタを削除する（.env、ChatGPT のトークン、イメージの置き場は残す）", ops.down),
+    "down": ("クラスタを削除する（Mac: k3d。AWS: 計算資源のスタックだけ。S3・Aurora・秘密情報は残す）", ops.down),
     "rebuild": ("クラスタを削除して作り直す（所要時間を表示）", rebuild),
     "status": ("状態を表示する", stage(ops.status)),
     # 段階ごと
     "preflight": ("[段階] 前提の確認", stages.preflight),
-    "cluster": ("[段階] イメージの置き場、k3d クラスタ、Traefik", stage(stages.cluster)),
+    "cluster": ("[段階] Mac: イメージの置き場、k3d、Traefik。AWS: CDK の配備、kubeconfig、ESO", stage(stages.cluster)),
     "images": ("[段階] 検証用 LiteLLM イメージのビルドと push", stage(stages.images)),
-    "secrets": ("[段階] .env の生成と k8s の Secret", stage(stages.secrets_)),
-    "objectstore": ("[段階] オブジェクトストレージ（RustFS）、バケット、利用者と権限", stage(stages.objectstore)),
-    "datastores": ("[段階] PostgreSQL と Redis", stage(stages.datastores)),
+    "secrets": ("[段階] 秘密情報（Mac: .env → Secret。AWS: Secrets Manager → External Secrets）", stage(stages.secrets_)),
+    "objectstore": ("[段階] オブジェクトストレージ（Mac: RustFS を作る。AWS: S3 の検査）", stage(stages.objectstore)),
+    "datastores": ("[段階] PostgreSQL と Redis（AWS: Aurora と ElastiCache の確認）", stage(stages.datastores)),
     "mcp": ("[段階] 試験用の偽 LLM と google_workspace_mcp", stage(stages.mcp)),
     "litellm": ("[段階] プロキシ設定、LiteLLM（Helm）、入口", stage(stages.litellm)),
     "bootstrap": ("[段階] 検証ユーザーと固定値のキー", stage(stages.bootstrap)),
@@ -116,7 +116,9 @@ def main(argv: list[str]) -> int:
     judge_scope.add_argument("--isolated", action="store_true", help="文脈独立審査の事例だけを流す")
     parsers["test-failover"].add_argument("--pooler", choices=["pooler", "direct"],
                                           help="この接続先に切り替えて試す（終わったら元に戻す）")
-    parsers["test-failover"].add_argument("--scenario", default="all", choices=["all", *failover.SCENARIOS])
+    parsers["test-failover"].add_argument("--scenario", default="all",
+                                          choices=["all", *failover.SCENARIOS, *failover.SCENARIOS_AWS],
+                                          help="場面（Mac: pg-*, valkey-*。AWS: litellm-drain, aurora-failover, valkey-failover）")
     parsers["audit-synth"].add_argument("--days", type=int, default=7)
     parsers["audit-synth"].add_argument("--per-day", type=int, default=1_000_000)
     parsers["audit-compact"].add_argument("--hour", help="日本時間の時間（YYYY-MM-DDTHH）。省くと締まった時間をすべて")

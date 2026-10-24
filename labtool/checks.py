@@ -14,7 +14,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 from .core import (
-    KUBE_CONTEXT, NS, ROOT, Env, LabError, helm, http, http_ok, info, json_output, kn, ok, run, step, warn,
+    NS, ROOT, Env, LabError, helm, http, http_ok, info, json_output, kn, kube_context, ok, run, step, warn,
 )
 
 BAD = 'TOOL:shell:{"command":["git","push","origin","--delete","old-branch"]}'
@@ -271,10 +271,10 @@ def snapshot() -> list[str]:
             lines.append(f"{o['kind']} {m['name']} {field}")
     try:
         from . import objectstore
-        from .core import Env, port_forward
+        from .core import Env
         env = Env.load()
-        with port_forward("svc/rustfs", 9000) as endpoint:
-            lines += objectstore.snapshot(env, endpoint)
+        with objectstore.admin_s3(env) as s3:
+            lines += objectstore.snapshot(env, s3)
     except Exception as e:  # noqa: BLE001 オブジェクトストレージがまだ無い
         lines.append(f"objectstore unavailable: {type(e).__name__}")
     return sorted(lines)
@@ -310,7 +310,7 @@ def load(env: Env, vus: str, duration: str, scenario: str) -> None:
         "-e", f"VUS={vus}", "-e", f"DURATION={duration}", "-e", f"SCENARIO={scenario}",
         "grafana/k6:1.3.0", "run", "-",
     ], input=script, text=True).returncode
-    info(f"試験中の Pod 数の変化は kubectl --context {KUBE_CONTEXT} -n {NS} get hpa,pods -w で見られます")
+    info(f"試験中の Pod 数の変化は kubectl --context {kube_context()} -n {NS} get hpa,pods -w で見られます")
     if rc:
         raise LabError(f"負荷試験が失敗しました（終了コード {rc}）")
 

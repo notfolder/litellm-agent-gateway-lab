@@ -31,6 +31,19 @@ brew install uv k3d kubectl helm kubectl-cnpg
 | TypeSafe の API キー | [console.typesafe.ai](https://console.typesafe.ai) の Billing でクレジットを追加してから、API Keys でキーを作り、`.env` の `TYPESAFE_API_KEY` に入れる | 審査の一次判定（Jev） |
 | ChatGPT Plus のログイン | 先に ChatGPT の設定 →「セキュリティ」で、デバイスコードによるサインイン（Codex など）を有効にする。その後 `./lab chatgpt-login`、`./lab up` | Codex 用のモデル、2 つの審査の審査官（無いあいだは試験用の偽 LLM） |
 
+## AWS で動かす（`LAB_TARGET=aws`）
+
+同じコードを AWS（EKS Auto Mode、Aurora PostgreSQL、ElastiCache for Valkey、S3、Bedrock）でも動かせます。Mac の構成を置き換えるのではなく、両方を維持します（審査・監査・検索アプリの層は環境を知らず、違いは `./lab` の分岐と `cdk/` だけ。経緯は `.history/2026-10-24-AWS構成/`）。
+
+```bash
+brew install awscli            # kubeconfig の発行に要る。CDK は npx（Node）で動く
+aws configure sso              # プロファイルを作り、aws sso login --profile <名前>
+# .env: LAB_TARGET=aws、LAB_AWS_PROFILE=<名前>、LAB_AWS_HOSTNAME=<HTTPS のホスト名>
+./lab up                       # CDK の配備 → kubeconfig → イメージを ECR へ → Secrets Manager → LiteLLM → ALB
+```
+
+人が行うこと: Bedrock のモデルアクセス（Anthropic の Claude）を有効にする、ACM の検証用 CNAME（配備の途中で表示）と、ホスト名 → ALB の CNAME（`./lab litellm` が表示）を手持ちの DNS に足す。`./lab down` は計算資源（EKS、ALB）だけを消し、S3 の監査ログ・Aurora・秘密情報は残します。
+
 ## よく使うコマンド
 
 | コマンド | 内容 |
@@ -41,7 +54,7 @@ brew install uv k3d kubectl helm kubectl-cnpg
 | `./lab upgrade v1.x.y` | LiteLLM のローリング更新 |
 | `./lab test-unit` / `test-smoke` / `test-idempotency` / `test-load` | 試験 |
 | `./lab test-judge [--context \| --isolated]` | 審査官の事例試験（本物の審査官を呼ぶので ChatGPT の利用枠を使う。指定なしは両方の審査） |
-| `./lab test-failover [--pooler direct]` / `test-restore` | DB と Redis の障害の試験 / バックアップから任意の時点に戻す試験 |
+| `./lab test-failover [--pooler direct]` / `test-restore` | DB と Redis の障害の試験（AWS は `--scenario litellm-drain` / `aurora-failover` / `valkey-failover`） / バックアップから任意の時点に戻す試験 |
 | `./lab test-audit` | 監査ログの試験（記録、整形、検索アプリ、精算、改ざんの防止、退避と再送） |
 | `./lab audit-synth` / `audit-bench` / `audit-compact` | 検索の速さの試験用の合成データ / 速さの試験 / 監査ログの整形を手で流す |
 | `./lab review-log` | 審査の判定ログの集計 |

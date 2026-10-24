@@ -12,8 +12,10 @@ import time
 import urllib.error
 import urllib.request
 
+import contextlib
+
 from . import render
-from .core import Env, LabError, info, ok
+from .core import Env, LabError, info, ok, port_forward
 
 REGION = "us-east-1"
 
@@ -25,6 +27,58 @@ def s3_client(endpoint: str, access_key: str, secret_key: str):
     return boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=access_key,
                         aws_secret_access_key=secret_key, region_name=REGION,
                         config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 3}))
+
+
+@contextlib.contextmanager
+def admin_s3(env: Env):
+    """管理者としてバケットに触る S3 クライアント。Mac は RustFS に port-forward、AWS は操作者の資格情報で S3 に直接。"""
+    if env.is_aws:
+        from . import aws
+        yield aws.client(env, "s3")
+        return
+    with port_forward("svc/rustfs", 9000) as endpoint:
+        yield s3_client(endpoint, *admin_credentials(env))
+
+
+@contextlib.contextmanager
+def user_s3(env: Env, user: str):
+    """利用者（RustFS の静的キー）としてつなぐ S3 クライアント（Mac だけ）。"""
+    with port_forward("svc/rustfs", 9000) as endpoint:
+        yield s3_client(endpoint, *user_credentials(env, user))
+
+
+def check_buckets(env: Env, s3) -> None:
+    """AWS: バケット（CDK が作る）が仕様どおりかを確かめる。違えばエラーで止める（作り直しは CDK で）。"""
+    problems: list[str] = []
+    for logical, spec in render.s3_buckets(env).items():
+        if logical == render.PG_BACKUP:
+            continue   # Aurora のバックアップは RDS が持つので、このバケットは AWS では作らない
+        bucket = render.bucket_name(env, logical)
+        try:
+            s3.head_bucket(Bucket=bucket)
+        except Exception:  # noqa: BLE001
+            problems.append(f"{bucket}: バケットがありません")
+            continue
+        versioning = s3.get_bucket_versioning(Bucket=bucket).get("Status") == "Enabled"
+        if versioning != spec["versioning"]:
+            problems.append(f"{bucket}: バージョニングが {versioning}（仕様 {spec['versioning']}）")
+        locked, rule = _lock_rule(s3, bucket)
+        if spec["lock"] and not locked:
+            problems.append(f"{bucket}: Object Lock が無効です（後から有効にできないので、バケットを作り直す）")
+        elif spec["lock"] and rule != spec["lock"]:
+            problems.append(f"{bucket}: Object Lock の既定の保持が {rule}（仕様 {spec['lock']}）")
+        have = {(r["ID"], r.get("Expiration", {}).get("Days"), r.get("NoncurrentVersionExpiration", {}).get("NoncurrentDays"))
+                for r in _lifecycle_rules(s3, bucket)}
+        want = {(r["ID"], r.get("Expiration", {}).get("Days"), r.get("NoncurrentVersionExpiration", {}).get("NoncurrentDays"))
+                for r in spec["lifecycle"]}
+        if have != want:
+            problems.append(f"{bucket}: ライフサイクルが仕様と違います（{sorted(have)} / 仕様 {sorted(want)}）")
+        pab = s3.get_public_access_block(Bucket=bucket)["PublicAccessBlockConfiguration"]
+        if not all(pab.values()):
+            problems.append(f"{bucket}: パブリックアクセスの遮断が不完全です")
+        info(f"{bucket}: OK")
+    if problems:
+        raise LabError("S3 のバケットが仕様と違います:\n  " + "\n  ".join(problems))
 
 
 class Admin:
@@ -184,15 +238,21 @@ def self_check(env: Env, endpoint: str) -> None:
     ok(f"オブジェクトストレージの自己確認: {len(checks)} 件すべて期待どおり")
 
 
-def snapshot(env: Env, endpoint: str) -> list[str]:
-    """冪等性の試験用: バケットの設定と、利用者と権限を文字列の一覧にする。"""
-    s3 = s3_client(endpoint, *admin_credentials(env))
-    admin = Admin(endpoint, *admin_credentials(env))
+def snapshot(env: Env, s3) -> list[str]:
+    """冪等性の試験用: バケットの設定と、利用者と権限を文字列の一覧にする。
+    AWS では利用者は IAM（CDK が管理）なので、バケットの設定だけ。"""
     lines = []
-    for name in sorted(render.s3_buckets(env)):
+    for logical in sorted(render.s3_buckets(env)):
+        if env.is_aws and logical == render.PG_BACKUP:
+            continue
+        name = render.bucket_name(env, logical)
         lock = _lock_rule(s3, name)
         lines.append(f"bucket {name} versioning={s3.get_bucket_versioning(Bucket=name).get('Status')} "
                      f"lock={_canon(lock)} lifecycle={_canon(_lifecycle_rules(s3, name))}")
+    if env.is_aws:
+        return lines
+    endpoint = s3.meta.endpoint_url
+    admin = Admin(endpoint, *admin_credentials(env))
     users = json.loads(admin.must("GET", "/list-users") or "{}")
     for access, meta in sorted(users.items()):
         lines.append(f"s3user {access} policy={meta.get('policyName')} status={meta.get('status')}")

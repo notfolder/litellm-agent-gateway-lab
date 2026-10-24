@@ -30,7 +30,8 @@ ENV_FILE = ROOT / ".env"
 ENV_EXAMPLE = ROOT / ".env.example"
 
 CLUSTER = "litellm"
-KUBE_CONTEXT = f"k3d-{CLUSTER}"
+KUBE_CONTEXT = f"k3d-{CLUSTER}"          # Mac（k3d）。AWS は Env.load() が set_kube_context で差し替える
+AWS_KUBE_CONTEXT = "litellm-lab-aws"      # aws eks update-kubeconfig --alias で付ける名前
 NS = "litellm-lab"
 HELM_RELEASE = "litellm"
 LITELLM_CHART = "oci://ghcr.io/berriai/litellm-helm"
@@ -118,6 +119,10 @@ class Env:
         if not ENV_FILE.exists():
             raise LabError(".env がありません。./lab up（preflight）で作られます")
         env = cls(parse_env(ENV_FILE.read_text()))
+        if env.target not in ("local", "aws"):
+            raise LabError(f"LAB_TARGET は local か aws です（{env.target}）")
+        # kubectl / helm が向くクラスタを環境に合わせる（変更仕様書 2026-10-24-AWS構成 2.3 節）
+        set_kube_context(AWS_KUBE_CONTEXT if env.is_aws else f"k3d-{CLUSTER}")
         # 設定は .env だけから読む。コマンドの前に付けた値は効かないので、食い違えば知らせる
         shell = os.environ.get("LAB_NOREVIEW_KEYS", "").strip()
         if shell and shell.lower() != env.get("LAB_NOREVIEW_KEYS", "false").lower():
@@ -143,6 +148,15 @@ class Env:
 
     # ---- 決まる値 ----
     @property
+    def target(self) -> str:
+        """向ける環境: local（Mac の k3d）か aws（変更仕様書 2026-10-24-AWS構成 0.2 節）。"""
+        return self.get("LAB_TARGET", "local")
+
+    @property
+    def is_aws(self) -> bool:
+        return self.target == "aws"
+
+    @property
     def data_dir(self) -> Path:
         return Path(self.get("LAB_DATA_DIR", "/Volumes/SSD/litellm-lab"))
 
@@ -152,7 +166,40 @@ class Env:
 
     @property
     def base_url(self) -> str:
+        """クライアントとこのツールが使う入口。Mac は http://localhost:<port>、AWS は https://<ホスト名>。"""
+        if self.is_aws:
+            return f"https://{self.aws_hostname}"
         return f"http://localhost:{self.http_port}"
+
+    @property
+    def public_host(self) -> str:
+        """入口のホスト名（ポート付き）。Claude Code の信頼するドメインの記述に使う。"""
+        return self.aws_hostname if self.is_aws else f"localhost:{self.http_port}"
+
+    # ---- AWS（LAB_TARGET=aws のときだけ使う） ----
+    @property
+    def aws_hostname(self) -> str:
+        host = self.get("LAB_AWS_HOSTNAME")
+        if not host:
+            raise LabError("LAB_TARGET=aws には LAB_AWS_HOSTNAME（HTTPS のホスト名）が要ります")
+        return host
+
+    @property
+    def aws_region(self) -> str:
+        return self.get("LAB_AWS_REGION", "ap-northeast-1")
+
+    @property
+    def aws_profile(self) -> str:
+        return self.get("LAB_AWS_PROFILE")
+
+    @property
+    def aws_prefix(self) -> str:
+        """CloudFormation のスタック名、Secrets Manager の名前、ECR のリポジトリの接頭辞。"""
+        return self.get("LAB_AWS_STACK_PREFIX", "litellm-lab")
+
+    @property
+    def aws_cluster_name(self) -> str:
+        return f"{self.aws_prefix}-eks"
 
     @property
     def litellm_version(self) -> str:
@@ -229,10 +276,11 @@ def short_hash(data: str | bytes) -> str:
 
 # ---- 外部コマンド ----
 def run(cmd: list[str], *, check: bool = True, capture: bool = False, quiet: bool = False,
-        input: str | None = None, timeout: float | None = None) -> subprocess.CompletedProcess:
+        input: str | None = None, timeout: float | None = None, cwd: Path | None = None,
+        env_vars: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """外部コマンドを実行する。capture=True なら標準出力を文字列で返す。
-    quiet=True なら出力を捨てる。check=True で失敗したら LabError。"""
-    kwargs: dict = {"text": True, "input": input, "timeout": timeout}
+    quiet=True なら出力を捨てる。check=True で失敗したら LabError。cwd と env_vars は CDK や aws に渡す。"""
+    kwargs: dict = {"text": True, "input": input, "timeout": timeout, "cwd": cwd, "env": env_vars}
     if capture:
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
@@ -292,6 +340,16 @@ def wait_until(timeout: int, desc: str, check) -> None:
 
 
 # ---- Kubernetes ----
+def set_kube_context(name: str) -> None:
+    """kubectl / helm が向く context。Env.load() が環境（local / aws）に合わせて呼ぶ。"""
+    global KUBE_CONTEXT
+    KUBE_CONTEXT = name
+
+
+def kube_context() -> str:
+    return KUBE_CONTEXT
+
+
 def kc(*args: str) -> list[str]:
     return ["kubectl", "--context", KUBE_CONTEXT, *args]
 

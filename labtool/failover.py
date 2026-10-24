@@ -17,14 +17,17 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from .core import (
-    BUILD_DIR, KUBE_CONTEXT, NS, Env, LabError, info, json_output, kc, kn, ok, output, run, step, wait_until, warn,
+    BUILD_DIR, NS, Env, LabError, info, json_output, kc, kn, kube_context, ok, output, run, step, wait_until, warn,
 )
 
 SERVER_NODE = "k3d-litellm-server-0"
 PG_CLUSTER = "litellm-pg"
 SCENARIOS = ["pg-switchover", "pg-pod", "pg-node", "valkey-pod", "valkey-node"]
+# AWS の場面（変更仕様書 2026-10-24-AWS構成 7.2 節）: LiteLLM のノードの drain、Aurora と ElastiCache のフェイルオーバー
+SCENARIOS_AWS = ["litellm-drain", "aurora-failover", "valkey-failover"]
 # 回復までの時間の合格の目安（秒）。ノードを止める場面は長め（変更仕様書 9.3 節）
-LIMITS = {"pg-switchover": 60, "pg-pod": 60, "pg-node": 120, "valkey-pod": 60, "valkey-node": 120}
+LIMITS = {"pg-switchover": 60, "pg-pod": 60, "pg-node": 120, "valkey-pod": 60, "valkey-node": 120,
+          "litellm-drain": 60, "aurora-failover": 90, "valkey-failover": 90}
 # 直結（比較用）のときだけ、PostgreSQL の primary の切り替えと Pod の削除は 90 秒にする。Pooler は切り替えの間の要求を
 # 待たせて吸収する（2026-10-12 の実測で、どちらも失敗 0 件）が、直結では新しい primary が立つまでの 15〜50 秒が
 # そのまま失敗になり、最後の失敗まで 54〜77 秒だった（変更仕様書 9.3 節の目安を、1 回目の結果を見て見直した）
@@ -34,7 +37,7 @@ NODE_DOWN_SECONDS = 120
 
 def cnpg(*args: str) -> list[str]:
     """kubectl cnpg（プラグイン）。プラグインには、全体のフラグをプラグイン名の後ろに渡す。"""
-    return ["kubectl", "cnpg", "--context", KUBE_CONTEXT, "-n", NS, *args]
+    return ["kubectl", "cnpg", "--context", kube_context(), "-n", NS, *args]
 
 
 # ---- 負荷 ----
@@ -52,6 +55,7 @@ class Load:
 
     env: Env
     rate: int = 20
+    cleanup: object = None     # 場面の後片付け（AWS の drain の uncordon など）
     samples: list[Sample] = field(default_factory=list)
     _stop: threading.Event = field(default_factory=threading.Event)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -135,6 +139,13 @@ def litellm_restarts() -> dict[str, int]:
 
 
 def healthy(env: Env) -> bool:
+    if env.is_aws:
+        from . import aws
+        out = aws.load_outputs(env)
+        rds = aws.client(env, "rds").describe_db_clusters(DBClusterIdentifier=out["AuroraClusterIdentifier"])
+        g = aws.client(env, "elasticache").describe_replication_groups(
+            ReplicationGroupId=out["ValkeyReplicationGroupId"])["ReplicationGroups"][0]
+        return rds["DBClusters"][0]["Status"] == "available" and g["Status"] == "available"
     from .stages import sentinel_masters
     st = (json_output(kn("get", "cluster", PG_CLUSTER, "-o", "json"), default={}) or {}).get("status") or {}
     if st.get("readyInstances") != 3:
@@ -149,7 +160,8 @@ def healthy(env: Env) -> bool:
 
 
 def wait_healthy(env: Env, timeout: int = 600) -> None:
-    wait_until(timeout, "PostgreSQL 3 台と Valkey 3 台がそろい、primary が 1 台", lambda: healthy(env))
+    desc = "Aurora と ElastiCache が available" if env.is_aws else "PostgreSQL 3 台と Valkey 3 台がそろい、primary が 1 台"
+    wait_until(timeout, desc, lambda: healthy(env))
     run(kn("rollout", "status", "deploy/litellm", "--timeout=300s"), quiet=True)
 
 
@@ -194,6 +206,16 @@ def _stop_node(node: str, load: Load) -> None:
 
 def trigger(env: Env, scenario: str, load: Load) -> str:
     """場面を起こす。何をしたかの説明を返す。"""
+    if scenario in SCENARIOS_AWS:
+        from . import aws
+        out = aws.load_outputs(env)
+        if scenario == "litellm-drain":
+            node = aws.drain_litellm_node(env)
+            load.cleanup = lambda: aws.uncordon(node)
+            return f"LiteLLM の Pod が載ったノード {node} を drain"
+        if scenario == "aurora-failover":
+            return aws.aurora_failover(env, out)
+        return aws.valkey_failover(env, out)
     if scenario == "pg-switchover":
         primary = pg_primary()
         pods = output(kn("get", "pods", "-l", f"cnpg.io/cluster={PG_CLUSTER},cnpg.io/podRole=instance", "-o", "name"),
@@ -245,6 +267,8 @@ def run_scenario(env: Env, scenario: str) -> dict:
             if time.time() - t0 >= 60 and (last is None or time.time() - last >= 20):
                 break
         samples = list(load.samples)
+        if callable(load.cleanup):
+            load.cleanup()
     wait_healthy(env)
     restarts_after = litellm_restarts()
     fails = [s for s in samples if s.start >= t0 and s.status != 200]
@@ -252,19 +276,24 @@ def run_scenario(env: Env, scenario: str) -> dict:
     window = (max(s.start for s in fails) - min(s.start for s in fails)) if fails else 0.0
     repeated = {p: restarts_after[p] - restarts_before.get(p, 0) for p in restarts_after
                 if restarts_after[p] - restarts_before.get(p, 0) > 1}
-    roles = valkey_roles(env)
+    if env.is_aws:
+        from . import aws
+        out = aws.load_outputs(env)
+        masters, pg_after, vk_after = 1, aws.aurora_writer(env, out), aws.valkey_primary(env, out)
+    else:
+        masters, pg_after, vk_after = list(valkey_roles(env).values()).count("master"), pg_primary(), valkey_primary(env)
     result = {
         "scenario": scenario, "what": what, "requests": len([s for s in samples if s.start >= t0]),
         "failed": len(fails), "baseline_failed": baseline_fail,
         "statuses": sorted({s.status for s in fails}), "recovery_seconds": round(recovery, 1),
         "failure_window_seconds": round(window, 1), "limit_seconds": LIMITS[scenario],
-        "litellm_restart_loops": repeated, "valkey_masters": list(roles.values()).count("master"),
-        "pg_primary_after": pg_primary(), "valkey_primary_after": valkey_primary(env),
+        "litellm_restart_loops": repeated, "valkey_masters": masters,
+        "pg_primary_after": pg_after, "valkey_primary_after": vk_after,
         "call_ids": [s.call_id for s in samples if s.status == 200 and s.call_id],
         "t0": t0,
     }
     limit = (DIRECT_LIMITS.get(scenario, LIMITS[scenario]) if env.get("LAB_DB_POOLER", "pooler") == "direct"
-             else LIMITS[scenario])
+             and not env.is_aws else LIMITS[scenario])
     result["limit_seconds"] = limit
     result["passed"] = (recovery <= limit and not repeated and result["valkey_masters"] == 1
                         and baseline_fail == 0)
@@ -275,16 +304,26 @@ def run_scenario(env: Env, scenario: str) -> dict:
     return result
 
 
+def scenarios_for(env: Env) -> list[str]:
+    return SCENARIOS_AWS if env.is_aws else SCENARIOS
+
+
 def failover(env: Env, scenarios: list[str], audit_check=None) -> None:
     """障害の試験。audit_check(results) を渡すと、監査ログの欠けも照合する。"""
-    step(f"test-failover 障害の試験（DB の接続先: {env.get('LAB_DB_POOLER', 'pooler')}）")
+    bad = [x for x in scenarios if x not in scenarios_for(env)]
+    if bad:
+        raise LabError(f"LAB_TARGET={env.target} では使えない場面です: {', '.join(bad)}"
+                       f"（使える場面: {', '.join(scenarios_for(env))}）")
+    where = "AWS: Aurora に直結" if env.is_aws else f"DB の接続先: {env.get('LAB_DB_POOLER', 'pooler')}"
+    step(f"test-failover 障害の試験（{where}）")
     results = [run_scenario(env, s) for s in scenarios]
     if audit_check is not None:
         audit_check(results)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = BUILD_DIR / f"failover-{stamp}.json"
     summary = [{k: v for k, v in r.items() if k != "call_ids"} for r in results]
-    out.write_text(json.dumps({"db_pooler": env.get("LAB_DB_POOLER", "pooler"), "results": summary},
+    out.write_text(json.dumps({"target": env.target, "db_pooler": env.get("LAB_DB_POOLER", "pooler"),
+                               "results": summary},
                               ensure_ascii=False, indent=2) + "\n")
     info(f"結果: {out.relative_to(BUILD_DIR.parent)}")
     failed = [r["scenario"] for r in results if not r["passed"]]

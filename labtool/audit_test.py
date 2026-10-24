@@ -17,7 +17,7 @@ from urllib.parse import quote
 from . import objectstore as objstore
 from . import render
 from .core import (
-    Env, LabError, admin_api, info, json_output, kn, ok, output, port_forward, run, step, succeeds, wait_until, warn,
+    Env, LabError, admin_api, info, json_output, kn, ok, output, run, step, succeeds, wait_until, warn,
 )
 
 JST = timezone(timedelta(hours=9))
@@ -48,19 +48,28 @@ def call(method: str, url: str, headers: dict, body=None, timeout: float = 60) -
         return status, {k.lower(): v for k, v in hdrs.items()}, raw.decode("utf-8", "replace")
 
 
+# 実際のバケット名（aws では接頭辞が付く）。audit_test() の最初に Env から決める
+BUCKETS = {"raw": render.AUDIT_RAW, "access": render.AUDIT_ACCESS, "derived": render.AUDIT_DERIVED}
+
+
+def set_buckets(env: Env) -> None:
+    for k, logical in (("raw", render.AUDIT_RAW), ("access", render.AUDIT_ACCESS), ("derived", render.AUDIT_DERIVED)):
+        BUCKETS[k] = render.bucket_name(env, logical)
+
+
 def raw_records(s3, since: str) -> list[dict]:
     """原本（raw/meta）の記録のうち、記録の時刻が since（UTC の ISO 8601）以降のもの。"""
     rows: list[dict] = []
     token = None
     while True:
-        kw = {"Bucket": render.AUDIT_RAW, "Prefix": "raw/meta/"}
+        kw = {"Bucket": BUCKETS["raw"], "Prefix": "raw/meta/"}
         if token:
             kw["ContinuationToken"] = token
         res = s3.list_objects_v2(**kw)
         for o in res.get("Contents", []):
             if o["LastModified"].isoformat() < since[:19]:
                 continue
-            data = s3.get_object(Bucket=render.AUDIT_RAW, Key=o["Key"])["Body"].read()
+            data = s3.get_object(Bucket=BUCKETS["raw"], Key=o["Key"])["Body"].read()
             rows += [json.loads(x) for x in gzip.decompress(data).decode().splitlines() if x.strip()]
         if not res.get("IsTruncated"):
             break
@@ -145,6 +154,10 @@ def _cleanup_test_user(env: Env, key: str) -> None:
 
 
 def audit_test(env: Env) -> None:
+    set_buckets(env)
+    if env.is_aws and not env.get("LITELLM_MASTER_KEY"):
+        from . import aws
+        aws.load_app_secret(env)
     global TEST_USER
     step("test-audit 監査ログの試験")
     TEST_USER = f"audit-test-{time.strftime('%Y%m%d%H%M%S')}@example.com"
@@ -194,8 +207,7 @@ def audit_test(env: Env) -> None:
                 all(v["status"] == 200 for v in sent.values()) and all(ids.values()))
         time.sleep(flush * 2 + 5)
 
-        with port_forward("svc/rustfs", 9000) as endpoint:
-            s3 = objstore.s3_client(endpoint, *objstore.admin_credentials(env))
+        with objstore.admin_s3(env) as s3:
             rows = raw_records(s3, since)
             by_id = {r.get("call_id"): r for r in rows if r.get("type") == "request"}
             reviews = [r for r in rows if r.get("type") == "review"]
@@ -254,13 +266,18 @@ def audit_test(env: Env) -> None:
                 return False
 
             key0 = by_id[ids["chat"]]["body"]["key"]
-            ver = s3.head_object(Bucket=render.AUDIT_RAW, Key=key0).get("VersionId")
-            writer = objstore.s3_client(endpoint, *objstore.user_credentials(env, "litellm-writer"))
-            viewer = objstore.s3_client(endpoint, *objstore.user_credentials(env, "audit-viewer"))
-            c.check("原本は、書き込み用・検索アプリの資格情報では消せない",
-                    lambda: denied(writer, render.AUDIT_RAW, key0, ver) and denied(viewer, render.AUDIT_RAW, key0, ver))
+            raw_bucket = render.bucket_name(env, render.AUDIT_RAW)
+            ver = s3.head_object(Bucket=raw_bucket, Key=key0).get("VersionId")
+            if env.is_aws:
+                # AWS の利用者は IAM ロール（Pod Identity）で、Mac からは借りられない。ロールごとの検査はクラスタの中で
+                # 行う（変更仕様書 2026-10-24-AWS構成 7.2 節。別の試験）。ここでは管理者の資格情報だけで確かめる
+                warn("AWS: 書き込み用・検索アプリのロールで消せないことの検査は、クラスタの中の試験で行います（省略）")
+            else:
+                with objstore.user_s3(env, "litellm-writer") as writer, objstore.user_s3(env, "audit-viewer") as viewer:
+                    c.check("原本は、書き込み用・検索アプリの資格情報では消せない",
+                            lambda: denied(writer, raw_bucket, key0, ver) and denied(viewer, raw_bucket, key0, ver))
             c.check("原本は、管理者でも保持の回避を指定しなければ消せない",
-                    lambda: denied(s3, render.AUDIT_RAW, key0, ver))
+                    lambda: denied(s3, raw_bucket, key0, ver))
 
             # 整形と検索アプリ
             compact_now(env)
@@ -303,10 +320,10 @@ def audit_test(env: Env) -> None:
             st5, _, views = call("GET", f"{base}/lab-audit/api/views?start={today}&end={today}", admin_sess)
             c.check("本文を開くと閲覧の記録が増える（監査担当・管理者が見られる）", lambda: st5 == 200 and any(
                 v.get("call_id") == ids["chat"] and v.get("viewer_email") == TEST_USER for v in views["rows"]))
-            vkeys = [o["Key"] for o in s3.list_objects_v2(Bucket=render.AUDIT_ACCESS, Prefix="view/").get(
+            vkeys = [o["Key"] for o in s3.list_objects_v2(Bucket=BUCKETS["access"], Prefix="view/").get(
                 "Contents", [])]
-            c.check("閲覧の記録も消せない", lambda: vkeys and denied(s3, render.AUDIT_ACCESS, vkeys[-1],
-                                                                    s3.head_object(Bucket=render.AUDIT_ACCESS,
+            c.check("閲覧の記録も消せない", lambda: vkeys and denied(s3, BUCKETS["access"], vkeys[-1],
+                                                                    s3.head_object(Bucket=BUCKETS["access"],
                                                                                    Key=vkeys[-1]).get("VersionId")))
 
             # 精算（円の請求の単位、利用者なし、審査の分の付け方）
@@ -355,20 +372,23 @@ def audit_test(env: Env) -> None:
             c.check(f"ローリング更新の間の要求 {len(roll_ids)} 件がすべて記録される（欠け {len(missing)} 件）",
                     not missing and roll_ids)
 
-        # S3 に書けないとき: 退避して、戻ったら再送する（RustFS を止めるので port-forward の外で）
-        info("RustFS を止めて要求を送り、戻してから再送を確かめます")
-        run(kn("scale", "statefulset/rustfs", "--replicas=0"), quiet=True)
-        run(kn("wait", "--for=delete", "pod/rustfs-0", "--timeout=120s"), quiet=True, check=False)
-        down_ids = [send("chat", f"while-s3-down {i}") for i in range(5)]
-        time.sleep(flush * 2 + 5)
-        run(kn("scale", "statefulset/rustfs", "--replicas=1"), quiet=True)
-        run(kn("rollout", "status", "statefulset/rustfs", "--timeout=180s"), quiet=True)
-        time.sleep(75)   # 退避の再送は 30 秒ごと
-        with port_forward("svc/rustfs", 9000) as endpoint:
-            s3 = objstore.s3_client(endpoint, *objstore.admin_credentials(env))
-            got = {r.get("call_id") for r in raw_records(s3, since)}
-        c.check("S3 に書けない間の要求は退避され、戻ると再送されて欠けが 0 件",
-                lambda: all(sent[x]["status"] == 200 for x in down_ids) and all(x in got for x in down_ids))
+        # S3 に書けないとき: 退避して、戻ったら再送する（RustFS を止めるので port-forward の外で）。
+        # AWS の S3 は止められないので Mac だけ（退避と再送の作り自体は環境を知らない）
+        if env.is_aws:
+            warn("AWS: S3 を止めて退避と再送を確かめる試験は、Mac（RustFS）だけで行います（省略）")
+        else:
+            info("RustFS を止めて要求を送り、戻してから再送を確かめます")
+            run(kn("scale", "statefulset/rustfs", "--replicas=0"), quiet=True)
+            run(kn("wait", "--for=delete", "pod/rustfs-0", "--timeout=120s"), quiet=True, check=False)
+            down_ids = [send("chat", f"while-s3-down {i}") for i in range(5)]
+            time.sleep(flush * 2 + 5)
+            run(kn("scale", "statefulset/rustfs", "--replicas=1"), quiet=True)
+            run(kn("rollout", "status", "statefulset/rustfs", "--timeout=180s"), quiet=True)
+            time.sleep(75)   # 退避の再送は 30 秒ごと
+            with objstore.admin_s3(env) as s3:
+                got = {r.get("call_id") for r in raw_records(s3, since)}
+            c.check("S3 に書けない間の要求は退避され、戻ると再送されて欠けが 0 件",
+                    lambda: all(sent[x]["status"] == 200 for x in down_ids) and all(x in got for x in down_ids))
 
         # MCP（Gmail。ユーザー 1 が Gmail にサインインしているときだけ確かめられる）
         mcp_check(env, c, since)
@@ -383,8 +403,7 @@ def audit_test(env: Env) -> None:
             return (int(md.get("total_api_requests") or 0), int(md.get("total_prompt_tokens") or 0),
                     int(md.get("total_completion_tokens") or 0))
 
-        with port_forward("svc/rustfs", 9000) as endpoint:
-            s3 = objstore.s3_client(endpoint, *objstore.admin_credentials(env))
+        with objstore.admin_s3(env) as s3:
             mine_rows = [r for r in raw_records(s3, since) if r.get("type") == "request"
                          and r.get("user_email") == TEST_USER]
         expect = (len(mine_rows), sum(r["tokens_in"] for r in mine_rows), sum(r["tokens_out"] for r in mine_rows))
@@ -406,7 +425,7 @@ def audit_test(env: Env) -> None:
 
 def objstore_read_body(s3, body: dict) -> dict:
     start, length = int(body["offset"]), int(body["length"])
-    data = s3.get_object(Bucket=render.AUDIT_RAW, Key=body["key"],
+    data = s3.get_object(Bucket=BUCKETS["raw"], Key=body["key"],
                          Range=f"bytes={start}-{start + length - 1}")["Body"].read()
     return json.loads(gzip.decompress(data))
 
@@ -429,8 +448,7 @@ def mcp_check(env: Env, c: Checks, since: str) -> None:
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",
         "params": {"name": label_tool, "arguments": {"user_google_email": env.get("LAB_USER1_EMAIL")}}})
     time.sleep(float(env.get("LAB_AUDIT_FLUSH_SECONDS", "10")) * 2 + 5)
-    with port_forward("svc/rustfs", 9000) as endpoint:
-        s3 = objstore.s3_client(endpoint, *objstore.admin_credentials(env))
+    with objstore.admin_s3(env) as s3:
         mcp = [r for r in raw_records(s3, since) if r.get("type") == "mcp"]
     c.check(f"MCP のツールの呼び出しが、ツール名と引数とともに記録される（{len(mcp)} 件）",
             lambda: any(r.get("mcp_server") == "gmail" and r.get("mcp_tool") and r.get("mcp_arguments_head")
@@ -458,8 +476,7 @@ def failover_audit_check(env: Env):
     def check(results: list[dict]) -> None:
         since = min(datetime.fromtimestamp(r["t0"] - 30, tz=timezone.utc) for r in results)
         time.sleep(flush * 2 + 5)
-        with port_forward("svc/rustfs", 9000) as endpoint:
-            s3 = objstore.s3_client(endpoint, *objstore.admin_credentials(env))
+        with objstore.admin_s3(env) as s3:
             got = {r.get("call_id") for r in raw_records(s3, since.isoformat().replace("+00:00", "Z"))}
         for r in results:
             missing = [cid for cid in r["call_ids"] if cid not in got]

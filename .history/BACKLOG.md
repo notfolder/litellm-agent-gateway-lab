@@ -34,11 +34,14 @@
 概要: .history/2026-10-24-AWS構成/変更仕様書.md（ブランチ `feature/aws-target`）
 
 - [ ] 変更仕様書の「13. 前提」（リージョン東京、検証の AWS 環境は GOVERNANCE と Google SSO）をユーザーに確認し、確定したら 0.2 の決定事項に移す（追加 2026-10-24、重要 高）
-- [ ] 変更設計書 `.history/2026-10-24-AWS構成/変更設計書.md` を書く（CDK のスタックの分け方、インスタンスの種類と費用の概算、labtool の `LAB_TARGET` の分岐、Helm の values の骨格、`chatgpt/` のトークンの置き場、test-failover の AWS 版。変更仕様書 10 章の一覧）（追加 2026-10-24、重要 高）
-- [ ] Codex 用のモデル（Bedrock Mantle の gpt-oss か GPT-5.x、Bedrock の Claude の変換経由、Azure OpenAI）を決める。決まるまで AWS でも `chatgpt/` を使う（追加 2026-10-24、重要 中）
-- [ ] 実装: `LAB_TARGET` の切り替え、`cdk/`、S3 の資格情報チェーンの分岐（`apps/audit/audit/common.py`、`litellm/guardrails/audit_log.py`、`labtool/objectstore.py`）、External Secrets Operator、ALB の Ingress、Bedrock のモデル登録。`LAB_TARGET=local` で既存の試験が全部通ることを先に確かめる（追加 2026-10-24、重要 中）
-- [ ] 試験: 変更仕様書 7.2 の AWS だけの項目（drain、Aurora と ElastiCache のフェイルオーバー、復元、Pod Identity の権限、計算資源の作り直し、Haiku 4.5 の審査官の評価セット）（追加 2026-10-24、重要 中）
-- [ ] 実装と試験の後、変更仕様書 12 章の表に従って `docs/spec.md` と `docs/design.md` に反映する（追加 2026-10-24、重要 中）
+  - 2026-10-24: 回答待ちのまま実装に入った。コードは東京・GOVERNANCE・Google SSO の前提（`.env` で変えられる）
+- [ ] AWS に配備して試す（資格情報の用意が先。手順は変更設計書 7 章）: `LAB_TARGET=aws` で `./lab up` → `test-smoke` → `test-idempotency` → `test-audit` → `test-failover`（litellm-drain、aurora-failover、valkey-failover）→ `test-judge`（Haiku 4.5 の審査官の評価セットの差を記録）→ `./lab down` で計算資源を消して作り直し、S3 と Aurora のデータが残ることを確かめる（追加 2026-10-24、重要 高）
+- [ ] Pod Identity のロールごとの権限（許した操作ができ、許していない操作が拒否される）を、クラスタの中で各 ServiceAccount の Pod から試す試験を `./lab test-audit` に足す（Mac からは IAM ロールを借りられないので今は省いている。変更設計書 10 章）（追加 2026-10-24、重要 中）
+- [ ] Codex 用のモデル（Bedrock Mantle の gpt-oss か GPT-5.x、Bedrock の Claude の変換経由、Azure OpenAI）を決める。決まるまで AWS でも `chatgpt/` を使う（トークンは EFS の PVC で共有）（追加 2026-10-24、重要 中）
+- [ ] 配備の後、AWS の試験の結果と費用の実測を変更設計書に書き足し、変更仕様書 12 章・変更設計書 12 章の表に従って `docs/spec.md` と `docs/design.md` に反映する（追加 2026-10-24、重要 中）
+- [ ] ElastiCache の `durability: sync` が `cache.t4g.micro` で使えるか配備で確かめる（使えなければノードの種類を上げる）（追加 2026-10-24、重要 低）
+- [x] (2026-10-24) 変更設計書 `.history/2026-10-24-AWS構成/変更設計書.md` を書く
+- [x] (2026-10-24) 実装: `LAB_TARGET` の切り替え、`labtool/aws.py`、`cdk/`、S3 の資格情報チェーンとバケット名の接頭辞、ESO、ALB の Ingress、Bedrock のモデル登録、障害試験の AWS の場面。単体テスト（labtool 52、監査 19、監査ログ 12）と CDK の synth が通り、Mac の `./lab up` を流し直して確認
 
 ## 冗長化と監査ログ
 概要: .history/2026-10-12-0741-検証環境の構築と冗長化・監査ログ/summary.md

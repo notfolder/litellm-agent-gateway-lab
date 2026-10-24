@@ -11,3 +11,8 @@ clients/out/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# CDK（AWS 環境）の生成物と仮想環境
+cdk/cdk.out/
+cdk/.venv/
+cdk/cdk.context.json

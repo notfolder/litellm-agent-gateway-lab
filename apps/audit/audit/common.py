@@ -12,7 +12,10 @@ from decimal import ROUND_DOWN, Decimal
 from urllib.parse import urlparse
 
 JST = timezone(timedelta(hours=9))
-RAW, ACCESS, DERIVED = "audit-raw", "audit-access", "audit-derived"
+# バケット名。AWS では全世界で一意にするため、接頭辞（AUDIT_S3_BUCKET_PREFIX。例 "litellm-lab-123456789012-"）を付ける。
+# Mac の RustFS では空（変更仕様書 2026-10-24-AWS構成 3.3 節）
+_BUCKET_PREFIX = os.environ.get("AUDIT_S3_BUCKET_PREFIX", "")
+RAW, ACCESS, DERIVED = (_BUCKET_PREFIX + "audit-raw", _BUCKET_PREFIX + "audit-access", _BUCKET_PREFIX + "audit-derived")
 
 
 # ---- 設定 ----
@@ -26,26 +29,44 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
+        # 接続先が空なら AWS S3（既定のエンドポイント）。Mac の RustFS は http://rustfs:9000
         return cls(endpoint=os.environ.get("AUDIT_S3_ENDPOINT", "http://rustfs:9000"),
                    region=os.environ.get("AUDIT_S3_REGION", "us-east-1"),
                    access_key=os.environ.get("AUDIT_S3_ACCESS_KEY", ""),
                    secret_key=os.environ.get("AUDIT_S3_SECRET_KEY", ""),
                    data_prefix=os.environ.get("AUDIT_DATA_PREFIX", ""))
 
+    @property
+    def static_keys(self) -> bool:
+        """静的なアクセスキーが設定されているか。無ければ boto3 の既定の資格情報チェーン（EKS Pod Identity など）を使う。"""
+        return bool(self.access_key and self.secret_key)
+
     def s3(self):
         import boto3
         from botocore.config import Config as BotoConfig
-        return boto3.client("s3", endpoint_url=self.endpoint, region_name=self.region,
-                            aws_access_key_id=self.access_key, aws_secret_access_key=self.secret_key,
-                            config=BotoConfig(s3={"addressing_style": "path"}, retries={"max_attempts": 3}))
+        kwargs: dict = {"region_name": self.region, "config": BotoConfig(retries={"max_attempts": 3})}
+        if self.endpoint:
+            # S3 互換ストレージ（RustFS など）はパス形式。接続先が無ければ AWS S3 の既定（仮想ホスト形式）
+            kwargs["endpoint_url"] = self.endpoint
+            kwargs["config"] = BotoConfig(s3={"addressing_style": "path"}, retries={"max_attempts": 3})
+        if self.static_keys:
+            kwargs.update(aws_access_key_id=self.access_key, aws_secret_access_key=self.secret_key)
+        return boto3.client("s3", **kwargs)
 
     def duckdb_secret_sql(self) -> str:
-        """DuckDB の S3 の接続（接続先などは設定から組み立てる。変更設計書 6.1 節）。"""
-        u = urlparse(self.endpoint)
-        host = u.netloc or u.path
-        ssl = "true" if u.scheme == "https" else "false"
-        return (f"CREATE OR REPLACE SECRET lab_s3 (TYPE s3, KEY_ID '{self.access_key}', SECRET '{self.secret_key}', "
-                f"ENDPOINT '{host}', URL_STYLE 'path', USE_SSL {ssl}, REGION '{self.region}')")
+        """DuckDB の S3 の接続（接続先などは設定から組み立てる。変更設計書 6.1 節）。
+        静的キーが無ければ DuckDB にも資格情報チェーン（環境変数、EKS Pod Identity など）を使わせる。"""
+        parts = ["TYPE s3", f"REGION '{self.region}'"]
+        if self.static_keys:
+            parts += [f"KEY_ID '{self.access_key}'", f"SECRET '{self.secret_key}'"]
+        else:
+            parts.append("PROVIDER credential_chain")
+        if self.endpoint:
+            u = urlparse(self.endpoint)
+            host = u.netloc or u.path
+            ssl = "true" if u.scheme == "https" else "false"
+            parts += [f"ENDPOINT '{host}'", "URL_STYLE 'path'", f"USE_SSL {ssl}"]
+        return f"CREATE OR REPLACE SECRET lab_s3 ({', '.join(parts)})"
 
 
 def duckdb_connect(cfg: Config, memory_limit: str | None = None):

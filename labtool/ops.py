@@ -14,9 +14,21 @@ from .core import (
 
 
 def down() -> None:
-    """クラスタを削除する。DB（クラスタ内）は消える。
-    残すもの: .env、ChatGPT のトークン（LAB_DATA_DIR）、イメージの置き場（自作イメージと Docker Hub のキャッシュ）。"""
+    """Mac: クラスタを削除する。DB（クラスタ内）は消える。
+    残すもの: .env、ChatGPT のトークン（LAB_DATA_DIR）、イメージの置き場（自作イメージと Docker Hub のキャッシュ）。
+    AWS: 計算資源（ALB、EKS）だけを消す。S3 の監査ログ、Aurora、Secrets Manager、ECR、証明書は残す
+    （変更仕様書 2026-10-24-AWS構成 6 章）。"""
     step("down クラスタの削除")
+    env = Env.load()
+    if env.is_aws:
+        from . import aws
+        # Ingress を先に消して ALB を片付けさせる（残っていると compute のスタックの削除が止まる）
+        if succeeds(kn("get", "ingress", "litellm")):
+            info("ALB の入口（Ingress）を消します")
+            run(kn("delete", "ingress", "litellm", "--wait=true", "--timeout=300s"), check=False)
+        aws.destroy(env, ["compute"])
+        ok(f"計算資源のスタック {env.aws_prefix}-compute を削除しました（S3、Aurora、秘密情報は残っています）")
+        return
     if cluster_exists():
         run(["k3d", "cluster", "delete", CLUSTER])
         ok(f"クラスタ {CLUSTER} を削除しました")
@@ -27,7 +39,11 @@ def down() -> None:
 def status(env: Env) -> None:
     """状態の表示（何も変更しない）。"""
     step("status 状態")
-    if not cluster_exists():
+    if env.is_aws:
+        if not succeeds(kn("get", "ns"), timeout=60):
+            warn(f"EKS {env.aws_cluster_name} に届きません（./lab up で作るか、aws sso login でサインインします）")
+            return
+    elif not cluster_exists():
         warn(f"クラスタ {CLUSTER} はありません（./lab up で作ります）")
         return
     run(kn("get", "pods", "-o", "wide"), check=False)
@@ -37,6 +53,7 @@ def status(env: Env) -> None:
         return "あり" if v else "なし"
 
     print(f"""
+環境:            {env.target}
 入口:            {env.base_url}（管理画面 {env.base_url}/ui）
 Google OAuth:    {yn(env.has_google())}   → SSO と Gmail の MCP
 Jev の API キー: {yn(env.has_jev())}      → 一次判定（LAB_USE_JEV={env.get('LAB_USE_JEV', 'true')}）
@@ -65,6 +82,9 @@ def clean_all(assume_yes: bool) -> None:
     """クラスタ、生成したクライアント設定、ビルドした LiteLLM イメージを消す。
     残すもの: .env、ChatGPT のトークン、イメージの置き場（Docker Hub のキャッシュを含む）。"""
     step("clean-all 全削除")
+    if Env.load().is_aws:
+        raise LabError("LAB_TARGET=aws では clean-all は使えません。計算資源は ./lab down、データのスタックは "
+                       "cdk destroy を手で流してください（監査ログのバケットは Object Lock で消せません）")
     print(f"""次を削除します:
   - クラスタ {CLUSTER}（DB を含む）
   - clients/out/、.codex-lab/、.codex-lab-noreview/、.build/

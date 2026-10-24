@@ -235,7 +235,11 @@ class AuditLogger(CustomLogger):
         self.spool = Path(os.environ.get("AUDIT_SPOOL_DIR", "/var/lib/audit-spool"))
         self.spool_limit = int(os.environ.get("AUDIT_SPOOL_LIMIT_BYTES", str(900 * 1024 * 1024)))
         self.pod = os.environ.get("HOSTNAME") or socket.gethostname()
-        self.enabled = bool(self.endpoint and self.access_key and self.secret_key)
+        # 資格情報: 静的キー（Mac の RustFS）か、boto3 の既定の資格情報チェーン（AWS の EKS Pod Identity。
+        # AUDIT_S3_CREDENTIAL_CHAIN=true で明示する）。どちらも無ければ書かない。接続先が空なら AWS S3
+        self.static_keys = bool(self.access_key and self.secret_key)
+        self.credential_chain = os.environ.get("AUDIT_S3_CREDENTIAL_CHAIN", "").lower() == "true"
+        self.enabled = bool(self.bucket) and (self.static_keys or self.credential_chain)
         self.buffer = Buffer(self.pod)
         self.lock = threading.Lock()
         self.upload_lock = threading.Lock()
@@ -290,10 +294,16 @@ class AuditLogger(CustomLogger):
         if self._client is None:
             import boto3
             from botocore.config import Config
-            self._client = boto3.client("s3", endpoint_url=self.endpoint, region_name=self.region,
-                                        aws_access_key_id=self.access_key, aws_secret_access_key=self.secret_key,
-                                        config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 2},
-                                                      connect_timeout=5, read_timeout=30))
+            kwargs: dict = {"region_name": self.region,
+                            "config": Config(retries={"max_attempts": 2}, connect_timeout=5, read_timeout=30)}
+            if self.endpoint:
+                # S3 互換ストレージ（RustFS など）はパス形式。接続先が無ければ AWS S3 の既定（仮想ホスト形式）
+                kwargs["endpoint_url"] = self.endpoint
+                kwargs["config"] = Config(s3={"addressing_style": "path"}, retries={"max_attempts": 2},
+                                          connect_timeout=5, read_timeout=30)
+            if self.static_keys:
+                kwargs.update(aws_access_key_id=self.access_key, aws_secret_access_key=self.secret_key)
+            self._client = boto3.client("s3", **kwargs)
         return self._client
 
     def _put(self, key: str, data: bytes) -> None:

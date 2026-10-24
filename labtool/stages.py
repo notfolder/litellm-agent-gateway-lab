@@ -6,6 +6,7 @@ import json
 import shutil
 import sys
 
+from . import aws
 from . import objectstore as objstore
 from . import render
 from .core import (
@@ -31,6 +32,8 @@ CNPG = {"repo": "https://cloudnative-pg.github.io/charts", "chart": "cloudnative
 BARMAN_PLUGIN_VERSION = "v0.15.1"
 BARMAN_PLUGIN_URL = ("https://github.com/cloudnative-pg/plugin-barman-cloud/releases/download/"
                      f"{BARMAN_PLUGIN_VERSION}/manifest.yaml")
+# AWS 環境だけ: Secrets Manager → Secret の同期（External Secrets Operator。変更仕様書 2026-10-24-AWS構成 0.2 節）
+ESO = {"repo": "https://charts.external-secrets.io", "chart": "external-secrets", "version": "2.14.0"}
 USER_KEYS = ["LAB_KEY_USER1_CLAUDE", "LAB_KEY_USER1_CODEX", "LAB_KEY_USER2_CLAUDE", "LAB_KEY_USER2_CODEX"]
 # 審査を外したキー（ユーザー 1 の検証用。LAB_NOREVIEW_KEYS=true のときだけ作る。docs/manual-check.md）
 NOREVIEW_KEYS = ["LAB_KEY_USER1_CLAUDE_NOREVIEW", "LAB_KEY_USER1_CODEX_NOREVIEW"]
@@ -39,17 +42,19 @@ NOREVIEW_KEYS = ["LAB_KEY_USER1_CLAUDE_NOREVIEW", "LAB_KEY_USER1_CODEX_NOREVIEW"
 def preflight() -> Env:
     """前提の確認。何も変更しない（.env が無いときに雛形からコピーすることだけを行う）。"""
     step("preflight 前提の確認")
-    require_commands("docker", "k3d", "kubectl", "helm")
-    if not succeeds(["kubectl", "cnpg", "version"]):
-        raise LabError("kubectl cnpg（CloudNativePG のプラグイン）がありません。brew install kubectl-cnpg で入れてください")
-    if not succeeds(["docker", "info"]):
-        raise LabError("Docker が動いていません。OrbStack を起動してください")
-
     if not ENV_FILE.exists():
         shutil.copyfile(ENV_EXAMPLE, ENV_FILE)
         ENV_FILE.chmod(0o600)
         info(".env を .env.example から作りました")
     env = Env.load()
+    if env.is_aws:
+        _preflight_aws(env)
+    else:
+        require_commands("docker", "k3d", "kubectl", "helm")
+        if not succeeds(["kubectl", "cnpg", "version"]):
+            raise LabError("kubectl cnpg（CloudNativePG のプラグイン）がありません。brew install kubectl-cnpg で入れてください")
+    if not succeeds(["docker", "info"]):
+        raise LabError("Docker が動いていません。OrbStack を起動してください")
 
     # 外付け SSD（LAB_DATA_DIR の親）がつながっているか
     if not env.data_dir.parent.is_dir():
@@ -57,9 +62,10 @@ def preflight() -> Env:
                        "（外付け SSD がつながっているか確かめてください）")
     (env.data_dir / "chatgpt").mkdir(parents=True, exist_ok=True)
 
-    port_busy = succeeds(["lsof", "-nP", f"-iTCP:{env.http_port}", "-sTCP:LISTEN"])
-    if port_busy and not cluster_exists():
-        raise LabError(f"ポート {env.http_port} が別のプロセスに使われています（.env の LAB_HTTP_PORT を変えてください）")
+    if not env.is_aws:
+        port_busy = succeeds(["lsof", "-nP", f"-iTCP:{env.http_port}", "-sTCP:LISTEN"])
+        if port_busy and not cluster_exists():
+            raise LabError(f"ポート {env.http_port} が別のプロセスに使われています（.env の LAB_HTTP_PORT を変えてください）")
 
     # 手作業の準備の状況（無くても構築は進む。該当する機能だけ無効になる）
     for present, good, bad in [
@@ -71,8 +77,20 @@ def preflight() -> Env:
          "ChatGPT のトークンがありません。./lab chatgpt-login で取得するまで、Codex と二次判定は動きません"),
     ]:
         ok(good) if present else warn(bad)
-    ok("前提の確認が終わりました")
+    ok(f"前提の確認が終わりました（LAB_TARGET={env.target}）")
     return env
+
+
+def _preflight_aws(env: Env) -> None:
+    """AWS 環境の前提: 道具（aws、npx、kubectl、helm）、資格情報、ホスト名。バケット名の接頭辞を Env に載せる。"""
+    require_commands("docker", "kubectl", "helm", "aws", "npx")
+    _ = env.aws_hostname   # 無ければここで止まる
+    ident = aws.identity(env)
+    env.values["LAB_AWS_ACCOUNT"] = ident["Account"]
+    env.values["LAB_AWS_BUCKET_PREFIX"] = render.bucket_prefix(env, ident["Account"])
+    ok(f"AWS の資格情報: アカウント {ident['Account']}、{ident['Arn']}（{env.aws_region}）")
+    if not (aws.CDK_DIR / "cdk.json").exists():
+        raise LabError("cdk/ がありません（AWS の基盤の定義）")
 
 
 def ensure_registry(name: str, port: int, *extra: str) -> None:
@@ -88,8 +106,13 @@ def ensure_registry(name: str, port: int, *extra: str) -> None:
 
 
 def cluster(env: Env) -> None:
-    """イメージの置き場 2 つ、k3d クラスタ、Traefik の設定、namespace。"""
+    """Mac: イメージの置き場 2 つ、k3d クラスタ、Traefik の設定、namespace。
+    AWS: CDK の配備（証明書、ネットワーク、データ、計算資源）、kubeconfig、ノードプール、namespace、
+    External Secrets Operator、EFS の StorageClass（変更仕様書 2026-10-24-AWS構成 2.3 節）。"""
     step("cluster クラスタ")
+    if env.is_aws:
+        _cluster_aws(env)
+        return
     # イメージの置き場はクラスタより先に作る。クラスタを消しても残す
     ensure_registry(REGISTRY_NAME, REGISTRY_HOST_PORT)
     ensure_registry(CACHE_NAME, CACHE_HOST_PORT, "--proxy-remote-url", "https://registry-1.docker.io")
@@ -130,8 +153,29 @@ def cluster(env: Env) -> None:
         warn("Traefik の起動引数にタイムアウトの設定が見えません（反映待ちの可能性があります）")
 
     kapply(files=[K8S / "namespace.yaml"], namespaced=False)
+    kapply(manifest=render.service_accounts_manifest())
     operators()
     ok("クラスタの準備ができました")
+
+
+def _cluster_aws(env: Env) -> None:
+    ident = aws.identity(env)
+    out = aws.deploy(env, ident)
+    aws.kubeconfig(env)
+    wait_until(120, "EKS の API サーバーへの接続", kc("get", "--raw", "/healthz"))
+    kapply(manifest=render.nodepool_manifest(env), namespaced=False)
+    kapply(files=[K8S / "namespace.yaml"], namespaced=False)
+    kapply(manifest=render.service_accounts_manifest())
+    # Secrets Manager → Secret の同期。コントローラーの ServiceAccount に Pod Identity で IAM ロールが付く
+    _ensure_chart("external-secrets", render.ESO_NAMESPACE, ESO, {
+        "installCRDs": True, "serviceAccount": {"name": aws.POD_IDENTITIES["external-secrets"][1]},
+        "webhook": {"replicaCount": 1}, "certController": {"replicaCount": 1},
+    })
+    wait_until(300, "External Secrets Operator の準備", kc("-n", render.ESO_NAMESPACE, "wait",
+                                                          "--for=condition=Available", "deploy", "--all", "--timeout=5s"))
+    kapply(manifest=render.eso_store_manifest(env), namespaced=False)
+    kapply(manifest=render.efs_manifests(out), namespaced=False)
+    ok(f"クラスタの準備ができました（EKS {env.aws_cluster_name}、{env.aws_region}）")
 
 
 def _ensure_chart(release: str, namespace: str, spec: dict, values: dict) -> None:
@@ -174,7 +218,7 @@ def operators() -> None:
                                                   "--timeout=5s"))
 
 
-def _build_and_push(name: str, tag: str, context, build_args: list[str]) -> dict:
+def _build_and_push(name: str, tag: str, context, build_args: list[str], env: Env | None = None) -> dict:
     """自作イメージをビルドして置き場に push する（同じタグがあれば、どちらも飛ばす）。"""
     local_image = f"{name}:{tag}"
     push_image = f"localhost:{REGISTRY_HOST_PORT}/{name}:{tag}"
@@ -205,14 +249,38 @@ def images(env: Env) -> dict:
     - apps/audit が無い間（実装の途中）は audit-lab を飛ばす
     外部のイメージ（PostgreSQL など）は、ノードが Docker Hub の中継キャッシュ経由で取るので扱わない。"""
     step("images イメージ")
+    push = _build_and_push_ecr if env.is_aws else _build_and_push
     tag = render.image_tag(env.litellm_base_image, ROOT / "litellm")
-    image = _build_and_push("litellm-lab", tag, ROOT / "litellm",
-                            ["--build-arg", f"LITELLM_BASE_IMAGE={env.litellm_base_image}"])
+    image = push("litellm-lab", tag, ROOT / "litellm",
+                 ["--build-arg", f"LITELLM_BASE_IMAGE={env.litellm_base_image}"], env=env)
     write_if_changed(IMAGE_FILE, json.dumps(image, indent=2) + "\n")
     if (ROOT / "apps" / "audit" / "Dockerfile").exists():
-        audit = _build_and_push("audit-lab", render.dir_hash(ROOT / "apps" / "audit"), ROOT / "apps" / "audit", [])
+        audit = push("audit-lab", render.dir_hash(ROOT / "apps" / "audit"), ROOT / "apps" / "audit", [], env=env)
         write_if_changed(AUDIT_IMAGE_FILE, json.dumps(audit, indent=2) + "\n")
     return image
+
+
+def _build_and_push_ecr(name: str, tag: str, context, build_args: list[str], env: Env) -> dict:
+    """AWS: 同じイメージ（linux/arm64）を ECR に push する。リポジトリは CDK が作る（{prefix}/<name>）。"""
+    local_image = f"{name}:{tag}"
+    if succeeds(["docker", "image", "inspect", local_image]):
+        ok(f"イメージ {local_image} はビルド済みです")
+    else:
+        info(f"イメージ {local_image} をビルドします（単体テストも流れます）")
+        run(["docker", "build", "--platform", "linux/arm64", *build_args, "-t", local_image, str(context)])
+    out = aws.load_outputs(env)
+    repository = f"{env.aws_prefix}/{name}"
+    registry = out["EcrRegistry"]
+    if aws.ecr_has_tag(env, repository, tag):
+        ok(f"ECR に {repository}:{tag} があります")
+    else:
+        info(f"ECR に {repository}:{tag} を push します")
+        aws.ecr_login(env, registry)
+        push_image = f"{registry}/{repository}:{tag}"
+        run(["docker", "tag", local_image, push_image])
+        run(["docker", "push", "-q", push_image], quiet=True)
+        ok(f"push しました: {push_image}")
+    return {"repository": f"{registry}/{repository}", "tag": tag, "local": local_image}
 
 
 def load_image() -> dict:
@@ -222,8 +290,12 @@ def load_image() -> dict:
 
 
 def secrets_(env: Env) -> Env:
-    """.env の空の値を生成し、k8s の Secret に反映する。既存の値は上書きしない。"""
+    """Mac: .env の空の値を生成し、k8s の Secret に反映する。既存の値は上書きしない。
+    AWS: Secrets Manager の {prefix}/app の空の項目を生成し、External Secrets Operator に同じ名前の Secret を作らせる。"""
     step("secrets 秘密情報")
+    if env.is_aws:
+        _secrets_aws(env)
+        return env
     env.fill("LITELLM_MASTER_KEY", gen_key())
     env.fill("LITELLM_SALT_KEY", gen_key())
     env.fill("POSTGRES_PASSWORD", gen_secret(16))
@@ -276,10 +348,34 @@ def secrets_(env: Env) -> Env:
     return env
 
 
+def _secrets_aws(env: Env) -> None:
+    aws.ensure_app_secret(env)
+    out = aws.load_outputs(env)
+    kapply(manifest=render.external_secrets_manifest(env, out))
+
+    def synced() -> bool:
+        items = (json_output(kn("get", "externalsecret", "-o", "json"), default={}) or {}).get("items", [])
+        if not items:
+            return False
+        for es in items:
+            conds = {c["type"]: c["status"] for c in (es.get("status") or {}).get("conditions", [])}
+            if conds.get("Ready") != "True":
+                return False
+        return True
+
+    wait_until(180, "Secrets Manager から Secret への同期", synced)
+    ok("Secret を反映しました（External Secrets Operator）")
+
+
 def objectstore(env: Env) -> None:
     """S3 互換のオブジェクトストレージ（RustFS）と、バケット、利用者、権限（変更設計書 2 章）。
     最後に、許した操作ができ、許していない操作が拒否されることを確かめる。"""
     step("objectstore オブジェクトストレージ")
+    if env.is_aws:
+        # バケット、ロック、ライフサイクル、IAM は CDK が作る。ここは仕様どおりかの検査だけ（変更仕様書 2.4 節）
+        objstore.check_buckets(env, aws.client(env, "s3"))
+        ok("オブジェクトストレージ（S3）は仕様どおりです")
+        return
     kapply(files=[K8S / "rustfs.yaml"])
     rollout("statefulset/rustfs", 180, "RustFS の起動")
     with port_forward("svc/rustfs", 9000) as endpoint:
@@ -310,6 +406,20 @@ def _delete_if_present(*resources: str) -> None:
 def datastores(env: Env) -> None:
     """PostgreSQL（CloudNativePG、3 台）と Redis。差分だけ反映し、準備ができるまで待つ。"""
     step("datastores PostgreSQL と Redis")
+    if env.is_aws:
+        # Aurora と ElastiCache は CDK が作る。ここは使える状態かの確認だけ
+        out = aws.load_outputs(env)
+        rds = aws.client(env, "rds").describe_db_clusters(DBClusterIdentifier=out["AuroraClusterIdentifier"])
+        status = rds["DBClusters"][0]["Status"]
+        if status != "available":
+            raise LabError(f"Aurora {out['AuroraClusterIdentifier']} が available ではありません（{status}）")
+        g = aws.client(env, "elasticache").describe_replication_groups(
+            ReplicationGroupId=out["ValkeyReplicationGroupId"])["ReplicationGroups"][0]
+        if g["Status"] != "available":
+            raise LabError(f"ElastiCache {out['ValkeyReplicationGroupId']} が available ではありません（{g['Status']}）")
+        ok(f"Aurora（writer {aws.aurora_writer(env, out)}）と ElastiCache for Valkey"
+           f"（primary {aws.valkey_primary(env, out)}、durability {g.get('EffectiveDurability', '?')}）は使えます")
+        return
     # 1 台の PostgreSQL（以前の構成）を消す。中身は引き継がない（変更仕様書 4 章）
     _delete_if_present("statefulset/postgres", "service/postgres", "pvc/data-postgres-0", "secret/postgres")
     kapply(manifest=render_template(K8S / "postgres-cnpg.yaml", {"S3_ENDPOINT": env.get("LAB_S3_ENDPOINT",
@@ -389,19 +499,23 @@ def litellm(env: Env) -> None:
     helm upgrade --install は、値が同じなら Pod を作り直さない。値のハッシュが同じなら helm 自体を流さない。"""
     step("litellm LiteLLM")
     image = load_image()
+    out = aws.load_outputs(env) if env.is_aws else None
+    if env.is_aws and env.has_chatgpt():
+        # chatgpt/ のトークンは Mac の auth.json を、全 Pod で共有する EFS の PVC に写す（変更仕様書 4.2 節）
+        aws.sync_chatgpt_token(env)
 
     config_text = render.to_yaml(render.litellm_config(env, env.has_chatgpt()), "./lab が生成。手で編集しない")
     if write_if_changed(BUILD_DIR / "litellm-config.yaml", config_text):
         info("プロキシ設定を更新しました")
     kapply(manifest=configmap_manifest("litellm-config", {"config.yaml": config_text}))
 
-    overrides = render.helm_overrides(env, image["repository"], image["tag"], short_hash(config_text))
+    overrides = render.helm_overrides(env, image["repository"], image["tag"], short_hash(config_text), out)
     overrides_file = BUILD_DIR / "litellm-overrides.json"
     write_if_changed(overrides_file, json.dumps(overrides, indent=2) + "\n")
     values_file = ROOT / "litellm" / "values.yaml"
     values_hash = short_hash(values_file.read_text() + overrides_file.read_text() + env.chart_version)
 
-    migrate_db(image)
+    migrate_db(image, aws.database_resource_id(env, out) if env.is_aws else None)
     _recover_helm_release()
     current = (json_output(helm("-n", NS, "get", "values", HELM_RELEASE, "-o", "json"), default={}) or {})
     if current.get("labValuesHash") == values_hash and _helm_status() == "deployed":
@@ -413,10 +527,28 @@ def litellm(env: Env) -> None:
                  "--set-string", f"labValuesHash={values_hash}", "--wait", "--timeout", "15m"))
 
     rollout("deploy/litellm", 600, "LiteLLM の起動")
-    kapply(files=[K8S / "ingress.yaml"])
+    if env.is_aws:
+        _ingress_aws(env, out, viewer=bool(render.audit_oidc_client(env)[0]))
+    else:
+        kapply(files=[K8S / "ingress.yaml"])
     wait_until(120, f"入口からの応答（{env.base_url}/health/liveliness）",
                lambda: http_ok(f"{env.base_url}/health/liveliness"))
     ok(f"LiteLLM の準備ができました: {env.base_url}（管理画面 {env.base_url}/ui）")
+
+
+def _ingress_aws(env: Env, out: dict, viewer: bool) -> None:
+    """ALB の入口。ALB のホスト名が決まったら、手持ちの DNS の CNAME（ホスト名 → ALB）が引けるまで待つ。"""
+    kapply(manifest=render.alb_ingress_manifest(env, out, viewer), namespaced=False)
+
+    def alb_host() -> str:
+        return output(kn("get", "ingress", "litellm", "-o",
+                         "jsonpath={.status.loadBalancer.ingress[0].hostname}"), check=False).strip()
+
+    wait_until(600, "ALB の作成", lambda: bool(alb_host()))
+    host = alb_host()
+    write_if_changed(BUILD_DIR / "aws-alb-hostname.txt", host + "\n")
+    info(f"ALB: {host}")
+    aws.wait_for_cname(env, host)
 
 
 def load_audit_image() -> dict:
@@ -431,14 +563,18 @@ def audit(env: Env) -> None:
     step("audit 監査ログの整形と検索アプリ")
     image = load_audit_image()
     ref = f"{image['repository']}:{image['tag']}"
-    common = {"IMAGE": ref, "S3_ENDPOINT": env.get("LAB_S3_ENDPOINT", render.DEFAULT_S3_ENDPOINT),
-              "S3_REGION": env.get("LAB_S3_REGION", "us-east-1")}
+    if env.is_aws:
+        common = {"IMAGE": ref, "S3_ENDPOINT": "", "S3_REGION": env.aws_region,
+                  "S3_BUCKET_PREFIX": env.get("LAB_AWS_BUCKET_PREFIX")}
+    else:
+        common = {"IMAGE": ref, "S3_ENDPOINT": env.get("LAB_S3_ENDPOINT", render.DEFAULT_S3_ENDPOINT),
+                  "S3_REGION": env.get("LAB_S3_REGION", "us-east-1"), "S3_BUCKET_PREFIX": ""}
     kapply(manifest=render_template(K8S / "audit-compactor.yaml", common))
-    with port_forward("svc/rustfs", 9000) as endpoint:
-        s3 = objstore.s3_client(endpoint, *objstore.admin_credentials(env))
+    derived = render.bucket_name(env, render.AUDIT_DERIVED)
+    with objstore.admin_s3(env) as s3:
         for kind, doc in (("contracts", render.initial_contracts(env)), ("fx_rates", render.initial_fx_rates(env))):
-            if not s3.list_objects_v2(Bucket=render.AUDIT_DERIVED, Prefix=f"billing/{kind}/").get("KeyCount"):
-                s3.put_object(Bucket=render.AUDIT_DERIVED, Key=f"billing/{kind}/00000000T000000-lab-initial.json",
+            if not s3.list_objects_v2(Bucket=derived, Prefix=f"billing/{kind}/").get("KeyCount"):
+                s3.put_object(Bucket=derived, Key=f"billing/{kind}/00000000T000000-lab-initial.json",
                               Body=json.dumps(doc, ensure_ascii=False, indent=2).encode())
                 info(f"{kind} の初期値を書きました")
     if render.audit_oidc_client(env)[0]:
@@ -453,15 +589,17 @@ def audit(env: Env) -> None:
         ok(f"検索アプリ: {env.base_url}/lab-audit/")
     else:
         if succeeds(kn("get", "deploy", "audit-viewer")):
-            run(kn("delete", "deploy/audit-viewer", "service/audit-viewer", "ingressroute/audit-viewer",
-                   "--ignore-not-found"))
+            run(kn("delete", "deploy/audit-viewer", "service/audit-viewer", "--ignore-not-found"))
+            if not env.is_aws:
+                run(kn("delete", "ingressroute/audit-viewer", "--ignore-not-found"))
         warn("サインインの設定（Google の OAuth クライアントか LAB_AUDIT_OIDC_*）が無いので、検索アプリは入れません")
     ok("監査ログの段階が終わりました")
 
 
-def migrate_db(image: dict) -> None:
-    """DB 移行の Job（変更設計書 3.5 節）。名前はイメージと DB（Cluster の uid）のハッシュ。成功済みなら流さない。"""
-    uid = output(kn("get", "cluster", "litellm-pg", "-o", "jsonpath={.metadata.uid}"), check=False).strip()
+def migrate_db(image: dict, db_id: str | None = None) -> None:
+    """DB 移行の Job（変更設計書 3.5 節）。名前はイメージと DB（Mac は Cluster の uid、AWS は Aurora の不変の ID）の
+    ハッシュ。成功済みなら流さない。DB を作り直すと ID が変わるので移行が流れ直る。"""
+    uid = db_id or output(kn("get", "cluster", "litellm-pg", "-o", "jsonpath={.metadata.uid}"), check=False).strip()
     if not uid:
         raise LabError("PostgreSQL（cluster/litellm-pg）がありません。先に ./lab datastores を流してください")
     name = f"litellm-migrate-{short_hash(image['tag'] + uid)}"
@@ -495,6 +633,8 @@ def bootstrap(env: Env) -> None:
     キーの値は .env の固定値を使うので、DB を作り直しても同じキーが作り直される。
     既にあれば作らず、役割と MCP の権限だけを揃える。"""
     step("bootstrap 初期データ")
+    if env.is_aws and not env.get("LITELLM_MASTER_KEY"):
+        aws.load_app_secret(env)
     # ローリング更新の直後は、終了中の Pod に当たって一時的に失敗することがあるので、少し待つ
     wait_until(60, f"LiteLLM への接続（{env.base_url}）", lambda: http_ok(f"{env.base_url}/health/liveliness"))
     if not env.has_users():
@@ -621,6 +761,8 @@ def clients(env: Env) -> None:
     .codex-lab-noreview/（審査を外したキーの Codex の CODEX_HOME）。
     どのユーザーのキーを使うかは .env の LAB_CLIENT_USER（1 か 2、既定 1）で選ぶ。"""
     step("clients クライアントの設定")
+    if env.is_aws and not env.get("LITELLM_MASTER_KEY"):
+        aws.load_app_secret(env)
     user = env.get("LAB_CLIENT_USER", "1")
     if not env.has_users():
         warn("検証ユーザーが未設定なので、マスターキーで設定を作ります")
