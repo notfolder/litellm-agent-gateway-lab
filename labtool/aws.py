@@ -85,8 +85,24 @@ def operator_principal_arn(ident: dict) -> str:
 
 # ---- CDK ----
 def _cdk(env: Env, *args: str, capture: bool = False) -> subprocess.CompletedProcess:
-    cmd = ["npx", "--yes", "aws-cdk@2", *args]
+    """CDK の CLI を流す。どのコマンドも cdk.json のアプリを起動するので、定義（-c spec=）は常に渡す（bootstrap も）。"""
+    cmd = ["npx", "--yes", "aws-cdk@2", *args, "-c", f"spec={SPEC_FILE}"]
     return run(cmd, capture=capture, cwd=CDK_DIR, env_vars=shell_env(env))
+
+
+def availability_zones(env: Env) -> list[str]:
+    """VPC に使う 3 つの AZ。LAB_AWS_AZS（末尾を , 区切り）があればそれ、無ければアカウントで使える AZ の先頭 3 つ
+    （使える AZ はアカウントごとに違う。例: 東京は a,c,d のアカウントと b,c,d のアカウントがある）。"""
+    suffixes = env.get("LAB_AWS_AZS", "").strip()
+    if suffixes:
+        return [env.aws_region + z.strip() for z in suffixes.split(",") if z.strip()]
+    zones = client(env, "ec2").describe_availability_zones(
+        Filters=[{"Name": "zone-type", "Values": ["availability-zone"]}, {"Name": "state", "Values": ["available"]}]
+    )["AvailabilityZones"]
+    names = sorted(z["ZoneName"] for z in zones)
+    if len(names) < 3:
+        raise LabError(f"{env.aws_region} で使える AZ が 3 つ未満です: {names}")
+    return names[:3]
 
 
 def spec(env: Env, ident: dict) -> dict:
@@ -96,7 +112,7 @@ def spec(env: Env, ident: dict) -> dict:
         "prefix": env.aws_prefix,
         "account": ident["Account"],
         "region": env.aws_region,
-        "availability_zones": [env.aws_region + z for z in env.get("LAB_AWS_AZS", "a,c,d").split(",")],
+        "availability_zones": availability_zones(env),
         "hostname": env.aws_hostname,
         "operator_principal_arn": operator_principal_arn(ident),
         "cluster_name": env.aws_cluster_name,
@@ -125,7 +141,7 @@ def deploy(env: Env, ident: dict, stacks: list[str] | None = None) -> dict:
     if "cert" in (stacks or STACKS):
         _cert_hint(env)
     _cdk(env, "deploy", *names, "--require-approval", "never", "--concurrency", "2",
-         "--outputs-file", str(OUTPUTS_FILE), "-c", f"spec={SPEC_FILE}")
+         "--outputs-file", str(OUTPUTS_FILE))
     return outputs(env)
 
 
@@ -133,7 +149,7 @@ def destroy(env: Env, stacks: list[str]) -> None:
     ident = identity(env)
     write_if_changed(SPEC_FILE, json.dumps(spec(env, ident), ensure_ascii=False, indent=2, sort_keys=True) + "\n")
     names = [f"{env.aws_prefix}-{s}" for s in stacks]
-    _cdk(env, "destroy", *names, "--force", "-c", f"spec={SPEC_FILE}")
+    _cdk(env, "destroy", *names, "--force")
 
 
 def _cert_hint(env: Env) -> None:

@@ -192,7 +192,7 @@ class DataStack(cdk.Stack):
     # ---- Aurora ----
     def _aurora(self, spec: dict, vpc: ec2.Vpc) -> rds.DatabaseCluster:
         sg = ec2.SecurityGroup(self, "AuroraSg", vpc=vpc, description="Aurora PostgreSQL (lab)")
-        sg.add_ingress_rule(ec2.Peer.ipv4(vpc.vpc_cidr_block), ec2.Port.tcp(5432), "VPC の中から")
+        sg.add_ingress_rule(ec2.Peer.ipv4(vpc.vpc_cidr_block), ec2.Port.tcp(5432), "from inside the VPC")
         cluster = rds.DatabaseCluster(
             self, "Aurora",
             cluster_identifier=f"{spec['prefix']}-pg",
@@ -224,7 +224,7 @@ class DataStack(cdk.Stack):
             self, "ValkeySubnets", description="Valkey (lab)",
             subnet_ids=[s.subnet_id for s in vpc.private_subnets], cache_subnet_group_name=f"{prefix}-valkey")
         sg = ec2.SecurityGroup(self, "ValkeySg", vpc=vpc, description="ElastiCache for Valkey (lab)")
-        sg.add_ingress_rule(ec2.Peer.ipv4(vpc.vpc_cidr_block), ec2.Port.tcp(6379), "VPC の中から")
+        sg.add_ingress_rule(ec2.Peer.ipv4(vpc.vpc_cidr_block), ec2.Port.tcp(6379), "from inside the VPC")
         # メモリが溢れても黙ってデータを消さない（仕様書 5.2）
         params = elasticache.CfnParameterGroup(
             self, "ValkeyParams", cache_parameter_group_family="valkey9", description="noeviction (lab)",
@@ -232,7 +232,7 @@ class DataStack(cdk.Stack):
         group = elasticache.CfnReplicationGroup(
             self, "Valkey",
             replication_group_id=f"{prefix}-valkey",
-            replication_group_description="LiteLLM の Redis 互換（Valkey 9、primary 1 + replica 2、durability sync）",
+            replication_group_description="LiteLLM Redis-compatible store (Valkey 9, 1 primary + 2 replicas, durability sync)",
             engine="valkey", engine_version="9.0",
             cache_node_type=spec["valkey_node_type"],
             num_cache_clusters=3,
@@ -254,7 +254,7 @@ class DataStack(cdk.Stack):
     # ---- EFS（chatgpt/ のトークンを全 Pod で共有） ----
     def _efs(self, spec: dict, vpc: ec2.Vpc) -> efs.FileSystem:
         sg = ec2.SecurityGroup(self, "EfsSg", vpc=vpc, description="EFS (lab)")
-        sg.add_ingress_rule(ec2.Peer.ipv4(vpc.vpc_cidr_block), ec2.Port.tcp(2049), "VPC の中から")
+        sg.add_ingress_rule(ec2.Peer.ipv4(vpc.vpc_cidr_block), ec2.Port.tcp(2049), "from inside the VPC")
         return efs.FileSystem(
             self, "Efs", vpc=vpc, security_group=sg, encrypted=True,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
