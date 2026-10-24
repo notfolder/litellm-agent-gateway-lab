@@ -16,18 +16,20 @@ from .core import (
 def down() -> None:
     """Mac: クラスタを削除する。DB（クラスタ内）は消える。
     残すもの: .env、ChatGPT のトークン（LAB_DATA_DIR）、イメージの置き場（自作イメージと Docker Hub のキャッシュ）。
-    AWS: 計算資源（ALB、EKS）だけを消す。S3 の監査ログ、Aurora、Secrets Manager、ECR、証明書は残す
-    （変更仕様書 2026-10-24-AWS構成 6 章）。"""
+    AWS: 有料のものをすべて消す（compute → data → network のスタックと、残る S3・秘密情報・スナップショット）。
+    残すのは無料のもの: ACM の証明書（cert スタック。消すと再検証が要る）、Identity Center、DNS の CNAME、
+    CDK の bootstrap（変更仕様書 2026-10-24-AWS構成 6 章）。"""
     step("down クラスタの削除")
     env = Env.load()
     if env.is_aws:
         from . import aws
         # Ingress を先に消して ALB を片付けさせる（残っていると compute のスタックの削除が止まる）
-        if succeeds(kn("get", "ingress", "litellm")):
+        if succeeds(kn("get", "ingress", "litellm"), timeout=60):
             info("ALB の入口（Ingress）を消します")
             run(kn("delete", "ingress", "litellm", "--wait=true", "--timeout=300s"), check=False)
-        aws.destroy(env, ["compute"])
-        ok(f"計算資源のスタック {env.aws_prefix}-compute を削除しました（S3、Aurora、秘密情報は残っています）")
+        aws.destroy(env, ["compute", "data", "network"])
+        aws.purge_retained(env)
+        ok(f"AWS の有料リソースを削除しました（残るのは無料の {env.aws_prefix}-cert の証明書と CDK の bootstrap）")
         return
     if cluster_exists():
         run(["k3d", "cluster", "delete", CLUSTER])
@@ -83,8 +85,8 @@ def clean_all(assume_yes: bool) -> None:
     残すもの: .env、ChatGPT のトークン、イメージの置き場（Docker Hub のキャッシュを含む）。"""
     step("clean-all 全削除")
     if Env.load().is_aws:
-        raise LabError("LAB_TARGET=aws では clean-all は使えません。計算資源は ./lab down、データのスタックは "
-                       "cdk destroy を手で流してください（監査ログのバケットは Object Lock で消せません）")
+        raise LabError("LAB_TARGET=aws では clean-all は使えません。AWS 側は ./lab down が有料のものをすべて消します。"
+                       "ローカルの生成物（clients/out、.build）は LAB_TARGET=local で clean-all を流してください")
     print(f"""次を削除します:
   - クラスタ {CLUSTER}（DB を含む）
   - clients/out/、.codex-lab/、.codex-lab-noreview/、.build/

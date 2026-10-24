@@ -545,6 +545,12 @@ class AwsTargetTest(unittest.TestCase):
         sas = list(yaml.safe_load_all(render.service_accounts_manifest()))
         self.assertEqual({d["metadata"]["name"] for d in sas}, {"audit-compactor", "audit-viewer"})
 
+    def test_retained_bucket_names(self):
+        """./lab down の後始末で消す S3 のバケット: 接頭辞付きの 3 つ。pg-backup は AWS では作らないので含めない"""
+        from labtool import aws
+        names = aws.retained_bucket_names(self.aws(), "123456789012")
+        self.assertEqual(names, [f"litellm-lab-123456789012-{b}" for b in ("audit-raw", "audit-access", "audit-derived")])
+
     def test_operator_principal_arn(self):
         from labtool import aws
         sso = {"Account": "1", "Arn": "arn:aws:sts::1:assumed-role/AWSReservedSSO_Admin_x/me"}

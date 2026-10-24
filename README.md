@@ -42,7 +42,7 @@ aws configure sso              # プロファイルを作り、aws sso login --p
 ./lab up                       # CDK の配備 → kubeconfig → イメージを ECR へ → Secrets Manager → LiteLLM → ALB
 ```
 
-人が行うこと: Bedrock のモデルアクセス（Anthropic の Claude）を有効にする、ACM の検証用 CNAME（配備の途中で表示）と、ホスト名 → ALB の CNAME（`./lab litellm` が表示）を手持ちの DNS に足す。`./lab down` は計算資源（EKS、ALB）だけを消し、S3 の監査ログ・Aurora・秘密情報は残します。
+人が行うこと: Bedrock のモデルアクセス（Anthropic の Claude）を有効にする、ACM の検証用 CNAME（配備の途中で表示）と、ホスト名 → ALB の CNAME（`./lab litellm` が表示）を手持ちの DNS に足す。`./lab down` は AWS の有料リソース（EKS、ALB、Aurora、ElastiCache、EFS、NAT、S3 の監査ログ、秘密情報）をすべて消します。残るのは無料のもの（ACM の証明書、Identity Center、DNS の CNAME、CDK の bootstrap）だけです。
 
 ## よく使うコマンド
 

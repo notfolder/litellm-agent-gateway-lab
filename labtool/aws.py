@@ -158,6 +158,72 @@ def destroy(env: Env, stacks: list[str]) -> None:
     _cdk(env, "destroy", *names, "--force")
 
 
+# ---- ./lab down の後始末（スタックを消しても残るもの） ----
+def retained_bucket_names(env: Env, account: str) -> list[str]:
+    """data スタックを消しても残る S3 のバケット（RETAIN。Object Lock のため CloudFormation が空にできない）。"""
+    prefix = render.bucket_prefix(env, account)
+    return [prefix + logical for logical in render.s3_buckets(env) if logical != render.PG_BACKUP]
+
+
+def purge_retained(env: Env) -> None:
+    """スタックを消した後に残る有料・残留のものを消す: S3（GOVERNANCE のロックを越えて空にしてから）、
+    アプリの秘密情報 {prefix}/app（復旧期間なし）、Aurora のスナップショット、ECR、EFS（RETAIN の版で作った残り）。
+    Object Lock が COMPLIANCE のバケットは誰にも消せないので残して知らせる。"""
+    ident = identity(env)
+    s3 = client(env, "s3")
+    lock_mode = env.get("LAB_AUDIT_LOCK_MODE", "GOVERNANCE")
+    for bucket in retained_bucket_names(env, ident["Account"]):
+        try:
+            s3.head_bucket(Bucket=bucket)
+        except Exception:
+            continue
+        if lock_mode == "COMPLIANCE" and bucket.endswith((render.AUDIT_RAW, render.AUDIT_ACCESS)):
+            warn(f"バケット {bucket} は Object Lock（COMPLIANCE）のため消せません。保持期間が切れるまで残ります")
+            continue
+        n = 0
+        paginator = s3.get_paginator("list_object_versions")
+        for page in paginator.paginate(Bucket=bucket):
+            objs = [{"Key": o["Key"], "VersionId": o["VersionId"]}
+                    for k in ("Versions", "DeleteMarkers") for o in page.get(k, [])]
+            for i in range(0, len(objs), 1000):
+                s3.delete_objects(Bucket=bucket, Delete={"Objects": objs[i:i + 1000], "Quiet": True},
+                                  BypassGovernanceRetention=True)
+                n += len(objs[i:i + 1000])
+        s3.delete_bucket(Bucket=bucket)
+        info(f"バケット {bucket} を消しました（{n} 版）")
+    sm = client(env, "secretsmanager")
+    try:
+        sm.delete_secret(SecretId=app_secret_name(env), ForceDeleteWithoutRecovery=True)
+        info(f"秘密情報 {app_secret_name(env)} を消しました")
+    except sm.exceptions.ResourceNotFoundException:
+        pass
+    rds = client(env, "rds")
+    for snap in rds.describe_db_cluster_snapshots(SnapshotType="manual")["DBClusterSnapshots"]:
+        if snap["DBClusterIdentifier"].startswith(env.aws_prefix):
+            rds.delete_db_cluster_snapshot(DBClusterSnapshotIdentifier=snap["DBClusterSnapshotIdentifier"])
+            info(f"Aurora のスナップショット {snap['DBClusterSnapshotIdentifier']} を消しました")
+    ecr = client(env, "ecr")
+    for repo in ("litellm-lab", "audit-lab"):
+        try:
+            ecr.delete_repository(repositoryName=f"{env.aws_prefix}/{repo}", force=True)
+            info(f"ECR {env.aws_prefix}/{repo} を消しました")
+        except ecr.exceptions.RepositoryNotFoundException:
+            pass
+    efs = client(env, "efs")
+    for fs in efs.describe_file_systems()["FileSystems"]:
+        tags = {t["Key"]: t["Value"] for t in fs.get("Tags", [])}
+        if tags.get("aws:cloudformation:stack-name") != f"{env.aws_prefix}-data":
+            continue
+        for mt in efs.describe_mount_targets(FileSystemId=fs["FileSystemId"])["MountTargets"]:
+            efs.delete_mount_target(MountTargetId=mt["MountTargetId"])
+        for _ in range(60):
+            if not efs.describe_mount_targets(FileSystemId=fs["FileSystemId"])["MountTargets"]:
+                break
+            time.sleep(5)
+        efs.delete_file_system(FileSystemId=fs["FileSystemId"])
+        info(f"EFS {fs['FileSystemId']} を消しました")
+
+
 def _cert_hint(env: Env) -> None:
     """ACM の証明書は DNS 検証。手持ちの DNS に CNAME を足すまで CloudFormation が待つので、先に知らせる。"""
     acm = client(env, "acm")

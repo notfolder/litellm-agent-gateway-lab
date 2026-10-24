@@ -2,7 +2,10 @@
 
 設計の要点:
 - 状態を持つもの（S3、Aurora、ElastiCache、EFS、ECR、Secrets Manager、IAM ロール）は data に置き、
-  計算資源（EKS）を消しても残す。監査ログのバケットは Object Lock で消せないので、消す対象から構造的に分ける
+  計算資源（EKS）と分けて消せるようにする。./lab down は compute → data → network の順に全部消す
+  （有料のものを残さない。ユーザー指示 2026-10-24）。検証（scale=lab）では Aurora・EFS・ECR も DESTROY。
+  S3 は Object Lock のため CloudFormation が空にできず RETAIN にし、labtool（aws.purge_retained）が
+  GOVERNANCE のロックを越えて空にしてから消す（COMPLIANCE のときは消せないので残す）
 - S3 のバケット・ライフサイクル・権限の表は labtool/render.py の定義（spec["buckets"]、spec["policies"]）を
   そのまま使う。IAM の Resource の ARN は論理名に接頭辞を付けて作る
 - EKS は Auto Mode。組み込みのノードプールは system だけ（default の NodeClass を用意させるため）。
@@ -83,7 +86,8 @@ class NetworkStack(cdk.Stack):
 
 
 class DataStack(cdk.Stack):
-    """消えてはいけないもの: S3（監査ログ）、Aurora、ElastiCache、EFS、ECR、Secrets Manager、Pod Identity のロール。"""
+    """状態を持つもの: S3（監査ログ）、Aurora、ElastiCache、EFS、ECR、Secrets Manager、Pod Identity のロール。
+    compute とは別のスタックにして、計算資源だけ作り直せるようにする。./lab down はこのスタックも消す。"""
 
     def __init__(self, scope: Construct, id_: str, *, spec: dict, vpc: ec2.Vpc, **kwargs) -> None:
         super().__init__(scope, id_, **kwargs)
@@ -96,7 +100,7 @@ class DataStack(cdk.Stack):
         self.efs = self._efs(spec, vpc)
         self.ecr = {name: ecr.Repository(
             self, f"Ecr{name.title().replace('-', '')}", repository_name=f"{prefix}/{name}",
-            image_scan_on_push=False, empty_on_delete=False, removal_policy=cdk.RemovalPolicy.RETAIN,
+            image_scan_on_push=False, empty_on_delete=True, removal_policy=cdk.RemovalPolicy.DESTROY,
             lifecycle_rules=[ecr.LifecycleRule(max_image_count=10)]) for name in ("litellm-lab", "audit-lab")}
         # アプリの秘密情報 {prefix}/app は ./lab secrets（labtool/aws.py）が作って育てる。ここでは読む権限だけを配る
         app_secret_arn = self.format_arn(service="secretsmanager", resource="secret", resource_name=f"{prefix}/app-*")
@@ -128,6 +132,8 @@ class DataStack(cdk.Stack):
                 "block_public_access": s3.BlockPublicAccess.BLOCK_ALL,
                 "encryption": s3.BucketEncryption.S3_MANAGED,
                 "enforce_ssl": True,
+                # Object Lock のバケットは CloudFormation が空にできないので RETAIN。./lab down（aws.purge_retained）が
+                # GOVERNANCE のロックを越えて空にしてから消す
                 "removal_policy": cdk.RemovalPolicy.RETAIN,
                 "lifecycle_rules": [self._lifecycle(rule) for rule in b["lifecycle"]],
             }
@@ -211,7 +217,8 @@ class DataStack(cdk.Stack):
             storage_encrypted=True,
             backup=rds.BackupProps(retention=cdk.Duration.days(30)),   # 任意の時点への復元は 30 日（仕様書 5.1）
             deletion_protection=spec["scale"] != "lab",
-            removal_policy=cdk.RemovalPolicy.SNAPSHOT,
+            # 検証は ./lab down で DB ごと消す（Mac の k3d と同じ）。検証以外はスナップショットを残す
+            removal_policy=cdk.RemovalPolicy.DESTROY if spec["scale"] == "lab" else cdk.RemovalPolicy.SNAPSHOT,
         )
         return cluster
 
@@ -260,7 +267,7 @@ class DataStack(cdk.Stack):
             self, "Efs", vpc=vpc, security_group=sg, encrypted=True,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
             lifecycle_policy=efs.LifecyclePolicy.AFTER_30_DAYS,
-            removal_policy=cdk.RemovalPolicy.RETAIN,
+            removal_policy=cdk.RemovalPolicy.DESTROY,   # 中身は chatgpt/ のトークンだけ（Mac の LAB_DATA_DIR から入れ直せる）
         )
 
 
