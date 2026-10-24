@@ -547,6 +547,9 @@ class AwsTargetTest(unittest.TestCase):
 
     def test_operator_principal_arn(self):
         from labtool import aws
-        self.assertEqual(aws.operator_principal_arn({"Account": "1", "Arn": "arn:aws:sts::1:assumed-role/AWSReservedSSO_Admin_x/me"}),
-                         "arn:aws:iam::1:role/AWSReservedSSO_Admin_x")
+        sso = {"Account": "1", "Arn": "arn:aws:sts::1:assumed-role/AWSReservedSSO_Admin_x/me"}
+        # SSO のロールはパス付きの ARN を IAM から引く（パス無しは EKS が invalid principal と返す）
+        self.assertEqual(aws.operator_principal_arn(sso, lambda r: f"arn:aws:iam::1:role/aws-reserved/sso.amazonaws.com/ap-northeast-1/{r}"),
+                         "arn:aws:iam::1:role/aws-reserved/sso.amazonaws.com/ap-northeast-1/AWSReservedSSO_Admin_x")
+        self.assertEqual(aws.operator_principal_arn(sso), "arn:aws:iam::1:role/AWSReservedSSO_Admin_x")
         self.assertEqual(aws.operator_principal_arn({"Account": "1", "Arn": "arn:aws:iam::1:user/me"}), "arn:aws:iam::1:user/me")

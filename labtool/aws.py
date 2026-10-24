@@ -73,14 +73,20 @@ def identity(env: Env) -> dict:
             "  .env の LAB_AWS_PROFILE にその名前を書いてください") from None
 
 
-def operator_principal_arn(ident: dict) -> str:
+def operator_principal_arn(ident: dict, role_arn_of=None) -> str:
     """EKS のアクセスエントリに登録する IAM の主体。IAM Identity Center（SSO）の一時的な資格情報は
-    assumed-role の ARN なので、ロールの ARN（パス無し）に直す。"""
+    assumed-role の ARN なので、IAM に問い合わせてロールの ARN に直す（SSO のロールは
+    /aws-reserved/sso.amazonaws.com/<リージョン>/ のパスを持ち、パス無しの ARN は EKS が invalid principal と返す）。
+    role_arn_of はロール名 → ARN（試験で差し替える）。"""
     arn = ident["Arn"]
     if ":assumed-role/" in arn:
         role = arn.split(":assumed-role/")[1].split("/")[0]
-        return f"arn:aws:iam::{ident['Account']}:role/{role}"
+        return role_arn_of(role) if role_arn_of else f"arn:aws:iam::{ident['Account']}:role/{role}"
     return arn
+
+
+def iam_role_arn(env: Env, role_name: str) -> str:
+    return client(env, "iam").get_role(RoleName=role_name)["Role"]["Arn"]
 
 
 # ---- CDK ----
@@ -114,7 +120,7 @@ def spec(env: Env, ident: dict) -> dict:
         "region": env.aws_region,
         "availability_zones": availability_zones(env),
         "hostname": env.aws_hostname,
-        "operator_principal_arn": operator_principal_arn(ident),
+        "operator_principal_arn": operator_principal_arn(ident, lambda r: iam_role_arn(env, r)),
         "cluster_name": env.aws_cluster_name,
         "kubernetes_version": env.get("LAB_EKS_VERSION", "1.34"),
         "bucket_prefix": render.bucket_prefix(env, ident["Account"]),
