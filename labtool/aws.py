@@ -222,6 +222,13 @@ def purge_retained(env: Env) -> None:
             time.sleep(5)
         efs.delete_file_system(FileSystemId=fs["FileSystemId"])
         info(f"EFS {fs['FileSystemId']} を消しました")
+    # CloudWatch Logs のロググループ（EKS の制御部分、CDK のカスタムリソースの Lambda）はスタックを消しても残る
+    logs = client(env, "logs")
+    for prefix in (f"/aws/eks/{env.aws_cluster_name}/", f"/aws/lambda/{env.aws_prefix}-"):
+        for page in logs.get_paginator("describe_log_groups").paginate(logGroupNamePrefix=prefix):
+            for g in page["logGroups"]:
+                logs.delete_log_group(logGroupName=g["logGroupName"])
+                info(f"ロググループ {g['logGroupName']} を消しました")
 
 
 def _cert_hint(env: Env) -> None:
