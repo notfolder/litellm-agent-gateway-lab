@@ -30,6 +30,16 @@
 - [ ] spec 9.1 の未確認: 7 日後の再サインイン、Claude Code の auto mode で MCP 呼び出しがブロックされないこと（追加 2026-10-12、重要 低）
 - [ ] spec 9.3 の未確認: OAuth のコールバックが別 Pod でも成功する、chatgpt/ のトークン共有の競合、入口のタイムアウト、無停止のバージョンアップ、Jev 有無の遅延と負荷時の挙動（追加 2026-10-12、重要 低）
 
+## AWS 構成
+概要: .history/2026-10-24-AWS構成/変更仕様書.md（ブランチ `feature/aws-target`）
+
+- [ ] 変更仕様書の「13. 前提」（リージョン東京、検証の AWS 環境は GOVERNANCE と Google SSO）をユーザーに確認し、確定したら 0.2 の決定事項に移す（追加 2026-10-24、重要 高）
+- [ ] 変更設計書 `.history/2026-10-24-AWS構成/変更設計書.md` を書く（CDK のスタックの分け方、インスタンスの種類と費用の概算、labtool の `LAB_TARGET` の分岐、Helm の values の骨格、`chatgpt/` のトークンの置き場、test-failover の AWS 版。変更仕様書 10 章の一覧）（追加 2026-10-24、重要 高）
+- [ ] Codex 用のモデル（Bedrock Mantle の gpt-oss か GPT-5.x、Bedrock の Claude の変換経由、Azure OpenAI）を決める。決まるまで AWS でも `chatgpt/` を使う（追加 2026-10-24、重要 中）
+- [ ] 実装: `LAB_TARGET` の切り替え、`cdk/`、S3 の資格情報チェーンの分岐（`apps/audit/audit/common.py`、`litellm/guardrails/audit_log.py`、`labtool/objectstore.py`）、External Secrets Operator、ALB の Ingress、Bedrock のモデル登録。`LAB_TARGET=local` で既存の試験が全部通ることを先に確かめる（追加 2026-10-24、重要 中）
+- [ ] 試験: 変更仕様書 7.2 の AWS だけの項目（drain、Aurora と ElastiCache のフェイルオーバー、復元、Pod Identity の権限、計算資源の作り直し、Haiku 4.5 の審査官の評価セット）（追加 2026-10-24、重要 中）
+- [ ] 実装と試験の後、変更仕様書 12 章の表に従って `docs/spec.md` と `docs/design.md` に反映する（追加 2026-10-24、重要 中）
+
 ## 冗長化と監査ログ
 概要: .history/2026-10-12-0741-検証環境の構築と冗長化・監査ログ/summary.md
 
