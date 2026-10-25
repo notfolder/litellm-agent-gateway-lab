@@ -29,10 +29,20 @@ def s3_client(endpoint: str, access_key: str, secret_key: str):
                         config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 3}))
 
 
+def aws_user_client(env: Env, user: str):
+    """利用者（IAM ユーザーの静的キー。aws-ec2）としてつなぐ AWS の S3 のクライアント。"""
+    import boto3
+    from botocore.config import Config
+
+    access, secret = user_credentials(env, user)
+    return boto3.client("s3", region_name=env.aws_region, aws_access_key_id=access, aws_secret_access_key=secret,
+                        config=Config(retries={"max_attempts": 3}))
+
+
 @contextlib.contextmanager
 def admin_s3(env: Env):
     """管理者としてバケットに触る S3 クライアント。Mac は RustFS に port-forward、AWS は操作者の資格情報で S3 に直接。"""
-    if env.is_aws:
+    if env.on_aws:
         from . import aws
         yield aws.client(env, "s3")
         return
@@ -42,17 +52,23 @@ def admin_s3(env: Env):
 
 @contextlib.contextmanager
 def user_s3(env: Env, user: str):
-    """利用者（RustFS の静的キー）としてつなぐ S3 クライアント（Mac だけ）。"""
+    """利用者の静的キーでつなぐ S3 クライアント（Mac は RustFS の利用者、aws-ec2 は IAM ユーザー。EKS 版には無い）。"""
+    if env.is_aws_ec2:
+        from . import ec2
+        ec2.load_credentials(env, ec2.load_outputs(env))
+        yield aws_user_client(env, user)
+        return
     with port_forward("svc/rustfs", 9000) as endpoint:
         yield s3_client(endpoint, *user_credentials(env, user))
 
 
 def check_buckets(env: Env, s3) -> None:
-    """AWS: バケット（CDK が作る）が仕様どおりかを確かめる。違えばエラーで止める（作り直しは CDK で）。"""
+    """AWS: バケット（EKS 版は CDK、aws-ec2 は CloudFormation が作る）が仕様どおりかを確かめる。
+    違えばエラーで止める（作り直しは基盤のコードで）。"""
     problems: list[str] = []
     for logical, spec in render.s3_buckets(env).items():
-        if logical == render.PG_BACKUP:
-            continue   # Aurora のバックアップは RDS が持つので、このバケットは AWS では作らない
+        if logical == render.PG_BACKUP and env.is_aws:
+            continue   # Aurora のバックアップは RDS が持つので、このバケットは EKS 版では作らない
         bucket = render.bucket_name(env, logical)
         try:
             s3.head_bucket(Bucket=bucket)
@@ -204,8 +220,10 @@ def ensure_users(env: Env, admin: Admin) -> None:
     ok("利用者と権限は最新です")
 
 
-def self_check(env: Env, endpoint: str) -> None:
-    """許した操作ができ、許していない操作（原本の読み取り・削除、保持の回避なしの削除）が拒否されることを確かめる。"""
+def self_check(env: Env, admin_client, user_client) -> None:
+    """許した操作ができ、許していない操作（原本の読み取り・削除、保持の回避なしの削除）が拒否されることを確かめる。
+    admin_client は管理者の S3 クライアント、user_client(利用者名) は利用者の静的キーのクライアント
+    （Mac は RustFS、aws-ec2 は IAM ユーザー。両環境で同じ検査）。"""
     from botocore.exceptions import ClientError
 
     def denied(fn) -> bool:
@@ -215,22 +233,22 @@ def self_check(env: Env, endpoint: str) -> None:
             return e.response.get("Error", {}).get("Code") == "AccessDenied"
         return False
 
-    admin_s3 = s3_client(endpoint, *admin_credentials(env))
-    writer = s3_client(endpoint, *user_credentials(env, "litellm-writer"))
-    viewer = s3_client(endpoint, *user_credentials(env, "audit-viewer"))
+    raw = render.bucket_name(env, render.AUDIT_RAW)
+    writer = user_client("litellm-writer")
+    viewer = user_client("audit-viewer")
     key = f"raw/_selfcheck/{time.strftime('%Y%m%dT%H%M%S')}.txt"
-    version = writer.put_object(Bucket=render.AUDIT_RAW, Key=key, Body=b"self-check").get("VersionId")
+    version = writer.put_object(Bucket=raw, Key=key, Body=b"self-check").get("VersionId")
     checks = {
-        "書き込み用の利用者は原本を読めない": denied(lambda: writer.get_object(Bucket=render.AUDIT_RAW, Key=key)),
+        "書き込み用の利用者は原本を読めない": denied(lambda: writer.get_object(Bucket=raw, Key=key)),
         "書き込み用の利用者は原本を消せない": denied(
-            lambda: writer.delete_object(Bucket=render.AUDIT_RAW, Key=key, VersionId=version)),
+            lambda: writer.delete_object(Bucket=raw, Key=key, VersionId=version)),
         "書き込み用の利用者は raw/ の外に書けない": denied(
-            lambda: writer.put_object(Bucket=render.AUDIT_RAW, Key="_selfcheck.txt", Body=b"x")),
+            lambda: writer.put_object(Bucket=raw, Key="_selfcheck.txt", Body=b"x")),
         "管理者でも保持の回避なしには原本を消せない": denied(
-            lambda: admin_s3.delete_object(Bucket=render.AUDIT_RAW, Key=key, VersionId=version)),
+            lambda: admin_client.delete_object(Bucket=raw, Key=key, VersionId=version)),
         "検索アプリは原本に書けない": denied(
-            lambda: viewer.put_object(Bucket=render.AUDIT_RAW, Key="raw/_selfcheck/viewer.txt", Body=b"x")),
-        "検索アプリは原本を読める": not denied(lambda: viewer.get_object(Bucket=render.AUDIT_RAW, Key=key)),
+            lambda: viewer.put_object(Bucket=raw, Key="raw/_selfcheck/viewer.txt", Body=b"x")),
+        "検索アプリは原本を読める": not denied(lambda: viewer.get_object(Bucket=raw, Key=key)),
     }
     failed = [k for k, v in checks.items() if not v]
     if failed:
@@ -240,7 +258,7 @@ def self_check(env: Env, endpoint: str) -> None:
 
 def snapshot(env: Env, s3) -> list[str]:
     """冪等性の試験用: バケットの設定と、利用者と権限を文字列の一覧にする。
-    AWS では利用者は IAM（CDK が管理）なので、バケットの設定だけ。"""
+    AWS では利用者は IAM（CDK か CloudFormation が管理）なので、バケットの設定だけ。"""
     lines = []
     for logical in sorted(render.s3_buckets(env)):
         if env.is_aws and logical == render.PG_BACKUP:
@@ -249,7 +267,7 @@ def snapshot(env: Env, s3) -> list[str]:
         lock = _lock_rule(s3, name)
         lines.append(f"bucket {name} versioning={s3.get_bucket_versioning(Bucket=name).get('Status')} "
                      f"lock={_canon(lock)} lifecycle={_canon(_lifecycle_rules(s3, name))}")
-    if env.is_aws:
+    if env.on_aws:
         return lines
     endpoint = s3.meta.endpoint_url
     admin = Admin(endpoint, *admin_credentials(env))

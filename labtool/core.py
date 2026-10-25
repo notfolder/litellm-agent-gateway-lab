@@ -32,6 +32,8 @@ ENV_EXAMPLE = ROOT / ".env.example"
 CLUSTER = "litellm"
 KUBE_CONTEXT = f"k3d-{CLUSTER}"          # Mac（k3d）。AWS は Env.load() が set_kube_context で差し替える
 AWS_KUBE_CONTEXT = "litellm-lab-aws"      # aws eks update-kubeconfig --alias で付ける名前
+EC2_KUBE_CONTEXT = "litellm-lab-ec2"      # EC2 3 台の k3s（Session Manager のポート転送の先。labtool/ec2.py が書く）
+TARGETS = ("local", "aws", "aws-ec2")
 NS = "litellm-lab"
 HELM_RELEASE = "litellm"
 LITELLM_CHART = "oci://ghcr.io/berriai/litellm-helm"
@@ -119,10 +121,10 @@ class Env:
         if not ENV_FILE.exists():
             raise LabError(".env がありません。./lab up（preflight）で作られます")
         env = cls(parse_env(ENV_FILE.read_text()))
-        if env.target not in ("local", "aws"):
-            raise LabError(f"LAB_TARGET は local か aws です（{env.target}）")
+        if env.target not in TARGETS:
+            raise LabError(f"LAB_TARGET は {' / '.join(TARGETS)} のどれかです（{env.target}）")
         # kubectl / helm が向くクラスタを環境に合わせる（変更仕様書 2026-10-24-AWS構成 2.3 節）
-        set_kube_context(AWS_KUBE_CONTEXT if env.is_aws else f"k3d-{CLUSTER}")
+        set_kube_context({"aws": AWS_KUBE_CONTEXT, "aws-ec2": EC2_KUBE_CONTEXT}.get(env.target, f"k3d-{CLUSTER}"))
         # 設定は .env だけから読む。コマンドの前に付けた値は効かないので、食い違えば知らせる
         shell = os.environ.get("LAB_NOREVIEW_KEYS", "").strip()
         if shell and shell.lower() != env.get("LAB_NOREVIEW_KEYS", "false").lower():
@@ -149,12 +151,24 @@ class Env:
     # ---- 決まる値 ----
     @property
     def target(self) -> str:
-        """向ける環境: local（Mac の k3d）か aws（変更仕様書 2026-10-24-AWS構成 0.2 節）。"""
+        """向ける環境: local（Mac の k3d）、aws（EKS 版。変更仕様書 2026-10-24-AWS構成 0.2 節）、
+        aws-ec2（EC2 3 台と S3 だけ。変更仕様書 2026-10-25-EC2三台構成 0.2 節）。"""
         return self.get("LAB_TARGET", "local")
 
     @property
     def is_aws(self) -> bool:
+        """EKS 版（マネージドサービス）か。"""
         return self.target == "aws"
+
+    @property
+    def is_aws_ec2(self) -> bool:
+        """EC2 3 台の k3s か（Kubernetes の中は Mac と同じ構成。基盤と入口と S3 だけが AWS）。"""
+        return self.target == "aws-ec2"
+
+    @property
+    def on_aws(self) -> bool:
+        """AWS のどちらか（HTTPS のホスト名、S3 のバケット名の接頭辞、Bedrock のモデルが共通）。"""
+        return self.is_aws or self.is_aws_ec2
 
     @property
     def data_dir(self) -> Path:
@@ -167,21 +181,21 @@ class Env:
     @property
     def base_url(self) -> str:
         """クライアントとこのツールが使う入口。Mac は http://localhost:<port>、AWS は https://<ホスト名>。"""
-        if self.is_aws:
+        if self.on_aws:
             return f"https://{self.aws_hostname}"
         return f"http://localhost:{self.http_port}"
 
     @property
     def public_host(self) -> str:
         """入口のホスト名（ポート付き）。Claude Code の信頼するドメインの記述に使う。"""
-        return self.aws_hostname if self.is_aws else f"localhost:{self.http_port}"
+        return self.aws_hostname if self.on_aws else f"localhost:{self.http_port}"
 
-    # ---- AWS（LAB_TARGET=aws のときだけ使う） ----
+    # ---- AWS（LAB_TARGET=aws / aws-ec2 のときだけ使う） ----
     @property
     def aws_hostname(self) -> str:
         host = self.get("LAB_AWS_HOSTNAME")
         if not host:
-            raise LabError("LAB_TARGET=aws には LAB_AWS_HOSTNAME（HTTPS のホスト名）が要ります")
+            raise LabError(f"LAB_TARGET={self.target} には LAB_AWS_HOSTNAME（HTTPS のホスト名）が要ります")
         return host
 
     @property
@@ -200,6 +214,33 @@ class Env:
     @property
     def aws_cluster_name(self) -> str:
         return f"{self.aws_prefix}-eks"
+
+    # ---- EC2 3 台（LAB_TARGET=aws-ec2。変更設計書 2026-10-25-EC2三台構成 6 章） ----
+    @property
+    def ec2_prefix(self) -> str:
+        """CloudFormation のスタック、IAM ユーザー、SSM のパラメータの接頭辞（EKS 版の名前と衝突しない）。"""
+        return f"{self.aws_prefix}-ec2"
+
+    @property
+    def ec2_instance_type(self) -> str:
+        return self.get("LAB_EC2_INSTANCE_TYPE", "t4g.large")
+
+    @property
+    def ec2_vpc_cidr(self) -> str:
+        return self.get("LAB_EC2_VPC_CIDR", "10.60.0.0/16")
+
+    @property
+    def ec2_disk_gib(self) -> int:
+        return int(self.get("LAB_EC2_DISK_GIB", "40"))
+
+    @property
+    def ec2_local_port(self) -> int:
+        """Session Manager のポート転送のローカル側（k3s の API 6443 の宛先）。"""
+        return int(self.get("LAB_EC2_LOCAL_PORT", "16443"))
+
+    @property
+    def ec2_keep_eip(self) -> bool:
+        return self.get("LAB_EC2_KEEP_EIP", "false").lower() == "true"
 
     @property
     def litellm_version(self) -> str:
@@ -392,13 +433,13 @@ def kapply(*, files: list[Path] | None = None, manifest: str | None = None, name
             tmp.unlink(missing_ok=True)
 
 
-def secret_manifest(name: str, data: dict[str, str], type_: str = "Opaque") -> str:
+def secret_manifest(name: str, data: dict[str, str], type_: str = "Opaque", namespace: str = NS) -> str:
     """Secret のマニフェスト（JSON は YAML として有効）。キーの順を固定して、差分が出ないようにする。
     CloudNativePG の初期化に渡す Secret は type_="kubernetes.io/basic-auth" にする。"""
     return json.dumps({
         "apiVersion": "v1",
         "kind": "Secret",
-        "metadata": {"name": name, "namespace": NS},
+        "metadata": {"name": name, "namespace": namespace},
         "type": type_,
         "data": {k: base64.b64encode(v.encode()).decode() for k, v in sorted(data.items())},
     }, indent=2)

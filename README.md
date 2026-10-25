@@ -44,6 +44,18 @@ aws configure sso              # プロファイルを作り、aws sso login --p
 
 人が行うこと: Bedrock のモデルアクセス（Anthropic の Claude）を有効にする、ACM の検証用 CNAME（配備の途中で表示）と、ホスト名 → ALB の CNAME（`./lab litellm` が表示）を手持ちの DNS に足す。`./lab down` は AWS の有料リソース（EKS、ALB、Aurora、ElastiCache、EFS、NAT、S3 の監査ログ、秘密情報）をすべて消します。残るのは無料のもの（ACM の証明書、Identity Center、DNS の CNAME、CDK の bootstrap）だけです。
 
+## AWS の EC2 3 台と S3 だけで動かす（`LAB_TARGET=aws-ec2`）
+
+マネージドサービスを使わず、EC2 3 台（別 AZ、k3s の server 3 台）と S3 だけで同じ構成を動かす 3 つ目の環境です。Kubernetes の中は Mac の k3d と同じ（CloudNativePG 3 台、Valkey と Sentinel、Traefik）で、RustFS だけ S3 に替わります。1 台が落ちても処理が続き、`./lab down` で有料のものがすべて消えます（経緯は `.history/2026-10-25-EC2三台構成/`。実装済み、配備はアカウントの制限の解除待ち）。
+
+```bash
+brew install awscli kubectl-cnpg && brew install --cask session-manager-plugin
+# .env: LAB_TARGET=aws-ec2、LAB_AWS_PROFILE、LAB_AWS_HOSTNAME、LAB_CLOUDFLARE_API_TOKEN（Zone / DNS / Edit）、LAB_ACME_EMAIL
+./lab up   # CloudFormation（Elastic IP、S3 と IAM ユーザー、VPC、EC2 3 台）→ k3s → イメージを中の registry へ → LiteLLM → Let's Encrypt
+```
+
+人が行うこと: `./lab litellm` が表示する Elastic IP への A レコードを Cloudflare に足す（DNS のみ）。入口は keepalived が Elastic IP を 3 台の間で移し、HTTPS は cert-manager が Let's Encrypt（DNS-01）で取ります。構築ツールは Systems Manager の Session Manager で k3s の API に届くので、SSH も 6443 も開けません。障害の試験は Mac と同じ場面に `--scenario eip-node`（入口の台を止める）が加わります。
+
 ## よく使うコマンド
 
 | コマンド | 内容 |
@@ -54,7 +66,7 @@ aws configure sso              # プロファイルを作り、aws sso login --p
 | `./lab upgrade v1.x.y` | LiteLLM のローリング更新 |
 | `./lab test-unit` / `test-smoke` / `test-idempotency` / `test-load` | 試験 |
 | `./lab test-judge [--context \| --isolated]` | 審査官の事例試験（本物の審査官を呼ぶので ChatGPT の利用枠を使う。指定なしは両方の審査） |
-| `./lab test-failover [--pooler direct]` / `test-restore` | DB と Redis の障害の試験（AWS は `--scenario litellm-drain` / `aurora-failover` / `valkey-failover`） / バックアップから任意の時点に戻す試験 |
+| `./lab test-failover [--pooler direct]` / `test-restore` | DB と Redis の障害の試験（EKS 版は `--scenario litellm-drain` / `aurora-failover` / `valkey-failover`、EC2 3 台は Mac の場面 ＋ `eip-node`） / バックアップから任意の時点に戻す試験 |
 | `./lab test-audit` | 監査ログの試験（記録、整形、検索アプリ、精算、改ざんの防止、退避と再送） |
 | `./lab audit-synth` / `audit-bench` / `audit-compact` | 検索の速さの試験用の合成データ / 速さの試験 / 監査ログの整形を手で流す |
 | `./lab review-log` | 審査の判定ログの集計 |

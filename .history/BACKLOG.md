@@ -50,9 +50,10 @@
 ## AWS の EC2 3 台構成（`LAB_TARGET=aws-ec2`）
 概要: .history/2026-10-25-EC2三台構成/変更仕様書.md（ブランチ `feature/aws-ec2-pair`。ワークツリー `~/orca/workspaces/litellm-agent-gateway-lab/feature-aws-target-2`）
 
-- [ ] 変更仕様書の「13. 前提」（「EC2 と S3 のみ」の範囲に IAM・CloudFormation・Session Manager・Bedrock を含めてよいか、イメージは S3 経由、`chatgpt/` を置かない、`t4g.large` × 3、Elastic IP は down で消す）をユーザーに確認し、確定したら 0.2 の決定事項に移す（追加 2026-10-25、重要 高）
-- [ ] 実装（変更設計書 3〜6 章）: `cfn/` の 4 スタック（eip、storage の描画、network、nodes の cloud-init と keepalived）、`labtool/ec2.py`（配備、SSM のポート転送、kubeconfig、S3 経由のイメージ取り込み、down）、`stages.py` の `aws-ec2` 分岐、`render.py` の TLS の入口と Bedrock の資格情報、`postgres-cnpg.yaml` の `endpointURL` 省略と接頭辞、`failover.py` の `eip-node` と EC2 の停止。単体試験とテンプレートの検査まで（アカウントの制限の解除前に進められる）（追加 2026-10-25、重要 高）
-- [ ] 配備と試験（変更設計書 9 章）: EC2 の vCPU 上限と Bedrock の解除後に `./lab up` → Cloudflare に A レコード → `test-smoke` → `test-idempotency` → `test-audit` → `test-failover`（`pg-*`、`valkey-*`、`eip-node`）→ `test-judge` → 1 台を止めたまま `up` → `down` → `up`。費用の実測を記録（追加 2026-10-25、重要 高）
+- [ ] 変更仕様書の「13. 前提」に残る 2 つ（Elastic IP は `./lab down` で消すのが既定、リージョン・Object Lock・SSO は EKS 版と同じ）をユーザーに確認し、確定したら 0.2 の決定事項に移す（追加 2026-10-25、重要 中）
+- [ ] 配備と試験（変更設計書 9 章）: EC2 の vCPU 上限と Bedrock の解除後に、`.env` の `LAB_TARGET=aws-ec2`、`LAB_CLOUDFLARE_API_TOKEN`、`LAB_ACME_EMAIL` を入れ、`brew install --cask session-manager-plugin` → `./lab up` → Cloudflare に A レコード → `test-smoke` → `test-idempotency` → `test-audit` → `test-failover`（`pg-*`、`valkey-*`、`eip-node`）→ `test-judge` → 1 台を止めたまま `up` → `down` → `up`。費用の実測を記録。配備で確かめること 5 点は変更設計書 10 章（別 AZ 間のユニキャスト VRRP、Traefik チャートの redirections の形、cert-manager の replicaCount の名前、6443 の /ping、Session Manager の転送の寿命）（追加 2026-10-25、重要 高）
+- [x] (2026-10-25) 4 回目のヒアリング（1A 無料の IAM・CloudFormation・Session Manager と従量の Bedrock は使ってよい、2 クラスタの中に registry を立てて保存先を S3 に、3A `chatgpt/` を置かない、4A `t4g.large` × 3）で前提を確定し 0.2 に移した
+- [x] (2026-10-25) 実装: `labtool/cfn.py`（4 スタックのテンプレートを JSON で組む）、`cfn/node-init.sh`（k3s の分裂しない起こし方、keepalived、registry のミラー）、`labtool/ec2.py`（配備、SSM の Run Command とポート転送、kubeconfig、静的キーの受け渡し、EC2 の停止、削除）、`stages.py` の `aws-ec2` 分岐（registry、オペレーター replica 2、Let's Encrypt の入口）、`render.py`（Bedrock の静的キー、TLS の経路の写し、registry、`pg_backup_values`）、`objectstore.py`（利用者ごとの検査を両環境で共通に）、`failover.py`（`eip-node`、EC2 の停止）、`ops.py`、`lab`、`k8s/postgres-cnpg.yaml`、`k8s/traefik-config-ec2.yaml`、`.env.example`、README。単体試験 65 本（12 本追加）、cfn-lint と `validate-template` が通る。配備は未実施（ユーザー指示: 実装だけ）
 - [ ] 試験の後、変更仕様書 12 章・変更設計書 12 章の表に従って `docs/spec.md` と `docs/design.md` に反映する（追加 2026-10-25、重要 中）
 - [x] (2026-10-25) 2 台案 → 3 台案 → CloudFormation のみ、の 3 回のヒアリングで決定（1A 3 台、2B Elastic IP ＋ keepalived ＋ Let's Encrypt、3B 静的キー、4A `.env`、5A 3 つ目の環境、6A 文書を一度に、基盤は素の CloudFormation）。変更仕様書と変更設計書を書いた
 

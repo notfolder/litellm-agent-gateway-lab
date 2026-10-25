@@ -269,10 +269,11 @@ def audit_test(env: Env) -> None:
             raw_bucket = render.bucket_name(env, render.AUDIT_RAW)
             ver = s3.head_object(Bucket=raw_bucket, Key=key0).get("VersionId")
             if env.is_aws:
-                # AWS の利用者は IAM ロール（Pod Identity）で、Mac からは借りられない。ロールごとの検査はクラスタの中で
+                # EKS 版の利用者は IAM ロール（Pod Identity）で、Mac からは借りられない。ロールごとの検査はクラスタの中で
                 # 行う（変更仕様書 2026-10-24-AWS構成 7.2 節。別の試験）。ここでは管理者の資格情報だけで確かめる
                 warn("AWS: 書き込み用・検索アプリのロールで消せないことの検査は、クラスタの中の試験で行います（省略）")
             else:
+                # Mac（RustFS の利用者）と aws-ec2（IAM ユーザーの静的キー）は同じ検査
                 with objstore.user_s3(env, "litellm-writer") as writer, objstore.user_s3(env, "audit-viewer") as viewer:
                     c.check("原本は、書き込み用・検索アプリの資格情報では消せない",
                             lambda: denied(writer, raw_bucket, key0, ver) and denied(viewer, raw_bucket, key0, ver))
@@ -374,7 +375,7 @@ def audit_test(env: Env) -> None:
 
         # S3 に書けないとき: 退避して、戻ったら再送する（RustFS を止めるので port-forward の外で）。
         # AWS の S3 は止められないので Mac だけ（退避と再送の作り自体は環境を知らない）
-        if env.is_aws:
+        if env.on_aws:
             warn("AWS: S3 を止めて退避と再送を確かめる試験は、Mac（RustFS）だけで行います（省略）")
         else:
             info("RustFS を止めて要求を送り、戻してから再送を確かめます")

@@ -31,6 +31,20 @@ def down() -> None:
         aws.purge_retained(env)
         ok(f"AWS の有料リソースを削除しました（残るのは無料の {env.aws_prefix}-cert の証明書と CDK の bootstrap）")
         return
+    if env.is_aws_ec2:
+        from . import ec2
+        # 証明書を退避してから（Let's Encrypt の発行数の上限を避ける）、nodes → network → storage →（eip）を消す。
+        # IAM ユーザーとキーは storage と一緒に消える。残るのは DNS の A レコードと .build/ の退避だけ
+        if ec2.OUTPUTS_FILE.exists():
+            try:
+                ec2.ensure_forward(env)
+                ec2.save_tls_secret(env)
+            except LabError as e:
+                warn(f"証明書の退避を飛ばします（{e}）")
+        ec2.destroy(env, keep_eip=env.ec2_keep_eip)
+        ok("AWS の有料リソースを削除しました（EC2、EBS、S3、IAM ユーザー"
+           + ("。Elastic IP は残しました）" if env.ec2_keep_eip else "、Elastic IP）"))
+        return
     if cluster_exists():
         run(["k3d", "cluster", "delete", CLUSTER])
         ok(f"クラスタ {CLUSTER} を削除しました")
@@ -41,9 +55,10 @@ def down() -> None:
 def status(env: Env) -> None:
     """状態の表示（何も変更しない）。"""
     step("status 状態")
-    if env.is_aws:
+    if env.on_aws:
         if not succeeds(kn("get", "ns"), timeout=60):
-            warn(f"EKS {env.aws_cluster_name} に届きません（./lab up で作るか、aws sso login でサインインします）")
+            where = f"EKS {env.aws_cluster_name}" if env.is_aws else "EC2 3 台の k3s"
+            warn(f"{where} に届きません（./lab up で作るか、aws sso login でサインインします）")
             return
     elif not cluster_exists():
         warn(f"クラスタ {CLUSTER} はありません（./lab up で作ります）")
@@ -84,8 +99,8 @@ def clean_all(assume_yes: bool) -> None:
     """クラスタ、生成したクライアント設定、ビルドした LiteLLM イメージを消す。
     残すもの: .env、ChatGPT のトークン、イメージの置き場（Docker Hub のキャッシュを含む）。"""
     step("clean-all 全削除")
-    if Env.load().is_aws:
-        raise LabError("LAB_TARGET=aws では clean-all は使えません。AWS 側は ./lab down が有料のものをすべて消します。"
+    if Env.load().on_aws:
+        raise LabError("LAB_TARGET=aws / aws-ec2 では clean-all は使えません。AWS 側は ./lab down が有料のものをすべて消します。"
                        "ローカルの生成物（clients/out、.build）は LAB_TARGET=local で clean-all を流してください")
     print(f"""次を削除します:
   - クラスタ {CLUSTER}（DB を含む）

@@ -1,0 +1,48 @@
+# k3s 同梱の Traefik の設定（LAB_TARGET=aws-ec2。変更設計書 .history/2026-10-25-EC2三台構成/ 2 章、4.6 節）。
+# Mac の traefik-config.yaml との違い:
+# - replica 2。3 台とも server ノードなので「server ノードに置く」では 1 台に寄らず、入口の Pod が載った台が
+#   止まっても Service の宛先が残るように 2 つにする
+# - web（80）は websecure（443）へ転送する。経路（IngressRoute）は websecure 側に TLS 付きで置く（render.tls_ingressroutes）
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    deployment:
+      replicas: 2
+    ports:
+      web:
+        redirections:
+          entryPoint:
+            to: websecure
+            scheme: https
+            permanent: true
+        transport:
+          respondingTimeouts:
+            readTimeout: 600s
+            writeTimeout: 600s
+            idleTimeout: 600s
+      websecure:
+        transport:
+          respondingTimeouts:
+            readTimeout: 600s
+            writeTimeout: 600s
+            idleTimeout: 600s
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: traefik
+    # アクセスログ（入口で返した状態コードと、どの Pod に送ったかを残す。502 などの切り分けに使う）
+    logs:
+      access:
+        enabled: true
+        fields:
+          headers:
+            defaultmode: drop
