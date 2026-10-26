@@ -107,3 +107,8 @@ migrationJob:
 
 ingress:
   enabled: false                       # k8s/ingress.yaml（Traefik）を使う
+
+# ノードの入れ替え（Kubernetes の版上げ、EKS Auto Mode の drain）で 2 台が同時に追い出されないようにする
+pdb:
+  enabled: true
+  maxUnavailable: 1

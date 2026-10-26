@@ -633,12 +633,16 @@ def litellm(env: Env) -> None:
         ok(f"LiteLLM のリリースは最新です（値のハッシュ {values_hash}）")
     else:
         info("LiteLLM を helm upgrade --install します")
+        # LiteLLM の PDB はチャートの値（litellm/values.yaml の pdb）で付く。一時期 ./lab litellm が別のマニフェストで
+        # 同名の PDB を付けていたので、Helm 管理でない PDB `litellm` が残っていれば消す（残っていると helm が所有権で失敗する）
+        stale = json_output(kn("get", "pdb", "litellm", "--ignore-not-found", "-o", "json"))
+        if stale and stale.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/managed-by") != "Helm":
+            run(kn("delete", "pdb", "litellm", "--ignore-not-found"), quiet=True)
         run(helm("upgrade", "--install", HELM_RELEASE, LITELLM_CHART, "--version", env.chart_version,
                  "-n", NS, "-f", str(values_file), "-f", str(overrides_file),
                  "--set-string", f"labValuesHash={values_hash}", "--wait", "--timeout", "15m"))
 
     rollout("deploy/litellm", 600, "LiteLLM の起動")
-    kapply(manifest=render.litellm_pdb_manifest())   # drain で 2 つの Pod が同時に消えないように（3 環境で同じ）
     if env.is_aws:
         _ingress_aws(env, out, viewer=bool(render.audit_oidc_client(env)[0]))
     else:

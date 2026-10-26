@@ -57,7 +57,7 @@
 - [ ] 試験の後、変更仕様書 12 章・変更設計書 12 章の表に従って `docs/spec.md` と `docs/design.md` に反映する。`.history/2026-10-26-k3s版上げ/` の変更仕様書 6 章・変更設計書 7 章（`docs/maintenance.md` を含む）も一緒に（追加 2026-10-25、2026-10-26 に追記、重要 中）
 - [ ] k3s の版上げの試験（`.history/2026-10-26-k3s版上げ/変更仕様書.md` 4 章）: 配備と障害の試験の後に `./lab upgrade-k8s <次のマイナー版> --measure`、パッチの更新、飛ばす・下げる指示、途中で止めて再実行、上げた後の `./lab up`（`K3S_IMAGE` の案内）、1 台の作り直し、AMI の固定の確認（nodes スタックに差分が出ない）。配備で確かめることは変更設計書 6 章（`config.yaml` の `server:` が再起動で無視されるか、drain の時間、`K3S_TOKEN` が消えても server が起きるか、Traefik の値の形、Elastic IP の移動）（追加 2026-10-26、重要 高）
 - [ ] AMI を新しくする手順（1 台ずつ作り直す）。`resolve_ami` が配備済みの AMI を固定で返すので、放っておくと AMI が古くなる。案: `./lab upgrade-ami` で nodes スタックの `AmiId` を更新しつつ、台ごとに drain → インスタンスの作り直し（CloudFormation の 3 台を別々の論理 ID にしてあるので、1 台ずつ `Replace` する手立てが要る）（追加 2026-10-26、重要 低）
-- [x] (2026-10-26) k3s のマイナー版の無停止の版上げを調査（構成は耐えられるが手順が無く、user data の版変更で 3 台が同時再起動する。AMI の「最新」参照で配備後の `./lab up` が 3 台を置き換える不具合も発見）。ユーザー回答 1A（AMI の固定を今直す）・2C（手順を全部今書く）で実装: `AmiId` を固定 ID で受ける `resolve_ami`、k3s の版を SSM のパラメータに、`node-init.sh` の引数を `config.yaml` に、`./lab upgrade-k8s <版> [--measure]`（1 台ずつ、Elastic IP の台は最後、転送の張り直し、etcd のスナップショット、マイナー版 1 つずつ）、LiteLLM の PDB、`./lab cluster` の版の食い違いの検知。単体試験 68 本、cfn-lint、`validate-template` が通る。変更仕様書・変更設計書は `.history/2026-10-26-k3s版上げ/`
+- [x] (2026-10-26) k3s のマイナー版の無停止の版上げを調査（構成は耐えられるが手順が無く、user data の版変更で 3 台が同時再起動する。AMI の「最新」参照で配備後の `./lab up` が 3 台を置き換える不具合も発見）。ユーザー回答 1A（AMI の固定を今直す）・2C（手順を全部今書く）で実装: `AmiId` を固定 ID で受ける `resolve_ami`、k3s の版を SSM のパラメータに、`node-init.sh` の引数を `config.yaml` に、`./lab upgrade-k8s <版> [--measure]`（1 台ずつ、Elastic IP の台は最後、転送の張り直し、etcd のスナップショット、マイナー版 1 つずつ）、`./lab cluster` の版の食い違いの検知。LiteLLM の PDB は親ブランチ `feature/aws-target` の Helm チャートの値（`maxUnavailable: 1`）に寄せた（2 つ付くと drain が止まる）。単体試験 67 本、cfn-lint、`validate-template` が通る。変更仕様書・変更設計書は `.history/2026-10-26-k3s版上げ/`
 - [x] (2026-10-25) 2 台案 → 3 台案 → CloudFormation のみ、の 3 回のヒアリングで決定（1A 3 台、2B Elastic IP ＋ keepalived ＋ Let's Encrypt、3B 静的キー、4A `.env`、5A 3 つ目の環境、6A 文書を一度に、基盤は素の CloudFormation）。変更仕様書と変更設計書を書いた
 
 ## 冗長化と監査ログ
@@ -65,4 +65,5 @@
 
 - [ ] 本番の規模（1 日 1,000 万件）での検索の速さの実測（今は合成データ 1 日 100 万件 × 7 日からの見積もり）（追加 2026-10-12、重要 低）
 - [ ] 本番に向けて、CloudNativePG のオペレーター・cert-manager・Traefik を複数台にする（検証では server ノードに固定）（追加 2026-10-12、重要 低）
+  - 2026-10-26: Mac の k3d は Kubernetes の版上げが無停止でできない（k3d に版を上げる命令が無く、server 1 台に制御部分の SQLite と Traefik・RustFS・オペレーターが固定）。無停止にするなら server 3 台（組み込み etcd）とこの固定の解除が要る。ユーザー判断で記録のみ（`docs/maintenance.md` 3.3）。EKS は Auto Mode が PDB を守ってノードを入れ替えるので無停止。LiteLLM に PDB（`maxUnavailable: 1`）を足した
 - [ ] 無停止のメンテナンスの改善案（`docs/maintenance.md` 4 章）: LiteLLM の PDB と anti-affinity、長いストリーミングとローリング更新の試験、Valkey の更新の手順、`./lab upgrade` での移行の互換性の確認（追加 2026-10-12、重要 低）

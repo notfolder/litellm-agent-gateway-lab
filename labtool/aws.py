@@ -122,7 +122,7 @@ def spec(env: Env, ident: dict) -> dict:
         "hostname": env.aws_hostname,
         "operator_principal_arn": operator_principal_arn(ident, lambda r: iam_role_arn(env, r)),
         "cluster_name": env.aws_cluster_name,
-        "kubernetes_version": env.get("LAB_EKS_VERSION", "1.34"),
+        "kubernetes_version": env.get("LAB_EKS_VERSION", "1.35"),
         "bucket_prefix": render.bucket_prefix(env, ident["Account"]),
         "buckets": {name: {"lock": b["lock"], "versioning": b["versioning"], "lifecycle": b["lifecycle"]}
                     for name, b in buckets.items() if name != render.PG_BACKUP},

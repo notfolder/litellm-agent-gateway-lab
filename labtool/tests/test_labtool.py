@@ -704,12 +704,6 @@ class Ec2TargetTest(unittest.TestCase):
         self.assertEqual(ec2.upgrade_order(ids, "i-2", forward_target="i-2"), ["i-1", "i-3", "i-2"])
         self.assertEqual(ec2.upgrade_order(ids, None), ids)
 
-    def test_litellm_pdb_manifest(self):
-        pdb = json.loads(render.litellm_pdb_manifest())
-        self.assertEqual(pdb["kind"], "PodDisruptionBudget")
-        self.assertEqual(pdb["spec"]["minAvailable"], 1)
-        self.assertEqual(pdb["spec"]["selector"]["matchLabels"], {"app.kubernetes.io/name": "litellm"})
-
 
 class CfnTemplateTest(unittest.TestCase):
     """CloudFormation のテンプレート（labtool/cfn.py）。"""

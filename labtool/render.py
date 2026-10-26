@@ -9,7 +9,7 @@ from pathlib import Path
 
 import yaml
 
-from .core import CHATGPT_TOKEN_IN_NODE, NS, ROOT, Env
+from .core import CHATGPT_TOKEN_IN_NODE, ROOT, Env
 
 FAKE_LLM_BASE = "http://fake-llm.litellm-lab.svc.cluster.local:8000/v1"
 WORKSPACE_MCP_URL = "http://workspace-mcp.litellm-lab.svc.cluster.local:8000/mcp"
@@ -827,17 +827,6 @@ def alb_ingress_manifest(env: Env, out: dict, viewer: bool) -> str:
 
 
 # ---- EC2 3 台の環境（LAB_TARGET=aws-ec2）。変更設計書 .history/2026-10-25-EC2三台構成/ 2 章、4.6 節 ----
-def litellm_pdb_manifest() -> str:
-    """LiteLLM の PodDisruptionBudget（minAvailable 1）。ノードの drain（k3s の版上げ）で、HPA が同じ台に置いた
-    2 つの Pod が同時に追い出されるのを防ぐ。ノードの故障（追い出しではない）には効かない（docs/maintenance.md 4 章の改善案）。
-    3 環境で同じに付ける。"""
-    return json.dumps({
-        "apiVersion": "policy/v1", "kind": "PodDisruptionBudget",
-        "metadata": {"name": "litellm", "namespace": NS},
-        "spec": {"minAvailable": 1, "selector": {"matchLabels": {"app.kubernetes.io/name": "litellm"}}},
-    }, indent=2) + "\n"
-
-
 EC2_REGISTRY_NAME = "lab-registry"
 EC2_REGISTRY_IMAGE = "registry:3.0.0"
 EC2_TLS_SECRET = "litellm-tls"

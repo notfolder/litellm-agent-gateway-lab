@@ -74,7 +74,7 @@ def stage(fn):
 
 COMMANDS: dict[str, tuple[str, object]] = {
     "up": ("全段階を順に流す（何度でも可）", up),
-    "down": ("クラスタを削除する（Mac: k3d。AWS: 有料のものをすべて消す）", ops.down),
+    "down": ("クラスタを削除する（Mac: k3d。AWS: 有料のものをすべて消す。残るのは無料の証明書と CDK の bootstrap）", ops.down),
     "rebuild": ("クラスタを削除して作り直す（所要時間を表示）", rebuild),
     "status": ("状態を表示する", stage(ops.status)),
     # 段階ごと
