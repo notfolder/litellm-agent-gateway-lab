@@ -638,6 +638,7 @@ def litellm(env: Env) -> None:
                  "--set-string", f"labValuesHash={values_hash}", "--wait", "--timeout", "15m"))
 
     rollout("deploy/litellm", 600, "LiteLLM の起動")
+    kapply(manifest=render.litellm_pdb_manifest())   # drain で 2 つの Pod が同時に消えないように（3 環境で同じ）
     if env.is_aws:
         _ingress_aws(env, out, viewer=bool(render.audit_oidc_client(env)[0]))
     else:

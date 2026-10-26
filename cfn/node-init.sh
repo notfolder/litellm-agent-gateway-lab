@@ -11,7 +11,7 @@ SELF_IP="@@SELF_IP@@"                  # 自分のプライベート IP（固定
 FIRST_IP="@@FIRST_IP@@"                # 1 番の台のプライベート IP
 PEER_IPS="@@PEER_IPS@@"                # 他の 2 台のプライベート IP（空白区切り）
 SECONDARY_IP="@@SECONDARY_IP@@"        # Elastic IP を付ける 2 つ目のプライベート IP
-K3S_VERSION="@@K3S_VERSION@@"          # 例 v1.35.5+k3s1
+VERSION_PARAM="@@VERSION_PARAM@@"      # k3s の版を置く SSM のパラメータ名（例の値 v1.35.5+k3s1。版上げ後は新しい版）
 TOKEN_PARAM="@@TOKEN_PARAM@@"          # SSM のパラメータ名（SecureString）
 EIP_ALLOCATION_ID="@@EIP_ALLOCATION_ID@@"
 PRIORITY="@@PRIORITY@@"                # keepalived の優先度（1 番が高い）
@@ -38,6 +38,9 @@ REGISTRY_NAME="${REGISTRY_HOST%%:*}"
 grep -q " ${REGISTRY_NAME}\$" /etc/hosts || echo "127.0.0.1 ${REGISTRY_NAME}" >> /etc/hosts
 
 # ---- k3s ----
+# 版は SSM のパラメータから（user data に書かない。./lab upgrade-k8s が上げた後に作り直した台も、同じ版で参加する）
+K3S_VERSION="$(aws ssm get-parameter --region "$REGION" --name "$VERSION_PARAM" \
+                --query Parameter.Value --output text)"
 TOKEN="$(aws ssm get-parameter --region "$REGION" --name "$TOKEN_PARAM" --with-decryption \
           --query Parameter.Value --output text)"
 
@@ -62,19 +65,26 @@ if [ -z "$JOIN" ] && [ "$NODE_INDEX" != "1" ]; then
   [ -n "$JOIN" ] || { echo "the first node did not come up"; exit 1; }
 fi
 
-# Mac の k3d と同じ引数（ノードが止まったら 30 秒で Pod を移す）。Traefik と ServiceLB は同梱のものを使う
-K3S_ARGS=(server --node-ip "$SELF_IP"
-  --kube-apiserver-arg=default-not-ready-toleration-seconds=30
-  --kube-apiserver-arg=default-unreachable-toleration-seconds=30
-  --kube-controller-manager-arg=node-monitor-grace-period=20s)
-if [ -n "$JOIN" ]; then
-  echo "joining the cluster via $JOIN"
-  K3S_ARGS+=(--server "https://${JOIN}:6443")
-else
-  echo "initializing a new cluster"
-  K3S_ARGS+=(--cluster-init)
-fi
-curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" K3S_TOKEN="$TOKEN" sh -s - "${K3S_ARGS[@]}"
+# 引数は設定ファイルに書く（コマンドラインに書くと、版上げでインストールスクリプトを再実行したときに消える）。
+# 内容は Mac の k3d と同じ（ノードが止まったら 30 秒で Pod を移す）。Traefik と ServiceLB は同梱のものを使う。
+# 参加先（server）と cluster-init は初回だけ意味を持ち、etcd のデータがある台の再起動では無視される
+{
+  echo "node-ip: ${SELF_IP}"
+  echo "kube-apiserver-arg:"
+  echo "  - default-not-ready-toleration-seconds=30"
+  echo "  - default-unreachable-toleration-seconds=30"
+  echo "kube-controller-manager-arg:"
+  echo "  - node-monitor-grace-period=20s"
+  if [ -n "$JOIN" ]; then
+    echo "server: https://${JOIN}:6443"
+  else
+    echo "cluster-init: true"
+  fi
+} > /etc/rancher/k3s/config.yaml
+chmod 600 /etc/rancher/k3s/config.yaml
+if [ -n "$JOIN" ]; then echo "joining the cluster via $JOIN"; else echo "initializing a new cluster"; fi
+# トークンは参加のときだけ環境変数で渡す（server/token に保存され、以後の再起動と版上げでは要らない）
+curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" K3S_TOKEN="$TOKEN" sh -s - server
 unset TOKEN
 
 for _ in $(seq 1 120); do

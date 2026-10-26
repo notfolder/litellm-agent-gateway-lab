@@ -221,14 +221,16 @@ def network_template(env: Env) -> dict:
 
 # ---- nodes ----
 def render_node_init(env: Env, node: dict, plan: dict, token_param: str, eip_allocation_id: str,
-                     script: str | None = None) -> str:
-    """node-init.sh の @@名前@@ を、この台の値で置き換える（Fn::Sub は使わない。シェルの ${...} と衝突するため）。"""
+                     script: str | None = None, version_param: str = "") -> str:
+    """node-init.sh の @@名前@@ を、この台の値で置き換える（Fn::Sub は使わない。シェルの ${...} と衝突するため）。
+    k3s の版は user data に埋め込まず、SSM のパラメータ（version_param）から読む。版を上げても user data が変わらず、
+    CloudFormation が 3 台を同時に再起動しない（変更設計書 2026-10-26-k3s版上げ 3 章）。"""
     text = script if script is not None else NODE_INIT_SCRIPT.read_text()
     peers = [n["private_ip"] for n in plan["nodes"] if n["index"] != node["index"]]
     values = {
         "REGION": env.aws_region, "NODE_INDEX": str(node["index"]), "SELF_IP": node["private_ip"],
         "FIRST_IP": plan["nodes"][0]["private_ip"], "PEER_IPS": " ".join(peers),
-        "SECONDARY_IP": node["secondary_ip"], "K3S_VERSION": k3s_install_version(),
+        "SECONDARY_IP": node["secondary_ip"], "VERSION_PARAM": version_param,
         "TOKEN_PARAM": token_param, "EIP_ALLOCATION_ID": eip_allocation_id,
         "PRIORITY": str(PRIORITIES[node["index"] - 1]), "REGISTRY_HOST": REGISTRY_HOST,
         "REGISTRY_NODEPORT": str(REGISTRY_NODEPORT),
@@ -241,13 +243,16 @@ def render_node_init(env: Env, node: dict, plan: dict, token_param: str, eip_all
     return text
 
 
-def nodes_template(env: Env, token_param: str, eip_allocation_id: str, script: str | None = None) -> dict:
+def nodes_template(env: Env, token_param: str, eip_allocation_id: str, script: str | None = None,
+                   version_param: str = "") -> dict:
     """EC2 3 台（別サブネット、固定のプライベート IP 2 つずつ）、インスタンスロール、cloud-init。
-    AMI は SSM の公開パラメータ（AL2023 arm64 の最新）。参加トークンは SSM のパラメータから取る。
+    AMI は固定の ID をパラメータで受ける（labtool が初回に SSM の公開パラメータから解き、以後は同じ値を渡す。
+    「最新」を指すパラメータを直接参照すると、新しい AMI が出た後の配備で 3 台が同時に置き換えられる）。
+    参加トークンと k3s の版は SSM のパラメータから取る。
     Elastic IP の割り当て ID は eip スタックの出力をそのまま埋め込む（keepalived のスクリプトが使う）。"""
     plan = network_plan(env.ec2_vpc_cidr)
     params: dict = {
-        "AmiId": {"Type": "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>", "Default": AMI_PARAMETER},
+        "AmiId": {"Type": "AWS::EC2::Image::Id"},
         "InstanceType": {"Type": "String", "Default": env.ec2_instance_type},
         "SecurityGroupId": {"Type": "AWS::EC2::SecurityGroup::Id"},
     }
@@ -264,15 +269,16 @@ def nodes_template(env: Env, token_param: str, eip_allocation_id: str, script: s
                 # Elastic IP の付け替え（keepalived の notify_master）
                 {"Effect": "Allow", "Action": ["ec2:AssociateAddress", "ec2:DisassociateAddress", "ec2:DescribeAddresses"],
                  "Resource": "*", "Condition": {"StringEquals": {"aws:RequestedRegion": env.aws_region}}},
-                # k3s の参加トークン
+                # k3s の参加トークンと版
                 {"Effect": "Allow", "Action": ["ssm:GetParameter"],
-                 "Resource": {"Fn::Sub": f"arn:${{AWS::Partition}}:ssm:${{AWS::Region}}:${{AWS::AccountId}}:parameter{token_param}"}},
+                 "Resource": [{"Fn::Sub": f"arn:${{AWS::Partition}}:ssm:${{AWS::Region}}:${{AWS::AccountId}}:parameter{p}"}
+                              for p in (token_param, version_param)]},
             ]}}]}},
         "NodeProfile": {"Type": "AWS::IAM::InstanceProfile", "Properties": {"Roles": [{"Ref": "NodeRole"}]}},
     }
     for node in plan["nodes"]:
         i = node["index"]
-        user_data = render_node_init(env, node, plan, token_param, eip_allocation_id, script)
+        user_data = render_node_init(env, node, plan, token_param, eip_allocation_id, script, version_param)
         res[f"Node{i}"] = {"Type": "AWS::EC2::Instance", "Properties": {
             "ImageId": {"Ref": "AmiId"}, "InstanceType": {"Ref": "InstanceType"},
             "IamInstanceProfile": {"Ref": "NodeProfile"},
@@ -299,10 +305,11 @@ def nodes_template(env: Env, token_param: str, eip_allocation_id: str, script: s
             "Parameters": params, "Resources": res, "Outputs": outputs}
 
 
-def templates(env: Env, account: str, token_param: str, eip_allocation_id: str) -> dict[str, dict]:
+def templates(env: Env, account: str, token_param: str, eip_allocation_id: str, version_param: str = "") -> dict[str, dict]:
     """4 スタックのテンプレート。nodes は eip スタックの出力（割り当て ID）が要るので、eip の配備の後に描く。"""
     return {"eip": eip_template(env), "storage": storage_template(env, account),
-            "network": network_template(env), "nodes": nodes_template(env, token_param, eip_allocation_id)}
+            "network": network_template(env),
+            "nodes": nodes_template(env, token_param, eip_allocation_id, version_param=version_param)}
 
 
 def write_template(doc: dict, path: Path) -> Path:

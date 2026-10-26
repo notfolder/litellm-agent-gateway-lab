@@ -681,6 +681,35 @@ class Ec2TargetTest(unittest.TestCase):
         self.assertEqual(failover.scenarios_for(env(LAB_TARGET="aws", LAB_AWS_HOSTNAME="x")), failover.SCENARIOS_AWS)
         self.assertEqual(failover.LIMITS["eip-node"], 30)
 
+    def test_k3s_version_rules(self):
+        """k3s の版上げ（./lab upgrade-k8s）: 版の形、マイナー版を 1 つずつ、下げない。"""
+        from labtool import ec2
+        from labtool.core import LabError
+        self.assertEqual(ec2.parse_k3s_version("v1.35.5+k3s1"), (1, 35, 5))
+        self.assertEqual(ec2.normalize_k3s_version("v1.36.1-k3s1"), "v1.36.1+k3s1")
+        ec2.check_upgrade_step("v1.35.5+k3s1", "v1.36.1+k3s1")    # 次のマイナー版
+        ec2.check_upgrade_step("v1.35.5+k3s1", "v1.35.7+k3s1")    # 同じマイナー版のパッチ
+        for bad in ("v1.37.0+k3s1", "v1.35.4+k3s1", "v1.34.9+k3s1", "v2.0.0+k3s1"):
+            with self.assertRaises(LabError):
+                ec2.check_upgrade_step("v1.35.5+k3s1", bad)
+        with self.assertRaises(LabError):
+            ec2.parse_k3s_version("1.36.1")
+        self.assertEqual(ec2.version_parameter(self.ec2()), "/litellm-lab-ec2/k3s-version")
+
+    def test_k3s_upgrade_order_puts_eip_holder_last(self):
+        from labtool import ec2
+        ids = ["i-1", "i-2", "i-3"]
+        self.assertEqual(ec2.upgrade_order(ids, "i-2"), ["i-1", "i-3", "i-2"])
+        self.assertEqual(ec2.upgrade_order(ids, "i-2", forward_target="i-1"), ["i-3", "i-1", "i-2"])
+        self.assertEqual(ec2.upgrade_order(ids, "i-2", forward_target="i-2"), ["i-1", "i-3", "i-2"])
+        self.assertEqual(ec2.upgrade_order(ids, None), ids)
+
+    def test_litellm_pdb_manifest(self):
+        pdb = json.loads(render.litellm_pdb_manifest())
+        self.assertEqual(pdb["kind"], "PodDisruptionBudget")
+        self.assertEqual(pdb["spec"]["minAvailable"], 1)
+        self.assertEqual(pdb["spec"]["selector"]["matchLabels"], {"app.kubernetes.io/name": "litellm"})
+
 
 class CfnTemplateTest(unittest.TestCase):
     """CloudFormation のテンプレート（labtool/cfn.py）。"""
@@ -742,8 +771,9 @@ class CfnTemplateTest(unittest.TestCase):
         self.assertEqual(ports, {(80, 80), (443, 443)})           # 外から開けるのは 80 と 443 だけ
         self.assertEqual(res["NodeToNode"]["Properties"]["IpProtocol"], "-1")
         script = "#!/bin/bash\nR=@@REGION@@ I=@@NODE_INDEX@@ S=@@SELF_IP@@ F=@@FIRST_IP@@ P=\"@@PEER_IPS@@\" Y=@@SECONDARY_IP@@ " \
-                 "V=@@K3S_VERSION@@ T=@@TOKEN_PARAM@@ E=@@EIP_ALLOCATION_ID@@ Q=@@PRIORITY@@ H=@@REGISTRY_HOST@@ N=@@REGISTRY_NODEPORT@@\n"
-        nodes = cfn.nodes_template(self.ec2(), "/litellm-lab-ec2/k3s-token", "eipalloc-1", script)
+                 "V=@@VERSION_PARAM@@ T=@@TOKEN_PARAM@@ E=@@EIP_ALLOCATION_ID@@ Q=@@PRIORITY@@ H=@@REGISTRY_HOST@@ N=@@REGISTRY_NODEPORT@@\n"
+        nodes = cfn.nodes_template(self.ec2(), "/litellm-lab-ec2/k3s-token", "eipalloc-1", script,
+                                   version_param="/litellm-lab-ec2/k3s-version")
         res = nodes["Resources"]
         self.assertEqual({k for k in res if res[k]["Type"] == "AWS::EC2::Instance"}, {"Node1", "Node2", "Node3"})
         n2 = res["Node2"]["Properties"]
@@ -754,12 +784,17 @@ class CfnTemplateTest(unittest.TestCase):
         self.assertEqual(n2["BlockDeviceMappings"][0]["Ebs"]["VolumeSize"], 40)
         user_data = n2["UserData"]["Fn::Base64"]
         self.assertIn("I=2 S=10.60.1.10 F=10.60.0.10 P=\"10.60.0.10 10.60.2.10\" Y=10.60.1.11", user_data)
-        self.assertIn("V=v1.35.5+k3s1 T=/litellm-lab-ec2/k3s-token E=eipalloc-1 Q=150 H=lab-registry:5000 N=30500", user_data)
+        self.assertIn("V=/litellm-lab-ec2/k3s-version T=/litellm-lab-ec2/k3s-token E=eipalloc-1 Q=150 H=lab-registry:5000 N=30500",
+                      user_data)
         self.assertNotIn("@@", user_data)
-        self.assertEqual(nodes["Parameters"]["AmiId"]["Default"], cfn.AMI_PARAMETER)
+        self.assertNotIn("v1.35.5", user_data)   # 版は user data に書かない（上げても 3 台が再起動しない）
+        # AMI は固定の ID で受ける（「最新」の SSM パラメータを参照すると、新しい AMI で 3 台が同時に置き換えられる）
+        self.assertEqual(nodes["Parameters"]["AmiId"], {"Type": "AWS::EC2::Image::Id"})
         role = res["NodeRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
         self.assertIn("ec2:AssociateAddress", role[0]["Action"])
         self.assertEqual(role[1]["Action"], ["ssm:GetParameter"])
+        self.assertEqual(len(role[1]["Resource"]), 2)   # 参加トークンと版の 2 つのパラメータだけ
+        self.assertIn("k3s-version", role[1]["Resource"][1]["Fn::Sub"])
         with self.assertRaises(ValueError):
             cfn.render_node_init(self.ec2(), cfn.network_plan("10.60.0.0/16")["nodes"][0], cfn.network_plan("10.60.0.0/16"),
                                  "/p", "eipalloc-1", "@@UNKNOWN@@")
@@ -767,9 +802,15 @@ class CfnTemplateTest(unittest.TestCase):
     def test_real_node_init_script_has_no_leftover_placeholders(self):
         from labtool import cfn
         plan = cfn.network_plan("10.60.0.0/16")
-        text = cfn.render_node_init(self.ec2(), plan["nodes"][2], plan, "/litellm-lab-ec2/k3s-token", "eipalloc-1")
+        text = cfn.render_node_init(self.ec2(), plan["nodes"][2], plan, "/litellm-lab-ec2/k3s-token", "eipalloc-1",
+                                    version_param="/litellm-lab-ec2/k3s-version")
         self.assertIn('PRIORITY="100"', text)
-        self.assertIn("--cluster-init", text)
+        self.assertIn('VERSION_PARAM="/litellm-lab-ec2/k3s-version"', text)
+        # 引数は config.yaml に書き、インストールスクリプトには server だけ渡す（版上げの再実行で引数が消えない）
+        self.assertIn("/etc/rancher/k3s/config.yaml", text)
+        self.assertIn("cluster-init: true", text)
+        self.assertIn("sh -s - server\n", text)
+        self.assertNotIn("--cluster-init", text)
         self.assertIn("nopreempt", text)
         self.assertIn("associate-address", text)
         eip = cfn.eip_template(self.ec2())

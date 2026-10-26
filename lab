@@ -93,6 +93,7 @@ COMMANDS: dict[str, tuple[str, object]] = {
     # 手作業・保守
     "chatgpt-login": ("ChatGPT Plus にデバイスコードでログインする（手作業。初回だけ）", stage(stages.chatgpt_login)),
     "upgrade": ("LiteLLM を別の版でローリング更新する（例: ./lab upgrade v1.104.3）", None),
+    "upgrade-k8s": ("aws-ec2: k3s（Kubernetes）を 1 台ずつ上げる（例: ./lab upgrade-k8s v1.36.1+k3s1。マイナー版は 1 つずつ）", None),
     "clean-all": ("クラスタ、生成したクライアント設定、ビルドしたイメージを消す（.env とトークンは残す）", None),
     # 試験
     "test-unit": ("単体テスト（構築ツールと、LiteLLM のイメージの中でガードレール）", stage(ops.test_unit)),
@@ -116,6 +117,9 @@ def main(argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="command", metavar="<コマンド>", required=True)
     parsers = {name: sub.add_parser(name, help=desc, description=desc) for name, (desc, _) in COMMANDS.items()}
     parsers["upgrade"].add_argument("version", help="LiteLLM の版（例: v1.104.3）")
+    parsers["upgrade-k8s"].add_argument("version", help="k3s の版（例: v1.36.1+k3s1）")
+    parsers["upgrade-k8s"].add_argument("--measure", action="store_true",
+                                        help="上げている間、偽 LLM への要求を流し続けて失敗の数と時間を測る（test-failover と同じ測り方）")
     parsers["clean-all"].add_argument("-y", "--yes", action="store_true", help="確認を出さずに消す")
     parsers["test-load"].add_argument("--vus", default="20", help="同時接続数（既定 20）")
     parsers["test-load"].add_argument("--duration", default="2m", help="時間（既定 2m）")
@@ -141,6 +145,8 @@ def main(argv: list[str]) -> int:
         match args.command:
             case "upgrade":
                 ops.upgrade(loaded(), args.version)
+            case "upgrade-k8s":
+                ops.upgrade_k8s(loaded(), args.version, args.measure)
             case "clean-all":
                 ops.clean_all(args.yes)
             case "test-load":

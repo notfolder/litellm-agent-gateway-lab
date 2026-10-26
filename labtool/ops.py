@@ -8,7 +8,7 @@ import sys
 
 from . import stages
 from .core import (
-    BUILD_DIR, CLUSTER, NS, ROOT, Env, LabError, cluster_exists, helm, http_ok,
+    BUILD_DIR, CLUSTER, EC2_KUBE_CONTEXT, NS, ROOT, Env, LabError, cluster_exists, helm, http_ok,
     info, kn, ok, output, run, step, succeeds, warn,
 )
 
@@ -93,6 +93,92 @@ def upgrade(env: Env, version: str) -> None:
     stages.images(env)
     stages.litellm(env)
     ok(f"{version} に更新しました")
+
+
+def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
+    """aws-ec2: k3s（Kubernetes）の版を 1 台ずつ上げる（変更設計書 2026-10-26-k3s版上げ 4 章）。
+    順: etcd のスナップショット → 台ごとに「転送先を別の台へ → cordon と drain → インストールスクリプトの再実行 →
+    Ready と版を待つ → uncordon → DB と Redis と LiteLLM がそろうのを待つ」→ SSM の版のパラメータを更新。
+    Elastic IP を持つ台は最後。マイナー版は 1 つずつ（Kubernetes の版の差の規則）。
+    measure=True なら偽 LLM への要求を流し続け、失敗の数と時間を報告する（test-failover と同じ測り方）。
+    途中で止まっても、もう一度流せば上げ終わった台を飛ばして続きから進む。"""
+    import time as _time
+    from datetime import datetime, timedelta
+
+    from . import cfn, ec2, failover
+    step(f"upgrade-k8s k3s を {version} に上げる（1 台ずつ）")
+    if not env.is_aws_ec2:
+        raise LabError("k3s の版上げの手順は LAB_TARGET=aws-ec2 だけです（Mac の k3d は K3S_IMAGE を変えて ./lab rebuild、"
+                       "EKS 版は cdk の kubernetes_version を変えて ./lab cluster）")
+    target = ec2.normalize_k3s_version(version)
+    out = ec2.load_outputs(env)
+    ec2.ensure_forward(env)
+    versions = ec2.node_versions()
+    if len(versions) != cfn.NODE_COUNT:
+        raise LabError(f"ノードが {len(versions)} 台です（{cfn.NODE_COUNT} 台そろってから上げてください）")
+    oldest = min(versions.values(), key=ec2.parse_k3s_version)
+    ec2.check_upgrade_step(oldest, target)
+    if all(v == target for v in versions.values()):
+        ec2.set_version_parameter(env, target)
+        ok(f"3 台とも {target} です")
+        return {"version": target, "upgraded": []}
+    holder = ec2.eip_holder(env, out)
+    order = ec2.upgrade_order(ec2.instance_ids(out), holder, ec2.forward_target())
+    failover.wait_healthy(env)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    ec2.etcd_snapshot(env, order[-1], f"lab-pre-upgrade-{stamp}")
+    todo = [i for i in order if versions.get(ec2.node_for_instance(env, i)) != target]
+    eta = datetime.now() + timedelta(minutes=8 * len(todo))
+    info(f"{len(todo)} 台を {' → '.join(todo)} の順に上げます（Elastic IP の台 {holder} は最後）。"
+         f"終了見込み {eta:%H:%M} ごろ（1 台 5〜8 分）")
+
+    restarts_before = failover.litellm_restarts()
+    upgraded: list[str] = []
+    t0 = _time.time()
+    load = failover.Load(env) if measure else None
+    if load is not None:
+        load.__enter__()
+        _time.sleep(10)   # 平常時の様子
+    try:
+        for inst in todo:
+            node = ec2.node_for_instance(env, inst)
+            info(f"--- {node}（{inst}）: {versions[node]} → {target}")
+            ec2.ensure_forward(env, avoid=inst)
+            node = ec2.node_for_instance(env, inst)
+            ec2.drain_node(node)
+            ec2.install_k3s(env, inst, target)
+            ec2.wait_node_version(node, target)
+            ec2.uncordon_node(node)
+            failover.wait_healthy(env)
+            succeeds(["kubectl", "--context", EC2_KUBE_CONTEXT, "-n", "kube-system", "rollout", "status", "deploy/traefik",
+                      "--timeout=300s"], timeout=320)
+            upgraded.append(node)
+            ok(f"{node} を {target} にしました")
+        if load is not None:
+            _time.sleep(20)   # 最後の台の後の様子
+    finally:
+        if load is not None:
+            load.__exit__(None, None, None)
+    ec2.set_version_parameter(env, target)
+
+    result: dict = {"version": target, "upgraded": upgraded, "seconds": round(_time.time() - t0)}
+    restarts_after = failover.litellm_restarts()
+    result["litellm_restart_loops"] = {p: restarts_after[p] - restarts_before.get(p, 0) for p in restarts_after
+                                       if restarts_after[p] - restarts_before.get(p, 0) > 1}
+    if load is not None:
+        samples = [s for s in load.samples if s.start >= t0]
+        fails = [s for s in samples if s.status != 200]
+        result.update({"requests": len(samples), "failed": len(fails), "statuses": sorted({s.status for s in fails}),
+                       "failure_window_seconds": round(max(s.start for s in fails) - min(s.start for s in fails), 1) if fails else 0.0})
+        (ok if not fails else warn)(f"要求 {len(samples)} 件のうち失敗 {len(fails)} 件（状態 {result['statuses']}）、"
+                                   f"失敗が散らばった幅 {result['failure_window_seconds']} 秒")
+    if result["litellm_restart_loops"]:
+        warn(f"LiteLLM の Pod が繰り返し再起動しました: {result['litellm_restart_loops']}")
+    ok(f"k3s を {target} に上げました（{result['seconds']} 秒）。SSM の版のパラメータも更新しました")
+    if target != cfn.k3s_install_version():
+        warn(f"core.py の K3S_IMAGE を rancher/k3s:{target.replace('+k3s', '-k3s')} に変えてコミットしてください"
+             "（変えないと、次の ./lab up が版の食い違いで止まります。Mac の k3d も同じ版になります）")
+    return result
 
 
 def clean_all(assume_yes: bool) -> None:

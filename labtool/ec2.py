@@ -20,6 +20,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import re
+
 import yaml
 
 from . import aws, cfn, render
@@ -31,7 +33,9 @@ from .core import (
 OUTPUTS_FILE = BUILD_DIR / "ec2-outputs.json"
 CFN_DIR = BUILD_DIR / "cfn"
 FORWARD_PID_FILE = BUILD_DIR / "ec2-forward.pid"
+FORWARD_TARGET_FILE = BUILD_DIR / "ec2-forward.target"   # 転送先のインスタンス ID（版上げでその台を避けるため）
 FORWARD_LOG = BUILD_DIR / "ec2-forward.log"
+K3S_INSTALL_URL = "https://get.k3s.io"
 TLS_BACKUP = BUILD_DIR / "ec2-tls-secret.json"
 TLS_SECRET = "litellm-tls"
 
@@ -45,8 +49,45 @@ def token_parameter(env: Env) -> str:
     return f"/{env.ec2_prefix}/k3s-token"
 
 
+def version_parameter(env: Env) -> str:
+    """k3s の版を置く Systems Manager のパラメータ（String）。node-init.sh が読み、./lab upgrade-k8s が書き換える。
+    user data に版を書かないので、版を上げても nodes スタックに差分が出ない（変更設計書 2026-10-26-k3s版上げ 3 章）。"""
+    return f"/{env.ec2_prefix}/k3s-version"
+
+
 def s3_endpoint(env: Env) -> str:
     return f"https://s3.{env.aws_region}.amazonaws.com"
+
+
+# ---- k3s の版（純粋な関数。単体テストの対象） ----
+def parse_k3s_version(text: str) -> tuple[int, int, int]:
+    """v1.35.5+k3s1（または v1.35.5-k3s1、kubelet が報告する v1.35.5+k3s1）→ (1, 35, 5)。"""
+    m = re.fullmatch(r"v(\d+)\.(\d+)\.(\d+)[+-]k3s\d+", text.strip())
+    if not m:
+        raise LabError(f"k3s の版の形が違います: {text!r}（例 v1.36.1+k3s1）")
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def normalize_k3s_version(text: str) -> str:
+    """インストールスクリプトに渡す形（v1.36.1+k3s1）にそろえる。"""
+    parse_k3s_version(text)
+    return text.strip().replace("-k3s", "+k3s")
+
+
+def check_upgrade_step(current: str, target: str) -> None:
+    """Kubernetes の版の差の規則: マイナー版は 1 つずつ、下げない（同じマイナー版の中のパッチの更新は可）。"""
+    cur, tgt = parse_k3s_version(current), parse_k3s_version(target)
+    if tgt[:2] < cur[:2] or (tgt[:2] == cur[:2] and tgt[2] < cur[2]):
+        raise LabError(f"{target} は今の {current} より古い版です（下げる操作は行いません）")
+    if tgt[0] != cur[0] or tgt[1] > cur[1] + 1:
+        raise LabError(f"{current} → {target} はマイナー版を飛ばしています。1 つずつ上げてください（例 v{cur[0]}.{cur[1] + 1}.x+k3s1）")
+
+
+def upgrade_order(instance_ids: list[str], eip_holder: str | None, forward_target: str | None = None) -> list[str]:
+    """上げる順。Elastic IP を持つ台は最後（入口の移動を 1 回にする）。転送先の台はその前（転送の張り直しを 1 回にする）。"""
+    rest = [i for i in instance_ids if i not in (eip_holder, forward_target)]
+    tail = [i for i in (forward_target, eip_holder) if i and i in instance_ids]
+    return rest + list(dict.fromkeys(tail))
 
 
 # ---- CloudFormation ----
@@ -61,6 +102,42 @@ def ensure_token_parameter(env: Env) -> None:
     ssm.put_parameter(Name=name, Type="SecureString", Value=gen_secret(32),
                       Description="litellm-lab aws-ec2: k3s join token (./lab cluster が管理)")
     info(f"k3s の参加トークンを SSM のパラメータ {name} に置きました")
+
+
+def ensure_version_parameter(env: Env) -> str:
+    """k3s の版のパラメータ。無ければコードの版（core.K3S_IMAGE）で作る。あれば今の値を返す（上書きしない。
+    上げるのは ./lab upgrade-k8s だけ）。"""
+    ssm = aws.client(env, "ssm")
+    name = version_parameter(env)
+    try:
+        return ssm.get_parameter(Name=name)["Parameter"]["Value"]
+    except ssm.exceptions.ParameterNotFound:
+        pass
+    version = cfn.k3s_install_version()
+    ssm.put_parameter(Name=name, Type="String", Value=version,
+                      Description="litellm-lab aws-ec2: k3s version (./lab upgrade-k8s が更新)")
+    info(f"k3s の版 {version} を SSM のパラメータ {name} に置きました")
+    return version
+
+
+def set_version_parameter(env: Env, version: str) -> None:
+    aws.client(env, "ssm").put_parameter(Name=version_parameter(env), Type="String", Value=version, Overwrite=True)
+
+
+def resolve_ami(env: Env) -> str:
+    """nodes スタックに渡す AMI ID。配備済みならその台と同じ値（置き換えを起こさない）、初回は SSM の公開パラメータ
+    （AL2023 arm64 の最新）を解く。AMI を新しくするのは、台を 1 台ずつ作り直す別の作業にする。"""
+    cf = aws.client(env, "cloudformation")
+    try:
+        stack = cf.describe_stacks(StackName=stack_name(env, "nodes"))["Stacks"][0]
+        current = {p["ParameterKey"]: p["ParameterValue"] for p in stack.get("Parameters", [])}
+        if current.get("AmiId"):
+            return current["AmiId"]
+    except Exception:  # noqa: BLE001 無いスタック
+        pass
+    ami = aws.client(env, "ssm").get_parameter(Name=cfn.AMI_PARAMETER)["Parameter"]["Value"]
+    info(f"AMI を {cfn.AMI_PARAMETER} から解きました: {ami}（以後の配備もこの値を使う）")
+    return ami
 
 
 def _deploy_stack(env: Env, stack: str, template: Path, params: dict[str, str] | None = None) -> None:
@@ -85,14 +162,20 @@ def stack_outputs(env: Env, stack: str) -> dict[str, str] | None:
 def deploy(env: Env, ident: dict) -> dict:
     """4 スタックを eip → storage → network → nodes の順に配備し、出力をまとめて返す。差分が無ければ何もしない。"""
     ensure_token_parameter(env)
+    deployed_version = ensure_version_parameter(env)
+    if deployed_version != cfn.k3s_install_version():
+        raise LabError(f"配備済みの k3s の版（{deployed_version}）とコードの版（{cfn.k3s_install_version()}）が違います。"
+                       f"上げるなら ./lab upgrade-k8s {cfn.k3s_install_version()}、戻すなら core.py の K3S_IMAGE を "
+                       f"{deployed_version} に合わせてください（./lab up では版を変えません）")
     CFN_DIR.mkdir(parents=True, exist_ok=True)
     _deploy_stack(env, "eip", cfn.write_template(cfn.eip_template(env), CFN_DIR / "eip.json"))
     eip = stack_outputs(env, "eip") or {}
-    docs = cfn.templates(env, ident["Account"], token_parameter(env), eip["EipAllocationId"])
+    docs = cfn.templates(env, ident["Account"], token_parameter(env), eip["EipAllocationId"], version_parameter(env))
     _deploy_stack(env, "storage", cfn.write_template(docs["storage"], CFN_DIR / "storage.json"))
     _deploy_stack(env, "network", cfn.write_template(docs["network"], CFN_DIR / "network.json"))
     net = stack_outputs(env, "network") or {}
-    params = {"SecurityGroupId": net["SecurityGroupId"], "InstanceType": env.ec2_instance_type}
+    params = {"SecurityGroupId": net["SecurityGroupId"], "InstanceType": env.ec2_instance_type,
+              "AmiId": resolve_ami(env)}
     for i in range(1, cfn.NODE_COUNT + 1):
         params[f"Subnet{i}Id"] = net[f"Subnet{i}Id"]
     _deploy_stack(env, "nodes", cfn.write_template(docs["nodes"], CFN_DIR / "nodes.json"), params)
@@ -215,13 +298,19 @@ def _port_listening(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def ensure_forward(env: Env) -> None:
+def forward_target() -> str | None:
+    """今の転送先のインスタンス ID（分からなければ None）。"""
+    return FORWARD_TARGET_FILE.read_text().strip() or None if FORWARD_TARGET_FILE.exists() else None
+
+
+def ensure_forward(env: Env, avoid: str | None = None) -> None:
     """k3s の API への Session Manager のポート転送を確かめ、無ければ張る。転送は背景に残し（./lab を何度も流すため）、
-    ./lab down で止める。Session Manager の既定では 20 分使わないと切れるので、切れていれば張り直す。"""
-    if forward_alive(env):
+    ./lab down で止める。Session Manager の既定では 20 分使わないと切れるので、切れていれば張り直す。
+    avoid の台（版上げで k3s を再起動する台）に張ってあれば、別の台へ張り直す。"""
+    if forward_alive(env) and (avoid is None or forward_target() != avoid):
         return
     out = load_outputs(env)
-    ids = ssm_online(env, instance_ids(out))
+    ids = [i for i in ssm_online(env, instance_ids(out)) if i != avoid]
     if not ids:
         raise LabError("Session Manager に Online のノードがありません（./lab cluster で作るか、起動を待ってください）")
     stop_forward(env)
@@ -236,11 +325,13 @@ def ensure_forward(env: Env) -> None:
          "--parameters", json.dumps({"portNumber": ["6443"], "localPortNumber": [str(port)]})],
         stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True, env=aws.shell_env(env))
     FORWARD_PID_FILE.write_text(str(proc.pid))
+    FORWARD_TARGET_FILE.write_text(ids[0])
     info(f"Session Manager のポート転送を張ります（{ids[0]} の 6443 → 127.0.0.1:{port}）")
     wait_until(90, "k3s の API への接続", lambda: proc.poll() is None and forward_alive(env))
 
 
 def stop_forward(env: Env) -> None:
+    FORWARD_TARGET_FILE.unlink(missing_ok=True)
     if not FORWARD_PID_FILE.exists():
         return
     try:
@@ -298,6 +389,45 @@ def eip_holder(env: Env, out: dict) -> str | None:
     """Elastic IP が付いているインスタンス ID（付いていなければ None）。"""
     res = aws.client(env, "ec2").describe_addresses(AllocationIds=[out["EipAllocationId"]])
     return (res["Addresses"][0].get("InstanceId") or None) if res["Addresses"] else None
+
+
+# ---- k3s の版上げ（1 台ずつ。変更設計書 2026-10-26-k3s版上げ 4 章） ----
+def node_versions() -> dict[str, str]:
+    """ノード名 → kubelet の版（例 v1.35.5+k3s1）。"""
+    nodes = json.loads(output(kc("get", "nodes", "-o", "json")))
+    return {n["metadata"]["name"]: n["status"]["nodeInfo"]["kubeletVersion"] for n in nodes["items"]}
+
+
+def etcd_snapshot(env: Env, instance_id: str, name: str) -> None:
+    """上げる前の控え（k3s の etcd のスナップショット。その台の /var/lib/rancher/k3s/server/db/snapshots/）。"""
+    run_on(env, instance_id, [f"/usr/local/bin/k3s etcd-snapshot save --name {name}"], timeout=300)
+    info(f"etcd のスナップショット {name} を {instance_id} に取りました")
+
+
+def drain_node(node: str) -> None:
+    """Pod を他の台へ追い出す。PDB（PostgreSQL、Valkey、LiteLLM）を守るので 1 つずつ動き、CloudNativePG は primary なら
+    先に切り替える。local-path の Pod は台が戻るまで Pending で待つ（追い出しの対象にはなる）。"""
+    run(kc("cordon", node), quiet=True)
+    run(kc("drain", node, "--ignore-daemonsets", "--delete-emptydir-data", "--timeout=600s"))
+
+
+def install_k3s(env: Env, instance_id: str, version: str) -> None:
+    """その台でインストールスクリプトを再実行する（新しい binary を置き、k3s を再起動する。Pod のコンテナは動き続ける）。
+    引数は /etc/rancher/k3s/config.yaml にあるので、server だけを渡す（node-init.sh と同じ形）。"""
+    run_on(env, instance_id, [f"curl -sfL {K3S_INSTALL_URL} | INSTALL_K3S_VERSION='{version}' sh -s - server"],
+           timeout=600)
+
+
+def wait_node_version(node: str, version: str) -> None:
+    def done() -> bool:
+        if node_versions().get(node) != version:
+            return False
+        return succeeds(kc("wait", "--for=condition=Ready", f"node/{node}", "--timeout=5s"), timeout=15)
+    wait_until(600, f"{node} が {version} で Ready になる", done)
+
+
+def uncordon_node(node: str) -> None:
+    run(kc("uncordon", node), quiet=True)
 
 
 def wait_for_a_record(env: Env, ip: str) -> None:
@@ -386,11 +516,10 @@ def destroy(env: Env, keep_eip: bool) -> None:
         cf.get_waiter("stack_delete_complete").wait(StackName=name, WaiterConfig={"Delay": 15, "MaxAttempts": 120})
         ok(f"スタック {name} を消しました")
     ssm = aws.client(env, "ssm")
-    try:
-        ssm.delete_parameter(Name=token_parameter(env))
-        info(f"SSM のパラメータ {token_parameter(env)} を消しました")
-    except ssm.exceptions.ParameterNotFound:
-        pass
+    for name in (token_parameter(env), version_parameter(env)):
+        with contextlib.suppress(ssm.exceptions.ParameterNotFound):
+            ssm.delete_parameter(Name=name)
+            info(f"SSM のパラメータ {name} を消しました")
     OUTPUTS_FILE.unlink(missing_ok=True)
     if keep_eip:
         eip = stack_outputs(env, "eip") or {}

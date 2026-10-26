@@ -54,7 +54,7 @@ brew install awscli kubectl-cnpg && brew install --cask session-manager-plugin
 ./lab up   # CloudFormation（Elastic IP、S3 と IAM ユーザー、VPC、EC2 3 台）→ k3s → イメージを中の registry へ → LiteLLM → Let's Encrypt
 ```
 
-人が行うこと: `./lab litellm` が表示する Elastic IP への A レコードを Cloudflare に足す（DNS のみ）。入口は keepalived が Elastic IP を 3 台の間で移し、HTTPS は cert-manager が Let's Encrypt（DNS-01）で取ります。構築ツールは Systems Manager の Session Manager で k3s の API に届くので、SSH も 6443 も開けません。障害の試験は Mac と同じ場面に `--scenario eip-node`（入口の台を止める）が加わります。
+人が行うこと: `./lab litellm` が表示する Elastic IP への A レコードを Cloudflare に足す（DNS のみ）。入口は keepalived が Elastic IP を 3 台の間で移し、HTTPS は cert-manager が Let's Encrypt（DNS-01）で取ります。構築ツールは Systems Manager の Session Manager で k3s の API に届くので、SSH も 6443 も開けません。障害の試験は Mac と同じ場面に `--scenario eip-node`（入口の台を止める）が加わります。Kubernetes（k3s）の版は `./lab upgrade-k8s <版>` が 1 台ずつ上げます（Pod を他の台へ追い出してから k3s を再起動。Elastic IP の台は最後。`./lab up` では版を変えません。経緯は `.history/2026-10-26-k3s版上げ/`）。
 
 ## よく使うコマンド
 
@@ -64,6 +64,7 @@ brew install awscli kubectl-cnpg && brew install --cask session-manager-plugin
 | `./lab rebuild` | クラスタを作り直す（DB と監査ログは消える。`.env`、ChatGPT のトークン、イメージの置き場は残る） |
 | `./lab status` | 状態の表示 |
 | `./lab upgrade v1.x.y` | LiteLLM のローリング更新 |
+| `./lab upgrade-k8s v1.x.y+k3s1 [--measure]` | EC2 3 台の k3s（Kubernetes）を 1 台ずつ上げる（`aws-ec2` だけ。マイナー版は 1 つずつ。`--measure` で上げている間の要求の失敗を測る） |
 | `./lab test-unit` / `test-smoke` / `test-idempotency` / `test-load` | 試験 |
 | `./lab test-judge [--context \| --isolated]` | 審査官の事例試験（本物の審査官を呼ぶので ChatGPT の利用枠を使う。指定なしは両方の審査） |
 | `./lab test-failover [--pooler direct]` / `test-restore` | DB と Redis の障害の試験（EKS 版は `--scenario litellm-drain` / `aurora-failover` / `valkey-failover`、EC2 3 台は Mac の場面 ＋ `eip-node`） / バックアップから任意の時点に戻す試験 |
