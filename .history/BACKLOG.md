@@ -52,4 +52,5 @@
 
 - [ ] 本番の規模（1 日 1,000 万件）での検索の速さの実測（今は合成データ 1 日 100 万件 × 7 日からの見積もり）（追加 2026-10-12、重要 低）
 - [ ] 本番に向けて、CloudNativePG のオペレーター・cert-manager・Traefik を複数台にする（検証では server ノードに固定）（追加 2026-10-12、重要 低）
+  - 2026-10-26: Mac の k3d は Kubernetes の版上げが無停止でできない（k3d に版を上げる命令が無く、server 1 台に制御部分の SQLite と Traefik・RustFS・オペレーターが固定）。無停止にするなら server 3 台（組み込み etcd）とこの固定の解除が要る。ユーザー判断で記録のみ（`docs/maintenance.md` 3.3）。EKS は Auto Mode が PDB を守ってノードを入れ替えるので無停止。LiteLLM に PDB（`maxUnavailable: 1`）を足した
 - [ ] 無停止のメンテナンスの改善案（`docs/maintenance.md` 4 章）: LiteLLM の PDB と anti-affinity、長いストリーミングとローリング更新の試験、Valkey の更新の手順、`./lab upgrade` での移行の互換性の確認（追加 2026-10-12、重要 低）
