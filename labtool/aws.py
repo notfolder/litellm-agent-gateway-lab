@@ -161,7 +161,7 @@ def destroy(env: Env, stacks: list[str]) -> None:
 # ---- ./lab down の後始末（スタックを消しても残るもの） ----
 def empty_bucket(s3, bucket: str) -> int:
     """バケットの全オブジェクトの全版（削除マーカーも）を消す。GOVERNANCE の Object Lock は保持を越えて消す
-    （操作者に s3:BypassGovernanceRetention が要る）。消した版の数を返す。aws-ec2 の削除（labtool/ec2.py）も使う。"""
+    （操作者に s3:BypassGovernanceRetention が要る）。消した版の数を返す。aws-ec2 の削除（labtool/clouds/aws_ec2.py）も使う。"""
     n = 0
     for page in s3.get_paginator("list_object_versions").paginate(Bucket=bucket):
         objs = [{"Key": o["Key"], "VersionId": o["VersionId"]}

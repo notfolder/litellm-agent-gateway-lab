@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script --quiet
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["pyyaml>=6.0", "boto3>=1.35"]
+# dependencies = ["pyyaml>=6.0", "boto3>=1.35", "google-cloud-compute>=1.20", "google-cloud-storage>=2.18", "google-cloud-iam>=2.15", "google-cloud-resource-manager>=1.12"]
 # ///
 """検証環境の構築ツール。どのコマンドも何度実行しても同じ結果になる（docs/design.md 17 章）。
 
@@ -61,7 +61,7 @@ def test_failover(pooler: str | None, scenario: str) -> None:
 
 
 def loaded() -> Env:
-    """.env を読み、Kubernetes の API に届く状態にする（aws-ec2 は Session Manager のポート転送）。"""
+    """.env を読み、Kubernetes の API に届く状態にする（VM の環境は 22 の許可の更新と SSH のポート転送）。"""
     env = Env.load()
     stages.ensure_access(env)
     return env
@@ -80,10 +80,10 @@ COMMANDS: dict[str, tuple[str, object]] = {
     # 段階ごと
     "preflight": ("[段階] 前提の確認", stages.preflight),
     "cluster": ("[段階] Mac: イメージの置き場、k3d、Traefik。aws: CDK の配備、kubeconfig、ESO。"
-                "aws-ec2: CloudFormation、k3s、ポート転送、registry、Let's Encrypt", stage(stages.cluster)),
+                "aws-ec2 / gcp-vm: 基盤（API を直接呼ぶ）、k3s、SSH のポート転送、registry、Let's Encrypt", stage(stages.cluster)),
     "images": ("[段階] 検証用 LiteLLM イメージのビルドと push", stage(stages.images)),
-    "secrets": ("[段階] 秘密情報（Mac・aws-ec2: .env → Secret。aws: Secrets Manager → External Secrets）", stage(stages.secrets_)),
-    "objectstore": ("[段階] オブジェクトストレージ（Mac: RustFS を作る。AWS: S3 の検査）", stage(stages.objectstore)),
+    "secrets": ("[段階] 秘密情報（Mac・VM の環境: .env → Secret。aws: Secrets Manager → External Secrets）", stage(stages.secrets_)),
+    "objectstore": ("[段階] オブジェクトストレージ（Mac: RustFS を作る。クラウド: バケットの検査）", stage(stages.objectstore)),
     "datastores": ("[段階] PostgreSQL と Redis（aws: Aurora と ElastiCache の確認）", stage(stages.datastores)),
     "mcp": ("[段階] 試験用の偽 LLM と google_workspace_mcp", stage(stages.mcp)),
     "litellm": ("[段階] プロキシ設定、LiteLLM（Helm）、入口", stage(stages.litellm)),
@@ -93,7 +93,7 @@ COMMANDS: dict[str, tuple[str, object]] = {
     # 手作業・保守
     "chatgpt-login": ("ChatGPT Plus にデバイスコードでログインする（手作業。初回だけ）", stage(stages.chatgpt_login)),
     "upgrade": ("LiteLLM を別の版でローリング更新する（例: ./lab upgrade v1.104.3）", None),
-    "upgrade-k8s": ("aws-ec2: k3s（Kubernetes）を 1 台ずつ上げる（例: ./lab upgrade-k8s v1.36.1+k3s1。マイナー版は 1 つずつ）", None),
+    "upgrade-k8s": ("aws-ec2 / gcp-vm: k3s（Kubernetes）を 1 台ずつ上げる（例: ./lab upgrade-k8s v1.36.1+k3s1。マイナー版は 1 つずつ）", None),
     "clean-all": ("クラスタ、生成したクライアント設定、ビルドしたイメージを消す（.env とトークンは残す）", None),
     # 試験
     "test-unit": ("単体テスト（構築ツールと、LiteLLM のイメージの中でガードレール）", stage(ops.test_unit)),
@@ -131,8 +131,8 @@ def main(argv: list[str]) -> int:
     parsers["test-failover"].add_argument("--pooler", choices=["pooler", "direct"],
                                           help="この接続先に切り替えて試す（終わったら元に戻す）")
     parsers["test-failover"].add_argument("--scenario", default="all",
-                                          choices=["all", *failover.SCENARIOS_EC2, *failover.SCENARIOS_AWS],
-                                          help="場面（Mac: pg-*, valkey-*。aws-ec2: 同じ ＋ eip-node。"
+                                          choices=["all", *failover.SCENARIOS_VM, *failover.SCENARIO_ALIASES, *failover.SCENARIOS_AWS],
+                                          help="場面（Mac: pg-*, valkey-*。aws-ec2 / gcp-vm: 同じ ＋ entry-node（eip-node でも可）。"
                                                "aws: litellm-drain, aurora-failover, valkey-failover）")
     parsers["audit-synth"].add_argument("--days", type=int, default=7)
     parsers["audit-synth"].add_argument("--per-day", type=int, default=1_000_000)

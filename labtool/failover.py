@@ -26,10 +26,11 @@ SCENARIOS = ["pg-switchover", "pg-pod", "pg-node", "valkey-pod", "valkey-node"]
 # AWS（EKS 版）の場面（変更仕様書 2026-10-24-AWS構成 7.2 節）: LiteLLM のノードの drain、Aurora と ElastiCache のフェイルオーバー
 SCENARIOS_AWS = ["litellm-drain", "aurora-failover", "valkey-failover"]
 # EC2 3 台の場面（変更仕様書 2026-10-25-EC2三台構成 7.2 節）: Mac と同じ場面（ノードの停止は EC2 の停止）＋ Elastic IP を持つ台の停止
-SCENARIOS_EC2 = [*SCENARIOS, "eip-node"]
+SCENARIOS_VM = [*SCENARIOS, "entry-node"]
+SCENARIO_ALIASES = {"eip-node": "entry-node"}   # EC2 版の名前
 # 回復までの時間の合格の目安（秒）。ノードを止める場面は長め（変更仕様書 9.3 節）
 LIMITS = {"pg-switchover": 60, "pg-pod": 60, "pg-node": 120, "valkey-pod": 60, "valkey-node": 120,
-          "litellm-drain": 60, "aurora-failover": 90, "valkey-failover": 90, "eip-node": 30}
+          "litellm-drain": 60, "aurora-failover": 90, "valkey-failover": 90, "entry-node": 30}
 # 直結（比較用）のときだけ、PostgreSQL の primary の切り替えと Pod の削除は 90 秒にする。Pooler は切り替えの間の要求を
 # 待たせて吸収する（2026-10-12 の実測で、どちらも失敗 0 件）が、直結では新しい primary が立つまでの 15〜50 秒が
 # そのまま失敗になり、最後の失敗まで 54〜77 秒だった（変更仕様書 9.3 節の目安を、1 回目の結果を見て見直した）
@@ -58,7 +59,7 @@ class Load:
     env: Env
     rate: int = 20
     cleanup: object = None     # 場面の後片付け（AWS の drain の uncordon など）
-    eip_moved: bool = False    # eip-node の場面: 別の台が Elastic IP を持ったか
+    eip_moved: bool = False    # entry-node の場面: 別の台が浮動 IP を持ったか
     samples: list[Sample] = field(default_factory=list)
     _stop: threading.Event = field(default_factory=threading.Event)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -168,18 +169,19 @@ def wait_healthy(env: Env, timeout: int = 600) -> None:
     run(kn("rollout", "status", "deploy/litellm", "--timeout=300s"), quiet=True)
 
 
-def _stop_ec2_node(env: Env, node: str, load: Load) -> None:
-    """aws-ec2: Pod が載ったノードのインスタンスを止め、NODE_DOWN_SECONDS 後に起こす。"""
-    from . import ec2
-    out = ec2.load_outputs(env)
-    instance = ec2.instance_id_for_node(env, out, node)
-    info(f"ノード {node}（{instance}）を {NODE_DOWN_SECONDS} 秒止めます")
-    ec2.stop_node(env, instance)
+def _stop_vm_node(env: Env, node: str, load: Load) -> None:
+    """VM の環境: Pod が載ったノードの VM を止め、NODE_DOWN_SECONDS 後に起こす（クラウド固有層の stop_node / start_node）。"""
+    from . import clouds, vm
+    cloud = clouds.for_env(env)
+    infra = vm.load_infra(env)
+    target = vm.node_for_k8s_name(infra, node)
+    info(f"ノード {node}（{target.id}）を {NODE_DOWN_SECONDS} 秒止めます")
+    cloud.stop_node(env, target)
     try:
         time.sleep(NODE_DOWN_SECONDS)
     finally:
-        ec2.start_node(env, instance)
-        info(f"ノード {node}（{instance}）を起動しました")
+        cloud.start_node(env, target)
+        info(f"ノード {node}（{target.id}）を起動しました")
     wait_until(600, f"{node} の Ready", kc("wait", "--for=condition=Ready", f"node/{node}", "--timeout=5s"))
 
 
@@ -210,8 +212,8 @@ def _move_valkey_primary_off_server(env: Env) -> None:
 
 
 def _stop_node(node: str, load: Load, env: Env | None = None) -> None:
-    if env is not None and env.is_aws_ec2:
-        _stop_ec2_node(env, node, load)
+    if env is not None and env.is_vm:
+        _stop_vm_node(env, node, load)
         return
     if node == SERVER_NODE:
         raise LabError("server ノードは止めません（Kubernetes の制御部分と RustFS が載っている）")
@@ -262,28 +264,29 @@ def trigger(env: Env, scenario: str, load: Load) -> str:
         node = pod_node(primary)
         _stop_node(node, load, env)
         return f"Valkey の primary（{primary}）が載ったノード {node} を停止"
-    if scenario == "eip-node":
-        # 入口（Elastic IP を持つ台）を止める。keepalived が別の台に付け替え、戻った台は奪い返さない（nopreempt）
-        from . import ec2
-        out = ec2.load_outputs(env)
-        holder = ec2.eip_holder(env, out)
+    if scenario == "entry-node":
+        # 入口（浮動 IP を持つ台）を止める。keepalived が別の台に付け替え、戻った台は奪い返さない（nopreempt）
+        from . import clouds, vm
+        cloud = clouds.for_env(env)
+        infra = vm.load_infra(env)
+        holder = cloud.entry_ip_holder(env, infra)
         if not holder:
-            raise LabError("Elastic IP がどのインスタンスにも付いていません（keepalived を確かめてください）")
-        node = ec2.node_for_instance(env, holder)
+            raise LabError("浮動 IP がどの VM にも付いていません（keepalived を確かめてください）")
+        node = vm.k8s_name_for_node(infra.node(holder))
         _stop_node(node, load, env)
-        after = ec2.eip_holder(env, out)
+        after = cloud.entry_ip_holder(env, infra)
         load.eip_moved = after not in (None, holder)
-        return f"Elastic IP を持つノード {node}（{holder}）を停止（戻った後の持ち主: {after}）"
+        return f"浮動 IP を持つノード {node}（{holder}）を停止（戻った後の持ち主: {after}）"
     raise LabError(f"知らない場面です: {scenario}")
 
 
 def run_scenario(env: Env, scenario: str) -> dict:
     step(f"test-failover {scenario}")
     wait_healthy(env)
-    if scenario == "pg-node" and not env.is_aws_ec2:
+    if scenario == "pg-node" and not env.is_vm:
         _move_pg_primary_off_server()
         wait_healthy(env)
-    if scenario == "valkey-node" and not env.is_aws_ec2:
+    if scenario == "valkey-node" and not env.is_vm:
         _move_valkey_primary_off_server(env)
     restarts_before = litellm_restarts()
     with Load(env) as load:
@@ -330,8 +333,8 @@ def run_scenario(env: Env, scenario: str) -> dict:
     result["limit_seconds"] = limit
     result["passed"] = (recovery <= limit and not repeated and result["valkey_masters"] == 1
                         and baseline_fail == 0)
-    if scenario == "eip-node":
-        # 別の台が Elastic IP を持ち、戻った台が奪い返していないこと（trigger が確かめた値）
+    if scenario == "entry-node":
+        # 別の台が浮動 IP を持ち、戻った台が奪い返していないこと（trigger が確かめた値）
         result["eip_moved"] = bool(getattr(load, "eip_moved", False))
         result["passed"] = result["passed"] and result["eip_moved"]
     (ok if result["passed"] else warn)(
@@ -344,17 +347,18 @@ def run_scenario(env: Env, scenario: str) -> dict:
 def scenarios_for(env: Env) -> list[str]:
     if env.is_aws:
         return SCENARIOS_AWS
-    return SCENARIOS_EC2 if env.is_aws_ec2 else SCENARIOS
+    return SCENARIOS_VM if env.is_vm else SCENARIOS
 
 
 def failover(env: Env, scenarios: list[str], audit_check=None) -> None:
     """障害の試験。audit_check(results) を渡すと、監査ログの欠けも照合する。"""
+    scenarios = [SCENARIO_ALIASES.get(x, x) for x in scenarios]   # eip-node（EC2 版の名前）→ entry-node
     bad = [x for x in scenarios if x not in scenarios_for(env)]
     if bad:
         raise LabError(f"LAB_TARGET={env.target} では使えない場面です: {', '.join(bad)}"
                        f"（使える場面: {', '.join(scenarios_for(env))}）")
     where = "AWS: Aurora に直結" if env.is_aws else f"DB の接続先: {env.get('LAB_DB_POOLER', 'pooler')}" + (
-        "、EC2 3 台" if env.is_aws_ec2 else "")
+        f"、{env.target} の VM 3 台" if env.is_vm else "")
     step(f"test-failover 障害の試験（{where}）")
     results = [run_scenario(env, s) for s in scenarios]
     if audit_check is not None:

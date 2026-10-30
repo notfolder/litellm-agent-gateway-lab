@@ -6,7 +6,7 @@ import json
 import shutil
 import sys
 
-from . import aws, cfn, ec2
+from . import aws, clouds, vm
 from . import objectstore as objstore
 from . import render
 from .core import (
@@ -49,8 +49,8 @@ def preflight() -> Env:
     env = Env.load()
     if env.is_aws:
         _preflight_aws(env)
-    elif env.is_aws_ec2:
-        _preflight_ec2(env)
+    elif env.is_vm:
+        _preflight_vm(env)
     else:
         require_commands("docker", "k3d", "kubectl", "helm")
     if not env.is_aws and not succeeds(["kubectl", "cnpg", "version"]):
@@ -64,7 +64,7 @@ def preflight() -> Env:
                        "（外付け SSD がつながっているか確かめてください）")
     (env.data_dir / "chatgpt").mkdir(parents=True, exist_ok=True)
 
-    if not env.on_aws:
+    if not env.on_cloud:
         port_busy = succeeds(["lsof", "-nP", f"-iTCP:{env.http_port}", "-sTCP:LISTEN"])
         if port_busy and not cluster_exists():
             raise LabError(f"ポート {env.http_port} が別のプロセスに使われています（.env の LAB_HTTP_PORT を変えてください）")
@@ -76,7 +76,7 @@ def preflight() -> Env:
         (env.has_users(), "検証ユーザー: 設定あり", "LAB_USER1_EMAIL が未設定です。利用者のキーは作りません"),
         (env.has_jev(), "Jev の API キー: 設定あり", "TYPESAFE_API_KEY が未設定です。一次判定（Jev）を使わずに構築します"),
     ]
-    if not env.is_aws_ec2:   # aws-ec2 は chatgpt/ を置かない（共有ファイルシステムが無い。変更仕様書 2026-10-25 4.2 節）
+    if not env.is_vm:   # VM の環境は chatgpt/ を置かない（共有ファイルシステムが無い。変更仕様書 2026-10-25 4.2 節）
         checks.append((env.has_chatgpt(), "ChatGPT のトークン: あり",
                        "ChatGPT のトークンがありません。./lab chatgpt-login で取得するまで、Codex と二次判定は動きません"))
     for present, good, bad in checks:
@@ -86,27 +86,28 @@ def preflight() -> Env:
 
 
 def ensure_access(env: Env) -> None:
-    """Kubernetes の API に届く状態にする。aws-ec2 は Session Manager のポート転送を確かめて（切れていれば）張り直す。
-    段階を単独で流すときも、./lab up でも、最初に呼ぶ（cluster の段階の前は基盤が無いので飛ばす）。"""
-    if env.is_aws_ec2 and ec2.OUTPUTS_FILE.exists():
-        ec2.ensure_forward(env)
+    """Kubernetes の API に届く状態にする。VM の環境は 22 の許可を操作者の今の IP に合わせ、SSH のポート転送を確かめて
+    （切れていれば）張り直す。段階を単独で流すときも、./lab up でも、最初に呼ぶ（基盤が無ければ何もしない）。"""
+    if env.is_vm:
+        vm.ensure_access(env)
 
 
-def _preflight_ec2(env: Env) -> None:
-    """EC2 3 台の環境の前提: 道具（aws、Session Manager plugin、kubectl、helm、docker）、資格情報、ホスト名、
-    Let's Encrypt の設定。バケット名の接頭辞を Env に載せる（変更設計書 2026-10-25-EC2三台構成 4.2 節）。"""
-    require_commands("docker", "kubectl", "helm", "aws", "session-manager-plugin")
-    _ = env.aws_hostname   # 無ければここで止まる
+def _preflight_vm(env: Env) -> None:
+    """VM 3 台の環境の前提: 道具（ssh、kubectl、helm、docker、クラウドの CLI）、資格情報、ホスト名、Let's Encrypt と審査官の設定。
+    バケット名の接頭辞を Env に載せる（変更設計書 2026-10-30-VM環境の共通化とGCP追加 7 章）。"""
+    require_commands("docker", "kubectl", "helm", "ssh", "ssh-keygen", "aws" if env.is_aws_ec2 else "gcloud")
+    _ = env.hostname   # 無ければここで止まる
     for key, what in (("LAB_CLOUDFLARE_API_TOKEN", "Cloudflare の API トークン（DNS-01 用。Zone / DNS / Edit）"),
-                      ("LAB_ACME_EMAIL", "Let's Encrypt の連絡先のメールアドレス")):
+                      ("LAB_ACME_EMAIL", "Let's Encrypt の連絡先のメールアドレス"),
+                      (render.JUDGE_KEY_ENV, "審査官の Anthropic の API キー")):
         if not env.get(key):
-            raise LabError(f"LAB_TARGET=aws-ec2 には .env の {key}（{what}）が要ります")
-    ident = aws.identity(env)
-    env.values["LAB_AWS_ACCOUNT"] = ident["Account"]
-    env.values["LAB_AWS_BUCKET_PREFIX"] = render.bucket_prefix(env, ident["Account"])
-    ok(f"AWS の資格情報: アカウント {ident['Account']}、{ident['Arn']}（{env.aws_region}）")
-    if not cfn.NODE_INIT_SCRIPT.exists():
-        raise LabError("cfn/node-init.sh がありません（EC2 ノードの初期化スクリプト）")
+            raise LabError(f"LAB_TARGET={env.target} には .env の {key}（{what}）が要ります")
+    cloud = clouds.for_env(env)
+    ident = cloud.identity(env)
+    env.values["LAB_BUCKET_PREFIX"] = cloud.bucket_prefix(env, ident)
+    ok(f"{env.target} の資格情報: {ident['account']}、{ident['principal']}（{ident['region']}）")
+    if not vm.NODE_INIT_SCRIPT.exists():
+        raise LabError("vm/node-init.sh がありません（VM の初期化スクリプト）")
 
 
 def _preflight_aws(env: Env) -> None:
@@ -141,8 +142,8 @@ def cluster(env: Env) -> None:
     if env.is_aws:
         _cluster_aws(env)
         return
-    if env.is_aws_ec2:
-        _cluster_ec2(env)
+    if env.is_vm:
+        _cluster_vm(env)
         return
     # イメージの置き場はクラスタより先に作る。クラスタを消しても残す
     ensure_registry(REGISTRY_NAME, REGISTRY_HOST_PORT)
@@ -209,37 +210,48 @@ def _cluster_aws(env: Env) -> None:
     ok(f"クラスタの準備ができました（EKS {env.aws_cluster_name}、{env.aws_region}）")
 
 
-def _cluster_ec2(env: Env) -> None:
-    """EC2 3 台: CloudFormation（eip → storage → network → nodes）→ 3 台の k3s の準備を待つ → ポート転送 →
-    Traefik（replica 2、80 → 443 の転送）→ namespace → SA → イメージ置き場（registry、保存先は S3）→ オペレーター（replica 2）
-    → Let's Encrypt の ClusterIssuer（変更設計書 2026-10-25-EC2三台構成 4.3 節）。"""
-    ident = aws.identity(env)
-    out = ec2.deploy(env, ident)
-    ec2.wait_nodes_ready(env, out)
-    ec2.ensure_forward(env)
+def _cluster_vm(env: Env) -> None:
+    """VM 3 台: クラウド固有層で基盤（ネットワーク → 22 の許可 → 浮動 IP → バケットと静的キー → k3s のトークンと版 → VM 3 台）
+    → 3 台の k3s の準備を待つ → SSH のポート転送 → Traefik（replica 2、80 → 443 の転送）→ namespace → SA →
+    イメージ置き場（registry、保存先はバケット）→ オペレーター（replica 2）→ Let's Encrypt の ClusterIssuer
+    （変更設計書 2026-10-30-VM環境の共通化とGCP追加 7 章）。"""
+    cloud = clouds.for_env(env)
+    pubkey = vm.ensure_ssh_key()
+    infra = cloud.discover(env) or clouds.Infra(region=env.vm_region)
+    infra.extra["network"] = cloud.ensure_network(env)
+    infra.network_id = infra.extra["network"].get("vpc_id") or infra.extra["network"].get("network", "")
+    cloud.allow_ssh_from(env, vm.operator_cidr(env))
+    infra.entry_ip, infra.entry_ip_id = cloud.ensure_entry_ip(env)
+    infra.bucket_prefix = env.get("LAB_BUCKET_PREFIX") or cloud.bucket_prefix(env, cloud.identity(env))
+    infra.buckets = cloud.ensure_buckets(env, infra.bucket_prefix)
+    vm.ensure_cluster_objects(env, cloud, infra)
+    infra.extra["ssh_pubkey"] = pubkey
+    infra.nodes = cloud.ensure_nodes(env, infra, vm.user_data_renderer(env, cloud, infra, pubkey))
+    vm.save_infra(infra)
+    vm.wait_nodes_ready(infra.nodes)
+    vm.ensure_forward(env, infra)
     wait_until(300, "全ノードの Ready", kc("wait", "--for=condition=Ready", "nodes", "--all", "--timeout=5s"))
-    kapply(files=[K8S / "traefik-config-ec2.yaml"], namespaced=False)
+    kapply(files=[K8S / "traefik-config-vm.yaml"], namespaced=False)
     wait_until(300, "Traefik の起動", kc("-n", "kube-system", "rollout", "status", "deploy/traefik", "--timeout=5s"))
     kapply(files=[K8S / "namespace.yaml"], namespaced=False)
     kapply(manifest=render.service_accounts_manifest())
-    _ec2_registry(env, out)
+    _vm_registry(env, cloud, infra)
     operators(replicas=2)
     # Let's Encrypt の DNS-01（Cloudflare の API トークンは cert-manager の名前空間の Secret）
     kapply(manifest=secret_manifest("cloudflare-api-token", {"api-token": env.get("LAB_CLOUDFLARE_API_TOKEN")},
                                     namespace="cert-manager"), namespaced=False)
-    kapply(manifest=render.ec2_issuer_manifest(env), namespaced=False)
-    ok(f"クラスタの準備ができました（EC2 3 台の k3s、{env.aws_region}、入口の IP {out['EipPublicIp']}）")
+    kapply(manifest=render.vm_issuer_manifest(env), namespaced=False)
+    ok(f"クラスタの準備ができました（{env.target} の k3s 3 台、{env.vm_region}、入口の IP {infra.entry_ip}）")
 
 
-def _ec2_registry(env: Env, out: dict) -> None:
-    """クラスタの中のイメージ置き場（registry。保存先は S3 の images バケット）。cluster と secrets の両方から呼ぶ
-    （images の段階が push する前に要り、秘密は secrets の段階が揃え直す）。"""
-    ec2.load_credentials(env, out)
+def _vm_registry(env: Env, cloud, infra: clouds.Infra) -> None:
+    """クラスタの中のイメージ置き場（registry。保存先は images バケット）。cluster と secrets の両方から呼ぶ
+    （images の段階が push する前に要り、秘密は secrets の段階が揃え直す）。静的キーは Secret に無い利用者だけ作る。"""
+    vm.ensure_static_keys(env, cloud, infra)
     env.fill("LAB_REGISTRY_HTTP_SECRET", gen_secret(16))
-    kapply(manifest=secret_manifest(render.EC2_REGISTRY_NAME, render.ec2_registry_secret(env)))
-    kapply(manifest=render.ec2_registry_manifest(env, out[f"{cfn.camel(cfn.IMAGES_BUCKET)}BucketName"],
-                                                 cfn.REGISTRY_NODEPORT))
-    rollout(f"deploy/{render.EC2_REGISTRY_NAME}", 300, "イメージ置き場（registry）の起動")
+    kapply(manifest=secret_manifest(render.VM_REGISTRY_NAME, render.vm_registry_secret(env)))
+    kapply(manifest=render.vm_registry_manifest(env, infra.buckets[clouds.IMAGES_BUCKET], clouds.REGISTRY_NODEPORT))
+    rollout(f"deploy/{render.VM_REGISTRY_NAME}", 300, "イメージ置き場（registry）の起動")
 
 
 def _ensure_chart(release: str, namespace: str, spec: dict, values: dict) -> None:
@@ -317,7 +329,7 @@ def images(env: Env) -> dict:
     - apps/audit が無い間（実装の途中）は audit-lab を飛ばす
     外部のイメージ（PostgreSQL など）は、ノードが Docker Hub の中継キャッシュ経由で取るので扱わない。"""
     step("images イメージ")
-    push = _build_and_push_ecr if env.is_aws else _build_and_push_ec2 if env.is_aws_ec2 else _build_and_push
+    push = _build_and_push_ecr if env.is_aws else _build_and_push_vm if env.is_vm else _build_and_push
     tag = render.image_tag(env.litellm_base_image, ROOT / "litellm")
     image = push("litellm-lab", tag, ROOT / "litellm",
                  ["--build-arg", f"LITELLM_BASE_IMAGE={env.litellm_base_image}"], env=env)
@@ -351,8 +363,8 @@ def _build_and_push_ecr(name: str, tag: str, context, build_args: list[str], env
     return {"repository": f"{registry}/{repository}", "tag": tag, "local": local_image}
 
 
-def _build_and_push_ec2(name: str, tag: str, context, build_args: list[str], env: Env) -> dict:
-    """aws-ec2: 同じイメージ（linux/arm64）を、クラスタの中の置き場（registry。保存先は S3）に kubectl port-forward 経由で
+def _build_and_push_vm(name: str, tag: str, context, build_args: list[str], env: Env) -> dict:
+    """VM の環境: 同じイメージ（linux/arm64）を、クラスタの中の置き場（registry。保存先はバケット）に kubectl port-forward 経由で
     push する。クラスタの中からは lab-registry:5000/<name>:<tag>（各ノードが自分の NodePort から引く）。"""
     local_image = f"{name}:{tag}"
     if succeeds(["docker", "image", "inspect", local_image]):
@@ -362,7 +374,7 @@ def _build_and_push_ec2(name: str, tag: str, context, build_args: list[str], env
         run(["docker", "build", "--platform", "linux/arm64", *build_args, "-t", local_image, str(context)])
     accept = ("application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, "
               "application/vnd.oci.image.manifest.v1+json")
-    with ec2.registry_forward(env) as endpoint:
+    with vm.registry_forward() as endpoint:
         res = http("HEAD", f"{endpoint}/v2/{name}/manifests/{tag}", headers={"Accept": accept}, timeout=10)
         if res.status == 200:
             ok(f"置き場に {name}:{tag} があります")
@@ -372,8 +384,8 @@ def _build_and_push_ec2(name: str, tag: str, context, build_args: list[str], env
             run(["docker", "tag", local_image, push_image])
             run(["docker", "push", "--platform", "linux/arm64", "-q", push_image], quiet=True)
             run(["docker", "rmi", push_image], check=False, quiet=True)
-            ok(f"push しました: {cfn.REGISTRY_HOST}/{name}:{tag}")
-    return {"repository": f"{cfn.REGISTRY_HOST}/{name}", "tag": tag, "local": local_image}
+            ok(f"push しました: {clouds.REGISTRY_HOST}/{name}:{tag}")
+    return {"repository": f"{clouds.REGISTRY_HOST}/{name}", "tag": tag, "local": local_image}
 
 
 def load_image() -> dict:
@@ -385,7 +397,7 @@ def load_image() -> dict:
 def secrets_(env: Env) -> Env:
     """Mac: .env の空の値を生成し、k8s の Secret に反映する。既存の値は上書きしない。
     AWS（EKS 版）: Secrets Manager の {prefix}/app の空の項目を生成し、External Secrets Operator に同じ名前の Secret を作らせる。
-    aws-ec2: Mac と同じ。S3 の利用者のキーだけは生成せず、IAM ユーザーの静的キー（CloudFormation の出力）を使う（.env に書かない）。"""
+    VM の環境: Mac と同じ。バケットの利用者のキーだけは生成せず、クラウドの静的キー（Kubernetes の Secret にだけ置く）を使う。"""
     step("secrets 秘密情報")
     if env.is_aws:
         _secrets_aws(env)
@@ -400,8 +412,8 @@ def secrets_(env: Env) -> Env:
     if render.noreview_enabled(env):
         for k in NOREVIEW_KEYS:
             env.fill(k, gen_key())
-    if env.is_aws_ec2:
-        _ec2_registry(env, ec2.load_outputs(env))   # IAM の静的キーを Env に載せ、イメージ置き場の Secret を揃える
+    if env.is_vm:
+        _vm_registry(env, clouds.for_env(env), vm.load_infra(env))   # 静的キーを Env に載せ、イメージ置き場の Secret を揃える
     else:
         # オブジェクトストレージの管理者と、用途ごとの利用者（アクセスキーは利用者の名前、シークレットは生成）
         env.fill("RUSTFS_ACCESS_KEY", "lab-admin")
@@ -434,7 +446,7 @@ def secrets_(env: Env) -> Env:
     kapply(manifest=secret_manifest("valkey", {"password": env.get("REDIS_PASSWORD"),
                                                "sentinel-password": env.get("SENTINEL_PASSWORD")}))
     kapply(manifest=secret_manifest("litellm-secrets", render.secrets_for_litellm(env)))
-    if env.is_aws_ec2:
+    if env.is_vm:
         kapply(manifest=secret_manifest("cloudflare-api-token", {"api-token": env.get("LAB_CLOUDFLARE_API_TOKEN")},
                                         namespace="cert-manager"), namespaced=False)
     else:
@@ -477,12 +489,14 @@ def objectstore(env: Env) -> None:
         objstore.check_buckets(env, aws.client(env, "s3"))
         ok("オブジェクトストレージ（S3）は仕様どおりです")
         return
-    if env.is_aws_ec2:
-        # バケットと IAM ユーザーは CloudFormation が作る。検査は Mac と同じ全部（静的キーがあるので利用者ごとの許可・拒否も）
-        ec2.load_credentials(env, ec2.load_outputs(env))
-        objstore.check_buckets(env, aws.client(env, "s3"))
-        objstore.self_check(env, aws.client(env, "s3"), lambda user: objstore.aws_user_client(env, user))
-        ok("オブジェクトストレージ（S3）は仕様どおりで、利用者ごとの権限も期待どおりです")
+    if env.is_vm:
+        # バケットと静的キーはクラウド固有層が作る（cluster の段階）。検査は Mac と同じ全部（利用者ごとの許可・拒否も）
+        cloud = clouds.for_env(env)
+        vm.load_static_keys(env)
+        cloud.check_buckets(env, env.get("LAB_BUCKET_PREFIX"))
+        with objstore.admin_s3(env) as admin:
+            objstore.self_check(env, admin, lambda user: objstore.cloud_user_client(env, user))
+        ok("オブジェクトストレージは仕様どおりで、利用者ごとの権限も期待どおりです")
         return
     kapply(files=[K8S / "rustfs.yaml"])
     rollout("statefulset/rustfs", 180, "RustFS の起動")
@@ -610,11 +624,11 @@ def litellm(env: Env) -> None:
     if env.is_aws and env.has_chatgpt():
         # chatgpt/ のトークンは Mac の auth.json を、全 Pod で共有する EFS の PVC に写す（変更仕様書 4.2 節）
         aws.sync_chatgpt_token(env)
-    if env.is_aws_ec2:
-        ec2.load_credentials(env, ec2.load_outputs(env))   # Bedrock の静的キー（Secret litellm-secrets に入れる）
+    if env.is_vm:
+        vm.load_static_keys(env)   # litellm-writer の静的キー（Secret litellm-secrets に入れる）
 
-    # aws-ec2 は chatgpt/ を置かない（トークンを全 Pod で共有する置き場が無い。変更仕様書 2026-10-25 4.2 節）
-    has_chatgpt = env.has_chatgpt() and not env.is_aws_ec2
+    # VM の環境は chatgpt/ を置かない（トークンを全 Pod で共有する置き場が無い。変更仕様書 2026-10-25 4.2 節）
+    has_chatgpt = env.has_chatgpt() and not env.is_vm
     config_text = render.to_yaml(render.litellm_config(env, has_chatgpt), "./lab が生成。手で編集しない")
     if write_if_changed(BUILD_DIR / "litellm-config.yaml", config_text):
         info("プロキシ設定を更新しました")
@@ -647,23 +661,23 @@ def litellm(env: Env) -> None:
         _ingress_aws(env, out, viewer=bool(render.audit_oidc_client(env)[0]))
     else:
         kapply(files=[K8S / "ingress.yaml"])
-        if env.is_aws_ec2:
-            _ingress_ec2(env)
+        if env.is_vm:
+            _ingress_vm(env)
     wait_until(120, f"入口からの応答（{env.base_url}/health/liveliness）",
                lambda: http_ok(f"{env.base_url}/health/liveliness"))
     ok(f"LiteLLM の準備ができました: {env.base_url}（管理画面 {env.base_url}/ui）")
 
 
-def _ingress_ec2(env: Env) -> None:
+def _ingress_vm(env: Env) -> None:
     """HTTPS の入口: Let's Encrypt の証明書（退避があれば先に戻す）と、Traefik の経路を websecure に TLS 付きで写す。
-    ホスト名 → Elastic IP の A レコードが引けるまで待つ（変更設計書 2026-10-25-EC2三台構成 4.6 節）。"""
-    out = ec2.load_outputs(env)
-    ec2.restore_tls_secret(env)
-    kapply(manifest=render.ec2_certificate_manifest(env))
+    ホスト名 → 浮動 IP の A レコードが引けるまで待つ（変更設計書 2026-10-25-EC2三台構成 4.6 節）。"""
+    infra = vm.load_infra(env)
+    vm.restore_tls_secret()
+    kapply(manifest=render.vm_certificate_manifest(env))
     kapply(manifest=render.tls_ingressroutes((K8S / "ingress.yaml").read_text()))
-    ec2.wait_for_a_record(env, out["EipPublicIp"])
-    wait_until(900, f"Let's Encrypt の証明書（{env.aws_hostname}）の発行",
-               kn("wait", f"certificate/{render.EC2_TLS_SECRET}", "--for=condition=Ready", "--timeout=5s"))
+    vm.wait_for_a_record(env, infra.entry_ip)
+    wait_until(900, f"Let's Encrypt の証明書（{env.hostname}）の発行",
+               kn("wait", f"certificate/{render.VM_TLS_SECRET}", "--for=condition=Ready", "--timeout=5s"))
 
 
 def _ingress_aws(env: Env, out: dict, viewer: bool) -> None:
@@ -693,10 +707,14 @@ def audit(env: Env) -> None:
     step("audit 監査ログの整形と検索アプリ")
     image = load_audit_image()
     ref = f"{image['repository']}:{image['tag']}"
-    if env.on_aws:
-        # AWS の S3（接続先は空で既定のエンドポイント、接頭辞付きの名前）。資格情報は EKS 版は Pod Identity、aws-ec2 は静的キー
+    if env.is_aws:
+        # AWS の S3（接続先は空で既定のエンドポイント、接頭辞付きの名前）。資格情報は Pod Identity
         common = {"IMAGE": ref, "S3_ENDPOINT": "", "S3_REGION": env.aws_region,
                   "S3_BUCKET_PREFIX": env.get("LAB_AWS_BUCKET_PREFIX")}
+    elif env.is_vm:
+        # クラウドのバケット（接続先はクラウド固有層の s3_endpoint、接頭辞付きの名前）。資格情報は静的キー
+        common = {"IMAGE": ref, "S3_ENDPOINT": render.vm_s3_endpoint(env), "S3_REGION": env.vm_region,
+                  "S3_BUCKET_PREFIX": env.get("LAB_BUCKET_PREFIX")}
     else:
         common = {"IMAGE": ref, "S3_ENDPOINT": env.get("LAB_S3_ENDPOINT", render.DEFAULT_S3_ENDPOINT),
                   "S3_REGION": env.get("LAB_S3_REGION", "us-east-1"), "S3_BUCKET_PREFIX": ""}
@@ -717,7 +735,7 @@ def audit(env: Env) -> None:
             render.audit_oidc_client(env)) + env.get("AUDIT_SESSION_SECRET"))
         viewer_manifest = render_template(K8S / "audit-viewer.yaml", values)
         kapply(manifest=viewer_manifest)
-        if env.is_aws_ec2:
+        if env.is_vm:
             kapply(manifest=render.tls_ingressroutes(viewer_manifest))   # HTTPS の経路（web は 443 へ転送される）
         rollout("deploy/audit-viewer", 300, "検索アプリの起動")
         ok(f"検索アプリ: {env.base_url}/lab-audit/")

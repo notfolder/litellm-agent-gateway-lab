@@ -8,7 +8,7 @@ import sys
 
 from . import stages
 from .core import (
-    BUILD_DIR, CLUSTER, EC2_KUBE_CONTEXT, NS, ROOT, Env, LabError, cluster_exists, helm, http_ok,
+    BUILD_DIR, CLUSTER, NS, ROOT, Env, LabError, cluster_exists, helm, http_ok,
     info, kn, ok, output, run, step, succeeds, warn,
 )
 
@@ -31,19 +31,21 @@ def down() -> None:
         aws.purge_retained(env)
         ok(f"AWS の有料リソースを削除しました（残るのは無料の {env.aws_prefix}-cert の証明書と CDK の bootstrap）")
         return
-    if env.is_aws_ec2:
-        from . import ec2
-        # 証明書を退避してから（Let's Encrypt の発行数の上限を避ける）、nodes → network → storage →（eip）を消す。
-        # IAM ユーザーとキーは storage と一緒に消える。残るのは DNS の A レコードと .build/ の退避だけ
-        if ec2.OUTPUTS_FILE.exists():
-            try:
-                ec2.ensure_forward(env)
-                ec2.save_tls_secret(env)
-            except LabError as e:
-                warn(f"証明書の退避を飛ばします（{e}）")
-        ec2.destroy(env, keep_eip=env.ec2_keep_eip)
-        ok("AWS の有料リソースを削除しました（EC2、EBS、S3、IAM ユーザー"
-           + ("。Elastic IP は残しました）" if env.ec2_keep_eip else "、Elastic IP）"))
+    if env.is_vm:
+        from . import clouds, vm
+        # 証明書を退避してから（Let's Encrypt の発行数の上限を避ける）、クラウド固有層が作った順の逆に全部消す。
+        # 残るのは DNS の A レコードと .build/ の退避だけ（変更設計書 2026-10-30-VM環境の共通化とGCP追加 4.5 節、5.5 節）
+        cloud = clouds.for_env(env)
+        try:
+            vm.ensure_access(env)
+            vm.save_tls_secret()
+        except LabError as e:
+            warn(f"証明書の退避を飛ばします（{e}）")
+        vm.stop_forward()
+        cloud.destroy(env, keep_entry_ip=env.vm_keep_entry_ip)
+        vm.INFRA_FILE.unlink(missing_ok=True)
+        ok(f"{env.target} の有料リソースを削除しました（VM、ディスク、バケット、静的キー"
+           + ("。浮動 IP は残しました）" if env.vm_keep_entry_ip else "、浮動 IP）"))
         return
     if cluster_exists():
         run(["k3d", "cluster", "delete", CLUSTER])
@@ -55,10 +57,10 @@ def down() -> None:
 def status(env: Env) -> None:
     """状態の表示（何も変更しない）。"""
     step("status 状態")
-    if env.on_aws:
+    if env.on_cloud:
         if not succeeds(kn("get", "ns"), timeout=60):
-            where = f"EKS {env.aws_cluster_name}" if env.is_aws else "EC2 3 台の k3s"
-            warn(f"{where} に届きません（./lab up で作るか、aws sso login でサインインします）")
+            where = f"EKS {env.aws_cluster_name}" if env.is_aws else f"{env.target} の k3s 3 台"
+            warn(f"{where} に届きません（./lab up で作るか、クラウドにサインインします）")
             return
     elif not cluster_exists():
         warn(f"クラスタ {CLUSTER} はありません（./lab up で作ります）")
@@ -77,6 +79,17 @@ Jev の API キー: {yn(env.has_jev())}      → 一次判定（LAB_USE_JEV={env
 ChatGPT:         {yn(env.has_chatgpt())}  → Codex 用のモデルと二次判定（なしなら二次判定は偽 LLM）
 検証ユーザー:    {env.get('LAB_USER1_EMAIL', '（未設定）')} {env.get('LAB_USER2_EMAIL')}
 クライアント:    clients/claude-lab、clients/codex-lab""")
+    if env.is_vm:
+        from . import clouds, vm
+        try:
+            infra = vm.load_infra(env)
+            holder = clouds.for_env(env).entry_ip_holder(env, infra)
+            print(f"VM:              {', '.join(f'{n.id}({n.public_ip})' for n in infra.nodes)}\n"
+                  f"浮動 IP:         {infra.entry_ip}（持ち主 {holder or '無し'}）\n"
+                  f"k3s の版:        {', '.join(sorted(set(vm.node_versions().values())))}\n"
+                  f"22 の許可:       {vm.operator_cidr(env)}")
+        except LabError as e:
+            warn(str(e))
     if http_ok(f"{env.base_url}/health/liveliness"):
         ok("LiteLLM は応答しています")
     else:
@@ -96,40 +109,41 @@ def upgrade(env: Env, version: str) -> None:
 
 
 def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
-    """aws-ec2: k3s（Kubernetes）の版を 1 台ずつ上げる（変更設計書 2026-10-26-k3s版上げ 4 章）。
+    """VM の環境（aws-ec2 / gcp-vm）: k3s（Kubernetes）の版を 1 台ずつ上げる（変更設計書 2026-10-26-k3s版上げ 4 章）。
     順: etcd のスナップショット → 台ごとに「転送先を別の台へ → cordon と drain → インストールスクリプトの再実行 →
-    Ready と版を待つ → uncordon → DB と Redis と LiteLLM がそろうのを待つ」→ SSM の版のパラメータを更新。
-    Elastic IP を持つ台は最後。マイナー版は 1 つずつ（Kubernetes の版の差の規則）。
+    Ready と版を待つ → uncordon → DB と Redis と LiteLLM がそろうのを待つ」→ バケットの版を更新。
+    浮動 IP を持つ台は最後。マイナー版は 1 つずつ（Kubernetes の版の差の規則）。
     measure=True なら偽 LLM への要求を流し続け、失敗の数と時間を報告する（test-failover と同じ測り方）。
     途中で止まっても、もう一度流せば上げ終わった台を飛ばして続きから進む。"""
     import time as _time
     from datetime import datetime, timedelta
 
-    from . import cfn, ec2, failover
+    from . import clouds, failover, vm
     step(f"upgrade-k8s k3s を {version} に上げる（1 台ずつ）")
-    if not env.is_aws_ec2:
-        raise LabError("k3s の版上げの手順は LAB_TARGET=aws-ec2 だけです（Mac の k3d は K3S_IMAGE を変えて ./lab rebuild、"
+    if not env.is_vm:
+        raise LabError("k3s の版上げの手順は LAB_TARGET=aws-ec2 / gcp-vm だけです（Mac の k3d は K3S_IMAGE を変えて ./lab rebuild、"
                        "EKS 版は cdk の kubernetes_version を変えて ./lab cluster）")
-    target = ec2.normalize_k3s_version(version)
-    out = ec2.load_outputs(env)
-    ec2.ensure_forward(env)
-    versions = ec2.node_versions()
-    if len(versions) != cfn.NODE_COUNT:
-        raise LabError(f"ノードが {len(versions)} 台です（{cfn.NODE_COUNT} 台そろってから上げてください）")
-    oldest = min(versions.values(), key=ec2.parse_k3s_version)
-    ec2.check_upgrade_step(oldest, target)
+    cloud = clouds.for_env(env)
+    target = vm.normalize_k3s_version(version)
+    infra = vm.load_infra(env)
+    vm.ensure_forward(env, infra)
+    versions = vm.node_versions()
+    if len(versions) != clouds.NODE_COUNT:
+        raise LabError(f"ノードが {len(versions)} 台です（{clouds.NODE_COUNT} 台そろってから上げてください）")
+    oldest = min(versions.values(), key=vm.parse_k3s_version)
+    vm.check_upgrade_step(oldest, target)
     if all(v == target for v in versions.values()):
-        ec2.set_version_parameter(env, target)
+        vm.set_version(env, cloud, infra, target)
         ok(f"3 台とも {target} です")
         return {"version": target, "upgraded": []}
-    holder = ec2.eip_holder(env, out)
-    order = ec2.upgrade_order(ec2.instance_ids(out), holder, ec2.forward_target())
+    holder = cloud.entry_ip_holder(env, infra)
+    order = vm.upgrade_order(infra.node_ids(), holder, vm.forward_target())
     failover.wait_healthy(env)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    ec2.etcd_snapshot(env, order[-1], f"lab-pre-upgrade-{stamp}")
-    todo = [i for i in order if versions.get(ec2.node_for_instance(env, i)) != target]
+    vm.etcd_snapshot(infra.node(order[-1]), f"lab-pre-upgrade-{stamp}")
+    todo = [i for i in order if versions.get(vm.k8s_name_for_node(infra.node(i))) != target]
     eta = datetime.now() + timedelta(minutes=8 * len(todo))
-    info(f"{len(todo)} 台を {' → '.join(todo)} の順に上げます（Elastic IP の台 {holder} は最後）。"
+    info(f"{len(todo)} 台を {' → '.join(todo)} の順に上げます（浮動 IP の台 {holder} は最後）。"
          f"終了見込み {eta:%H:%M} ごろ（1 台 5〜8 分）")
 
     restarts_before = failover.litellm_restarts()
@@ -140,26 +154,26 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
         load.__enter__()
         _time.sleep(10)   # 平常時の様子
     try:
-        for inst in todo:
-            node = ec2.node_for_instance(env, inst)
-            info(f"--- {node}（{inst}）: {versions[node]} → {target}")
-            ec2.ensure_forward(env, avoid=inst)
-            node = ec2.node_for_instance(env, inst)
-            ec2.drain_node(node)
-            ec2.install_k3s(env, inst, target)
-            ec2.wait_node_version(node, target)
-            ec2.uncordon_node(node)
+        for node_id in todo:
+            node = infra.node(node_id)
+            name = vm.k8s_name_for_node(node)
+            info(f"--- {name}（{node_id}）: {versions[name]} → {target}")
+            vm.ensure_forward(env, infra, avoid=node_id)
+            vm.drain_node(name)
+            vm.install_k3s(node, target)
+            vm.wait_node_version(name, target)
+            vm.uncordon_node(name)
             failover.wait_healthy(env)
-            succeeds(["kubectl", "--context", EC2_KUBE_CONTEXT, "-n", "kube-system", "rollout", "status", "deploy/traefik",
-                      "--timeout=300s"], timeout=320)
-            upgraded.append(node)
-            ok(f"{node} を {target} にしました")
+            succeeds(["kubectl", "--context", vm.kube_context(env), "-n", "kube-system", "rollout", "status",
+                      "deploy/traefik", "--timeout=300s"], timeout=320)
+            upgraded.append(name)
+            ok(f"{name} を {target} にしました")
         if load is not None:
             _time.sleep(20)   # 最後の台の後の様子
     finally:
         if load is not None:
             load.__exit__(None, None, None)
-    ec2.set_version_parameter(env, target)
+    vm.set_version(env, cloud, infra, target)
 
     result: dict = {"version": target, "upgraded": upgraded, "seconds": round(_time.time() - t0)}
     restarts_after = failover.litellm_restarts()
@@ -174,8 +188,8 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
                                    f"失敗が散らばった幅 {result['failure_window_seconds']} 秒")
     if result["litellm_restart_loops"]:
         warn(f"LiteLLM の Pod が繰り返し再起動しました: {result['litellm_restart_loops']}")
-    ok(f"k3s を {target} に上げました（{result['seconds']} 秒）。SSM の版のパラメータも更新しました")
-    if target != cfn.k3s_install_version():
+    ok(f"k3s を {target} に上げました（{result['seconds']} 秒）。バケットの版も更新しました")
+    if target != vm.k3s_install_version():
         warn(f"core.py の K3S_IMAGE を rancher/k3s:{target.replace('+k3s', '-k3s')} に変えてコミットしてください"
              "（変えないと、次の ./lab up が版の食い違いで止まります。Mac の k3d も同じ版になります）")
     return result
@@ -185,8 +199,8 @@ def clean_all(assume_yes: bool) -> None:
     """クラスタ、生成したクライアント設定、ビルドした LiteLLM イメージを消す。
     残すもの: .env、ChatGPT のトークン、イメージの置き場（Docker Hub のキャッシュを含む）。"""
     step("clean-all 全削除")
-    if Env.load().on_aws:
-        raise LabError("LAB_TARGET=aws / aws-ec2 では clean-all は使えません。AWS 側は ./lab down が有料のものをすべて消します。"
+    if Env.load().on_cloud:
+        raise LabError("LAB_TARGET が local 以外では clean-all は使えません。クラウド側は ./lab down が有料のものをすべて消します。"
                        "ローカルの生成物（clients/out、.build）は LAB_TARGET=local で clean-all を流してください")
     print(f"""次を削除します:
   - クラスタ {CLUSTER}（DB を含む）

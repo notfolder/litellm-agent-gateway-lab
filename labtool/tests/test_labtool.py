@@ -2,6 +2,7 @@
 
 import base64
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -561,75 +562,83 @@ class AwsTargetTest(unittest.TestCase):
         self.assertEqual(aws.operator_principal_arn({"Account": "1", "Arn": "arn:aws:iam::1:user/me"}), "arn:aws:iam::1:user/me")
 
 
-class Ec2TargetTest(unittest.TestCase):
-    """LAB_TARGET=aws-ec2（EC2 3 台の k3s と S3）のときの描画と CloudFormation のテンプレート
-    （変更仕様書 .history/2026-10-25-EC2三台構成/ 2.4 節、変更設計書 3 章）。local と aws の振る舞いは上のテストで変わらないこと。"""
+class VmTargetTest(unittest.TestCase):
+    """LAB_TARGET=aws-ec2 / gcp-vm（VM 3 台の k3s とクラウドのバケット）のときの描画
+    （変更仕様書 .history/2026-10-30-VM環境の共通化とGCP追加/ 2 章・4 章、変更設計書 2 章・8 章）。local と aws の振る舞いは上のテストで変わらないこと。"""
 
-    OUT = {"EipAllocationId": "eipalloc-1", "EipPublicIp": "203.0.113.10", "InstanceIds": "i-1,i-2,i-3",
-           "ImagesBucketName": "litellm-lab-111111111111-images",
-           "LitellmWriterAccessKeyId": "AKIAWRITER", "LitellmWriterSecretAccessKey": "sw",
-           "AuditCompactorAccessKeyId": "AKIACOMP", "AuditCompactorSecretAccessKey": "sc",
-           "AuditViewerAccessKeyId": "AKIAVIEW", "AuditViewerSecretAccessKey": "sv",
-           "PgBackupAccessKeyId": "AKIAPG", "PgBackupSecretAccessKey": "sp",
-           "RegistryAccessKeyId": "AKIAREG", "RegistrySecretAccessKey": "sr",
-           "LitellmBedrockAccessKeyId": "AKIABED", "LitellmBedrockSecretAccessKey": "sb"}
-
-    def ec2(self, **extra):
-        e = env(LAB_TARGET="aws-ec2", LAB_AWS_HOSTNAME="lab.example.test", LAB_ACME_EMAIL="ops@example.test",
-                TYPESAFE_API_KEY="t", **extra)
-        e.values["LAB_AWS_BUCKET_PREFIX"] = render.bucket_prefix(e, "111111111111")
+    def vm(self, target="aws-ec2", **extra):
+        e = env(LAB_TARGET=target, LAB_HOSTNAME="lab.example.test", LAB_ACME_EMAIL="ops@example.test",
+                TYPESAFE_API_KEY="t", LAB_GCP_PROJECT="my-project", LAB_JUDGE_ANTHROPIC_API_KEY="sk-judge", **extra)
+        e.values["LAB_BUCKET_PREFIX"] = "litellm-lab-111111111111-" if target == "aws-ec2" else "litellm-lab-my-project-"
         return e
 
     def test_target_flags_and_urls(self):
-        e = self.ec2()
-        self.assertTrue(e.is_aws_ec2 and e.on_aws and not e.is_aws)
-        self.assertFalse(env().on_aws)
-        self.assertEqual(e.base_url, "https://lab.example.test")
-        self.assertEqual(e.ec2_prefix, "litellm-lab-ec2")
-        self.assertEqual((e.ec2_instance_type, e.ec2_vpc_cidr, e.ec2_local_port, e.ec2_keep_eip),
-                         ("t4g.large", "10.60.0.0/16", 16443, False))
+        e = self.vm()
+        self.assertTrue(e.is_aws_ec2 and e.is_vm and e.on_aws and e.on_cloud and not e.is_aws and not e.is_gcp_vm)
+        g = self.vm("gcp-vm")
+        self.assertTrue(g.is_gcp_vm and g.is_vm and g.on_cloud and not g.on_aws)
+        self.assertFalse(env().on_cloud or env().is_vm)
+        self.assertEqual((e.base_url, g.base_url), ("https://lab.example.test", "https://lab.example.test"))
+        self.assertEqual(env(LAB_TARGET="aws-ec2", LAB_AWS_HOSTNAME="old.example.test").hostname, "old.example.test")
+        self.assertEqual((e.vm_prefix, g.vm_prefix), ("litellm-lab-ec2", "litellm-lab"))
+        self.assertEqual((e.vm_cidr, e.vm_disk_gib, e.vm_local_port, e.vm_keep_entry_ip), ("10.60.0.0/16", 40, 16443, False))
+        self.assertEqual((e.vm_region, g.vm_region, g.gcp_machine_type), ("ap-northeast-1", "asia-northeast1", "c4a-standard-2"))
         self.assertEqual(render.bucket_name(e, "audit-raw"), "litellm-lab-111111111111-audit-raw")
+        self.assertEqual(render.bucket_name(g, "audit-raw"), "litellm-lab-my-project-audit-raw")
+        with self.assertRaises(Exception):
+            _ = env(LAB_TARGET="gcp-vm", LAB_HOSTNAME="x").gcp_project   # プロジェクトが無いと止まる
 
-    def test_models_use_bedrock_with_static_keys_and_no_chatgpt(self):
-        cfg = render.litellm_config(self.ec2(), has_chatgpt=False)
-        models = {m["model_name"]: m["litellm_params"] for m in cfg["model_list"]}
-        self.assertTrue(models["claude-sonnet-4-5"]["model"].startswith("bedrock/jp.anthropic.claude-sonnet-4-5"))
-        self.assertEqual(models["claude-sonnet-4-5"]["aws_access_key_id"], "os.environ/BEDROCK_ACCESS_KEY_ID")
-        self.assertEqual(models["review-judge"]["aws_secret_access_key"], "os.environ/BEDROCK_SECRET_ACCESS_KEY")
-        self.assertFalse(cfg["guardrails"][0]["litellm_params"]["use_jev"])
-        # EKS 版は Pod Identity（資格情報チェーン）なので静的キーの指定が無い
+    def test_models_use_max_token_forwarding_and_api_key_judges(self):
+        """Claude Code 用は Mac と同じ anthropic/*（キー無し、Max のトークンの転送）、審査官は Anthropic の API キー。
+        ANTHROPIC_API_KEY の名前は Pod に置かない（転送がキーに置き換わらないように）。"""
+        for target in ("aws-ec2", "gcp-vm"):
+            cfg = render.litellm_config(self.vm(target), has_chatgpt=False)
+            models = {m["model_name"]: m["litellm_params"] for m in cfg["model_list"]}
+            self.assertEqual(models["anthropic/*"], {"model": "anthropic/*"})
+            self.assertEqual(models["review-judge"], {"model": "anthropic/claude-haiku-4-5-20251001",
+                                                      "api_key": "os.environ/LAB_JUDGE_ANTHROPIC_API_KEY"})
+            self.assertEqual(models["isolated-judge"]["api_key"], "os.environ/LAB_JUDGE_ANTHROPIC_API_KEY")
+            self.assertFalse(cfg["guardrails"][0]["litellm_params"]["use_jev"])
+            self.assertFalse(any(m["litellm_params"]["model"].startswith("bedrock/") for m in cfg["model_list"]))
+            secrets = render.secrets_for_litellm(self.vm(target))
+            self.assertEqual(secrets["LAB_JUDGE_ANTHROPIC_API_KEY"], "sk-judge")
+            self.assertNotIn("ANTHROPIC_API_KEY", secrets)
+            self.assertNotIn("BEDROCK_ACCESS_KEY_ID", secrets)
+            contracts = {c["id"]: c for c in render.initial_contracts(self.vm(target))["contracts"]}
+            self.assertEqual(set(contracts), {"claude-max", "anthropic-api"})
+            self.assertEqual(contracts["anthropic-api"]["models"], ["review-judge", "isolated-judge"])
+        self.assertEqual(render.vm_judge_model(self.vm(LAB_VM_JUDGE_MODEL="claude-haiku-9")), "claude-haiku-9")
+        self.assertNotIn("LAB_JUDGE_ANTHROPIC_API_KEY", render.secrets_for_litellm(env()))
+        # EKS 版は Bedrock のまま
         aws_cfg = render.litellm_config(env(LAB_TARGET="aws", LAB_AWS_HOSTNAME="x.test"), has_chatgpt=False)
-        self.assertNotIn("aws_access_key_id", {m["model_name"]: m["litellm_params"] for m in aws_cfg["model_list"]}["review-judge"])
-        secrets = render.secrets_for_litellm(self.ec2(BEDROCK_ACCESS_KEY_ID="AKIABED", BEDROCK_SECRET_ACCESS_KEY="sb"))
-        self.assertEqual((secrets["BEDROCK_ACCESS_KEY_ID"], secrets["BEDROCK_SECRET_ACCESS_KEY"]), ("AKIABED", "sb"))
-        self.assertNotIn("BEDROCK_ACCESS_KEY_ID", render.secrets_for_litellm(env()))
-        contracts = {c["id"] for c in render.initial_contracts(self.ec2())["contracts"]}
-        self.assertEqual(contracts, {"bedrock"})   # chatgpt/ を置かない
+        self.assertTrue({m["model_name"]: m["litellm_params"] for m in aws_cfg["model_list"]}["review-judge"]["model"].startswith("bedrock/"))
 
-    def test_helm_overrides_keep_local_shape_but_use_aws_s3(self):
-        o = render.helm_overrides(self.ec2(), "lab-registry:5000/litellm-lab", "t", "h")
+    def test_helm_overrides_keep_local_shape_but_use_cloud_buckets(self):
+        o = render.helm_overrides(self.vm(), "lab-registry:5000/litellm-lab", "t", "h")
         ev = o["envVars"]
         self.assertIn("REDIS_SENTINEL_NODES", ev)                      # Valkey は Mac と同じ Sentinel
         self.assertEqual(o["db"]["endpoint"], "litellm-pg-pooler-rw")  # Pooler も Mac と同じ
-        self.assertEqual(ev["AUDIT_S3_ENDPOINT"], "")
+        self.assertEqual((ev["AUDIT_S3_ENDPOINT"], ev["AUDIT_S3_REGION"]), ("", "ap-northeast-1"))
         self.assertEqual(ev["AUDIT_S3_BUCKET"], "litellm-lab-111111111111-audit-raw")
-        self.assertEqual(ev["AUDIT_S3_REGION"], "ap-northeast-1")
         self.assertNotIn("AUDIT_S3_CREDENTIAL_CHAIN", ev)              # 静的キー（Secret litellm-secrets）
         self.assertEqual([v["name"] for v in o["volumes"]], ["audit-spool"])   # chatgpt/ の hostPath は無い
+        g = render.helm_overrides(self.vm("gcp-vm"), "lab-registry:5000/litellm-lab", "t", "h")["envVars"]
+        self.assertEqual((g["AUDIT_S3_ENDPOINT"], g["AUDIT_S3_REGION"]), ("https://storage.googleapis.com", "asia-northeast1"))
 
     def test_pg_backup_values(self):
         local = render.pg_backup_values(env())
         self.assertEqual(local["S3_BUCKET_PREFIX"], "")
         self.assertEqual(local["S3_ENDPOINT_LINE"], "endpointURL: http://rustfs:9000")
-        e = render.pg_backup_values(self.ec2())
+        e = render.pg_backup_values(self.vm())
         self.assertEqual((e["S3_BUCKET_PREFIX"], e["S3_ENDPOINT_LINE"], e["S3_REGION"]),
                          ("litellm-lab-111111111111-", "", "ap-northeast-1"))
+        g = render.pg_backup_values(self.vm("gcp-vm"))
+        self.assertEqual((g["S3_BUCKET_PREFIX"], g["S3_ENDPOINT_LINE"], g["S3_REGION"]),
+                         ("litellm-lab-my-project-", "endpointURL: https://storage.googleapis.com", "asia-northeast1"))
         text = render_template(Path(__file__).resolve().parents[2] / "k8s" / "postgres-cnpg.yaml", e)
         store = next(d for d in yaml.safe_load_all(text) if d["kind"] == "ObjectStore")
         self.assertEqual(store["spec"]["configuration"]["destinationPath"], "s3://litellm-lab-111111111111-pg-backup/litellm-pg")
         self.assertNotIn("endpointURL", store["spec"]["configuration"])
-        local_text = render_template(Path(__file__).resolve().parents[2] / "k8s" / "postgres-cnpg.yaml", local)
-        self.assertIn("endpointURL: http://rustfs:9000", local_text)
 
     def test_tls_ingressroutes_copy_routes_to_websecure(self):
         text = (Path(__file__).resolve().parents[2] / "k8s" / "ingress.yaml").read_text()
@@ -642,170 +651,192 @@ class Ec2TargetTest(unittest.TestCase):
         self.assertEqual(docs[0]["spec"]["routes"], original["spec"]["routes"])   # 経路と Middleware は同じ
 
     def test_issuer_certificate_and_registry(self):
-        issuer = yaml.safe_load(render.ec2_issuer_manifest(self.ec2()))
+        issuer = yaml.safe_load(render.vm_issuer_manifest(self.vm()))
         self.assertEqual(issuer["spec"]["acme"]["server"], render.ACME_PRODUCTION)
         self.assertEqual(issuer["spec"]["acme"]["solvers"][0]["dns01"]["cloudflare"]["apiTokenSecretRef"]["name"],
                          "cloudflare-api-token")
-        self.assertEqual(yaml.safe_load(render.ec2_issuer_manifest(self.ec2(LAB_ACME_STAGING="true")))["spec"]["acme"]["server"],
+        self.assertEqual(yaml.safe_load(render.vm_issuer_manifest(self.vm(LAB_ACME_STAGING="true")))["spec"]["acme"]["server"],
                          render.ACME_STAGING)
         with self.assertRaises(ValueError):
-            render.ec2_issuer_manifest(env(LAB_TARGET="aws-ec2", LAB_AWS_HOSTNAME="x.test"))
-        cert = yaml.safe_load(render.ec2_certificate_manifest(self.ec2()))
+            render.vm_issuer_manifest(env(LAB_TARGET="aws-ec2", LAB_HOSTNAME="x.test"))
+        cert = yaml.safe_load(render.vm_certificate_manifest(self.vm()))
         self.assertEqual((cert["spec"]["dnsNames"], cert["spec"]["secretName"]), (["lab.example.test"], "litellm-tls"))
-        docs = list(yaml.safe_load_all(render.ec2_registry_manifest(self.ec2(), "litellm-lab-111111111111-images", 30500)))
+        docs = list(yaml.safe_load_all(render.vm_registry_manifest(self.vm("gcp-vm"), "litellm-lab-my-project-images", 30500)))
         svc = next(d for d in docs if d["kind"] == "Service")
         self.assertEqual((svc["spec"]["type"], svc["spec"]["ports"][0]["nodePort"]), ("NodePort", 30500))
         dep = next(d for d in docs if d["kind"] == "Deployment")
         envs = {e["name"]: e["value"] for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
-        self.assertEqual((envs["REGISTRY_STORAGE"], envs["REGISTRY_STORAGE_S3_BUCKET"]), ("s3", "litellm-lab-111111111111-images"))
+        self.assertEqual((envs["REGISTRY_STORAGE"], envs["REGISTRY_STORAGE_S3_BUCKET"]), ("s3", "litellm-lab-my-project-images"))
+        self.assertEqual((envs["REGISTRY_STORAGE_S3_REGION"], envs["REGISTRY_STORAGE_S3_REGIONENDPOINT"]),
+                         ("asia-northeast1", "https://storage.googleapis.com"))
         self.assertEqual(dep["spec"]["replicas"], 2)
-        secret = render.ec2_registry_secret(self.ec2(S3_REGISTRY_KEY="AKIAREG", S3_REGISTRY_SECRET="sr",
-                                                     LAB_REGISTRY_HTTP_SECRET="h"))
+        secret = render.vm_registry_secret(self.vm(S3_REGISTRY_KEY="AKIAREG", S3_REGISTRY_SECRET="sr",
+                                                   LAB_REGISTRY_HTTP_SECRET="h"))
         self.assertEqual(secret, {"REGISTRY_STORAGE_S3_ACCESSKEY": "AKIAREG", "REGISTRY_STORAGE_S3_SECRETKEY": "sr",
                                   "REGISTRY_HTTP_SECRET": "h"})
 
-    def test_load_credentials_from_outputs(self):
-        from labtool import ec2
-        e = self.ec2()
-        ec2.load_credentials(e, self.OUT)
-        self.assertEqual((e.get("S3_LITELLM_WRITER_KEY"), e.get("S3_LITELLM_WRITER_SECRET")), ("AKIAWRITER", "sw"))
-        self.assertEqual(e.get("S3_REGISTRY_KEY"), "AKIAREG")
-        self.assertEqual(e.get("BEDROCK_SECRET_ACCESS_KEY"), "sb")
-        self.assertEqual(ec2.instance_ids(self.OUT), ["i-1", "i-2", "i-3"])
-        self.assertEqual(ec2.token_parameter(e), "/litellm-lab-ec2/k3s-token")
-
     def test_failover_scenarios(self):
         from labtool import failover
-        self.assertEqual(failover.scenarios_for(self.ec2()), [*failover.SCENARIOS, "eip-node"])
+        self.assertEqual(failover.scenarios_for(self.vm()), [*failover.SCENARIOS, "entry-node"])
+        self.assertEqual(failover.scenarios_for(self.vm("gcp-vm")), [*failover.SCENARIOS, "entry-node"])
         self.assertEqual(failover.scenarios_for(env()), failover.SCENARIOS)
         self.assertEqual(failover.scenarios_for(env(LAB_TARGET="aws", LAB_AWS_HOSTNAME="x")), failover.SCENARIOS_AWS)
-        self.assertEqual(failover.LIMITS["eip-node"], 30)
+        self.assertEqual(failover.LIMITS["entry-node"], 30)
+        self.assertEqual(failover.SCENARIO_ALIASES["eip-node"], "entry-node")   # EC2 版の名前も受ける
 
     def test_k3s_version_rules(self):
         """k3s の版上げ（./lab upgrade-k8s）: 版の形、マイナー版を 1 つずつ、下げない。"""
-        from labtool import ec2
+        from labtool import vm
         from labtool.core import LabError
-        self.assertEqual(ec2.parse_k3s_version("v1.35.5+k3s1"), (1, 35, 5))
-        self.assertEqual(ec2.normalize_k3s_version("v1.36.1-k3s1"), "v1.36.1+k3s1")
-        ec2.check_upgrade_step("v1.35.5+k3s1", "v1.36.1+k3s1")    # 次のマイナー版
-        ec2.check_upgrade_step("v1.35.5+k3s1", "v1.35.7+k3s1")    # 同じマイナー版のパッチ
+        self.assertEqual(vm.parse_k3s_version("v1.35.5+k3s1"), (1, 35, 5))
+        self.assertEqual(vm.normalize_k3s_version("v1.36.1-k3s1"), "v1.36.1+k3s1")
+        self.assertEqual(vm.k3s_install_version("rancher/k3s:v1.35.5-k3s1"), "v1.35.5+k3s1")
+        vm.check_upgrade_step("v1.35.5+k3s1", "v1.36.1+k3s1")    # 次のマイナー版
+        vm.check_upgrade_step("v1.35.5+k3s1", "v1.35.7+k3s1")    # 同じマイナー版のパッチ
         for bad in ("v1.37.0+k3s1", "v1.35.4+k3s1", "v1.34.9+k3s1", "v2.0.0+k3s1"):
             with self.assertRaises(LabError):
-                ec2.check_upgrade_step("v1.35.5+k3s1", bad)
+                vm.check_upgrade_step("v1.35.5+k3s1", bad)
         with self.assertRaises(LabError):
-            ec2.parse_k3s_version("1.36.1")
-        self.assertEqual(ec2.version_parameter(self.ec2()), "/litellm-lab-ec2/k3s-version")
+            vm.parse_k3s_version("1.36.1")
 
-    def test_k3s_upgrade_order_puts_eip_holder_last(self):
-        from labtool import ec2
+    def test_k3s_upgrade_order_puts_entry_holder_last(self):
+        from labtool import vm
         ids = ["i-1", "i-2", "i-3"]
-        self.assertEqual(ec2.upgrade_order(ids, "i-2"), ["i-1", "i-3", "i-2"])
-        self.assertEqual(ec2.upgrade_order(ids, "i-2", forward_target="i-1"), ["i-3", "i-1", "i-2"])
-        self.assertEqual(ec2.upgrade_order(ids, "i-2", forward_target="i-2"), ["i-1", "i-3", "i-2"])
-        self.assertEqual(ec2.upgrade_order(ids, None), ids)
+        self.assertEqual(vm.upgrade_order(ids, "i-2"), ["i-1", "i-3", "i-2"])
+        self.assertEqual(vm.upgrade_order(ids, "i-2", forward_target="i-1"), ["i-3", "i-1", "i-2"])
+        self.assertEqual(vm.upgrade_order(ids, "i-2", forward_target="i-2"), ["i-1", "i-3", "i-2"])
+        self.assertEqual(vm.upgrade_order(ids, None), ids)
+
+    def test_operator_cidr(self):
+        """22 を開ける送信元: .env で固定、無ければ外部に問い合わせた IPv4 の /32。IPv6 や失敗は止める。"""
+        from labtool import vm
+        from labtool.core import LabError
+        self.assertEqual(vm.operator_cidr(self.vm(LAB_SSH_ALLOW_CIDR="203.0.113.5/32")), "203.0.113.5/32")
+        self.assertEqual(vm.operator_cidr(self.vm(LAB_SSH_ALLOW_CIDR="203.0.113.5")), "203.0.113.5/32")
+        self.assertEqual(vm.operator_cidr(self.vm(), lookup=lambda: "198.51.100.7\n"), "198.51.100.7/32")
+        for bad in ("2001:db8::1", "", "not-an-ip"):
+            with self.assertRaises(LabError):
+                vm.operator_cidr(self.vm(), lookup=lambda: bad)
+
+    def test_env_example_has_vm_items_and_no_ec2_leftovers(self):
+        text = (Path(__file__).resolve().parents[2] / ".env.example").read_text()
+        for key in ("LAB_HOSTNAME", "LAB_VM_CIDR", "LAB_VM_KEEP_ENTRY_IP", "LAB_SSH_ALLOW_CIDR", "LAB_JUDGE_ANTHROPIC_API_KEY",
+                    "LAB_GCP_PROJECT", "LAB_GCP_MACHINE_TYPE"):
+            self.assertIn(f"\n{key}=", text)
+        for old in ("LAB_EC2_VPC_CIDR", "LAB_EC2_DISK_GIB", "LAB_EC2_LOCAL_PORT", "LAB_EC2_KEEP_EIP", "LAB_AWS_HOSTNAME="):
+            self.assertNotIn(old, text)
 
 
-class CfnTemplateTest(unittest.TestCase):
-    """CloudFormation のテンプレート（labtool/cfn.py）。"""
+class CloudLayerTest(unittest.TestCase):
+    """クラウド固有層（labtool/clouds/）: 2 つの実装が同じ関数の組を持つこと、ネットワークの計画、VM の初期化の描画
+    （変更設計書 3 章〜6 章）。クラウドの API は呼ばない。"""
 
-    def ec2(self, **extra):
-        e = env(LAB_TARGET="aws-ec2", LAB_AWS_HOSTNAME="lab.example.test", LAB_ACME_EMAIL="ops@example.test", **extra)
-        e.values["LAB_AWS_BUCKET_PREFIX"] = render.bucket_prefix(e, "111111111111")
-        return e
+    def infra(self, target):
+        from labtool import clouds
+        plan = clouds.network_plan("10.60.0.0/16", subnets_per_node=(target == "aws-ec2"))
+        nodes = [clouds.Node(id=f"id-{n['index']}", index=n["index"], private_ip=n["private_ip"], public_ip="", zone=f"z{n['index']}")
+                 for n in plan["nodes"]]
+        prefix = "litellm-lab-111111111111-" if target == "aws-ec2" else "litellm-lab-my-project-"
+        infra = clouds.Infra(nodes=nodes, entry_ip="203.0.113.10", entry_ip_id="eipalloc-1" if target == "aws-ec2" else "litellm-lab-entry",
+                             buckets={k: prefix + k for k in clouds.bucket_specs(VmTargetTest().vm(target))}, bucket_prefix=prefix)
+        infra.extra["network"] = {"plan": plan, "azs": ["a", "b", "c"], "zones": ["a", "b", "c"]}
+        return infra
 
-    def test_network_plan_and_version(self):
-        from labtool import cfn
-        plan = cfn.network_plan("10.60.0.0/16")
-        self.assertEqual(plan["subnets"], ["10.60.0.0/24", "10.60.1.0/24", "10.60.2.0/24"])
-        self.assertEqual(plan["nodes"][0], {"index": 1, "subnet": "10.60.0.0/24", "private_ip": "10.60.0.10",
-                                            "secondary_ip": "10.60.0.11"})
-        self.assertEqual(cfn.k3s_install_version("rancher/k3s:v1.35.5-k3s1"), "v1.35.5+k3s1")
-        self.assertEqual(cfn.camel("audit-raw"), "AuditRaw")
-        self.assertEqual(cfn.output_key("litellm-bedrock", "AccessKeyId"), "LitellmBedrockAccessKeyId")
+    def test_both_clouds_implement_the_same_functions(self):
+        import inspect
+        from labtool import clouds
+        from labtool.clouds import aws_ec2, gcp
+        for name in clouds.FUNCTIONS:
+            a, g = getattr(aws_ec2, name, None), getattr(gcp, name, None)
+            self.assertTrue(callable(a) and callable(g), f"{name} が両方にありません")
+            self.assertEqual(str(inspect.signature(a)), str(inspect.signature(g)), f"{name} の引き数が違います")
+        self.assertIs(clouds.for_env(VmTargetTest().vm()), aws_ec2)
+        self.assertIs(clouds.for_env(VmTargetTest().vm("gcp-vm")), gcp)
+        with self.assertRaises(Exception):
+            clouds.for_env(env())
 
-    def test_storage_template(self):
-        from labtool import cfn
-        doc = cfn.storage_template(self.ec2(), "111111111111")
-        res = doc["Resources"]
-        raw = res["AuditRawBucket"]["Properties"]
-        self.assertEqual(raw["BucketName"], "litellm-lab-111111111111-audit-raw")
-        self.assertTrue(raw["ObjectLockEnabled"])
-        self.assertEqual(raw["ObjectLockConfiguration"]["Rule"]["DefaultRetention"], {"Mode": "GOVERNANCE", "Days": 90})
-        self.assertEqual(raw["LifecycleConfiguration"]["Rules"][0]["ExpirationInDays"], 91)
-        self.assertNotIn("Prefix", raw["LifecycleConfiguration"]["Rules"][0])
-        derived = res["AuditDerivedBucket"]["Properties"]
-        self.assertNotIn("ObjectLockEnabled", derived)
-        self.assertEqual(next(r for r in derived["LifecycleConfiguration"]["Rules"] if r["Id"] == "synth")["Prefix"], "synth/")
-        self.assertIn("PgBackupBucket", res)   # aws-ec2 は CloudNativePG のバックアップ先が要る（EKS 版は作らない）
-        self.assertIn("ImagesBucket", res)
-        self.assertTrue(all(res[k]["DeletionPolicy"] == "Delete" for k in res if k.endswith("Bucket")))
-        # IAM ユーザー: S3 の 4 利用者 ＋ registry ＋ litellm-bedrock。権限は接頭辞付きの ARN で、監査ログの削除を明示的に拒否
-        users = {k for k in res if res[k]["Type"] == "AWS::IAM::User"}
-        self.assertEqual(users, {"LitellmWriterUser", "AuditCompactorUser", "AuditViewerUser", "PgBackupUser",
-                                 "RegistryUser", "LitellmBedrockUser"})
-        writer = res["LitellmWriterUser"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
-        self.assertEqual(writer[0]["Resource"], ["arn:aws:s3:::litellm-lab-111111111111-audit-raw/raw/*"])
-        self.assertEqual(writer[-1]["Effect"], "Deny")
-        self.assertIn("s3:BypassGovernanceRetention", writer[-1]["Action"])
-        bedrock = res["LitellmBedrockUser"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"][0]
-        self.assertEqual(bedrock["Action"], ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"])
-        out = doc["Outputs"]
-        self.assertEqual(out["LitellmWriterSecretAccessKey"]["Value"], {"Fn::GetAtt": ["LitellmWriterKey", "SecretAccessKey"]})
-        self.assertEqual(out["ImagesBucketName"]["Value"], {"Ref": "ImagesBucket"})
-        self.assertEqual(res["LitellmWriterUser"]["Properties"]["UserName"], "litellm-lab-ec2-litellm-writer")
+    def test_network_plans(self):
+        from labtool import clouds
+        aws_plan = clouds.network_plan("10.60.0.0/16", subnets_per_node=True)
+        self.assertEqual(aws_plan["subnets"], ["10.60.0.0/24", "10.60.1.0/24", "10.60.2.0/24"])
+        self.assertEqual(aws_plan["nodes"][0], {"index": 1, "subnet": "10.60.0.0/24", "private_ip": "10.60.0.10",
+                                                "secondary_ip": "10.60.0.11"})
+        self.assertEqual(aws_plan["nodes"][2]["private_ip"], "10.60.2.10")
+        gcp_plan = clouds.network_plan("10.60.0.0/16", subnets_per_node=False)
+        self.assertEqual(gcp_plan["subnets"], ["10.60.0.0/24"])
+        self.assertEqual([n["private_ip"] for n in gcp_plan["nodes"]], ["10.60.0.10", "10.60.0.11", "10.60.0.12"])
+        self.assertEqual([n["secondary_ip"] for n in gcp_plan["nodes"]], ["", "", ""])
 
-    def test_network_and_nodes_templates(self):
-        from labtool import cfn
-        net = cfn.network_template(self.ec2())
-        res = net["Resources"]
-        self.assertEqual(res["Vpc"]["Properties"]["CidrBlock"], "10.60.0.0/16")
-        self.assertEqual(res["Subnet3"]["Properties"]["AvailabilityZone"], {"Fn::Select": [2, {"Fn::GetAZs": ""}]})
-        self.assertEqual(res["S3Endpoint"]["Properties"]["VpcEndpointType"], "Gateway")
-        ports = {(r["FromPort"], r["ToPort"]) for r in res["NodeSecurityGroup"]["Properties"]["SecurityGroupIngress"]}
-        self.assertEqual(ports, {(80, 80), (443, 443)})           # 外から開けるのは 80 と 443 だけ
-        self.assertEqual(res["NodeToNode"]["Properties"]["IpProtocol"], "-1")
-        script = "#!/bin/bash\nR=@@REGION@@ I=@@NODE_INDEX@@ S=@@SELF_IP@@ F=@@FIRST_IP@@ P=\"@@PEER_IPS@@\" Y=@@SECONDARY_IP@@ " \
-                 "V=@@VERSION_PARAM@@ T=@@TOKEN_PARAM@@ E=@@EIP_ALLOCATION_ID@@ Q=@@PRIORITY@@ H=@@REGISTRY_HOST@@ N=@@REGISTRY_NODEPORT@@\n"
-        nodes = cfn.nodes_template(self.ec2(), "/litellm-lab-ec2/k3s-token", "eipalloc-1", script,
-                                   version_param="/litellm-lab-ec2/k3s-version")
-        res = nodes["Resources"]
-        self.assertEqual({k for k in res if res[k]["Type"] == "AWS::EC2::Instance"}, {"Node1", "Node2", "Node3"})
-        n2 = res["Node2"]["Properties"]
-        self.assertEqual(n2["NetworkInterfaces"][0]["PrivateIpAddresses"],
-                         [{"PrivateIpAddress": "10.60.1.10", "Primary": True}, {"PrivateIpAddress": "10.60.1.11", "Primary": False}])
-        self.assertEqual(n2["NetworkInterfaces"][0]["SubnetId"], {"Ref": "Subnet2Id"})
-        self.assertEqual(n2["MetadataOptions"]["HttpTokens"], "required")
-        self.assertEqual(n2["BlockDeviceMappings"][0]["Ebs"]["VolumeSize"], 40)
-        user_data = n2["UserData"]["Fn::Base64"]
-        self.assertIn("I=2 S=10.60.1.10 F=10.60.0.10 P=\"10.60.0.10 10.60.2.10\" Y=10.60.1.11", user_data)
-        self.assertIn("V=/litellm-lab-ec2/k3s-version T=/litellm-lab-ec2/k3s-token E=eipalloc-1 Q=150 H=lab-registry:5000 N=30500",
-                      user_data)
-        self.assertNotIn("@@", user_data)
-        self.assertNotIn("v1.35.5", user_data)   # 版は user data に書かない（上げても 3 台が再起動しない）
-        # AMI は固定の ID で受ける（「最新」の SSM パラメータを参照すると、新しい AMI で 3 台が同時に置き換えられる）
-        self.assertEqual(nodes["Parameters"]["AmiId"], {"Type": "AWS::EC2::Image::Id"})
-        role = res["NodeRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
-        self.assertIn("ec2:AssociateAddress", role[0]["Action"])
-        self.assertEqual(role[1]["Action"], ["ssm:GetParameter"])
-        self.assertEqual(len(role[1]["Resource"]), 2)   # 参加トークンと版の 2 つのパラメータだけ
-        self.assertIn("k3s-version", role[1]["Resource"][1]["Fn::Sub"])
+    def test_bucket_specs_and_policies(self):
+        from labtool import clouds
+        from labtool.clouds import aws_ec2, gcp
+        e = VmTargetTest().vm()
+        specs = clouds.bucket_specs(e)
+        self.assertEqual(set(specs), {"audit-raw", "audit-access", "audit-derived", "pg-backup", "images", "cluster"})
+        self.assertEqual(specs["cluster"], {"lock": None, "versioning": True, "lifecycle": []})
+        self.assertEqual((aws_ec2.bucket_prefix(e, {"account": "111111111111"}), gcp.bucket_prefix(e, {"account": "my-project"})),
+                         ("litellm-lab-111111111111-", "litellm-lab-my-project-"))
+        self.assertEqual((aws_ec2.s3_endpoint(e), gcp.s3_endpoint(e)), ("", "https://storage.googleapis.com"))
+        # AWS: 接頭辞付きの ARN と、監査ログの削除の明示的な拒否
+        pol = aws_ec2.iam_policies(e, "p-")
+        self.assertEqual(set(pol), set(clouds.STATIC_KEY_USERS))
+        self.assertEqual(pol["litellm-writer"]["Statement"][0]["Resource"], ["arn:aws:s3:::p-audit-raw/raw/*"])
+        self.assertEqual(pol["registry"]["Statement"][0]["Resource"], ["arn:aws:s3:::p-images", "arn:aws:s3:::p-images/*"])
+        deny = pol["pg-backup"]["Statement"][-1]
+        self.assertEqual(deny["Effect"], "Deny")
+        self.assertIn("arn:aws:s3:::p-audit-raw/*", deny["Resource"])
+        # GCP: バケットの IAM の条件付きバインディングに写す（拒否は無く、保持ポリシーが守る）
+        bindings = gcp.bucket_bindings(e, "p-")
+        self.assertEqual(bindings["p-audit-raw"][0], {"user": "litellm-writer", "role": "roles/storage.objectCreator", "prefix": "raw/"})
+        self.assertIn({"user": "audit-viewer", "role": "roles/storage.objectViewer", "prefix": ""}, bindings["p-audit-raw"])
+        self.assertIn({"user": "pg-backup", "role": "roles/storage.objectAdmin", "prefix": ""}, bindings["p-pg-backup"])
+        self.assertTrue(all(any(b["user"] == "operator" for b in v) for v in bindings.values()))
+        rules = gcp._lifecycle_rules(specs["audit-raw"]["lifecycle"])
+        self.assertEqual(rules, [{"action": {"type": "Delete"}, "condition": {"age": 91, "isLive": True}},
+                                 {"action": {"type": "Delete"}, "condition": {"daysSinceNoncurrentTime": 91, "isLive": False}}])
+
+    def test_node_init_rendering_for_both_clouds(self):
+        from labtool import vm
+        from labtool.clouds import aws_ec2, gcp
+        for target, cloud in (("aws-ec2", aws_ec2), ("gcp-vm", gcp)):
+            e = VmTargetTest().vm(target)
+            infra = self.infra(target)
+            node = infra.nodes[2]
+            hooks = cloud.node_init_hooks(e, infra, node)
+            for fn in ("lab_install_tools", "lab_read_object", "lab_self_id", "lab_take_entry_ip", "lab_ensure_egress", "lab_hook_values"):
+                self.assertIn(f"{fn}()", hooks, f"{target} の hooks に {fn} がありません")
+            text = vm.render_node_init(node, infra.nodes, hooks, "ssh-ed25519 AAAA test")
+            self.assertEqual(re.findall(r"@@[A-Z_]+@@", text), [])   # 置き換え漏れ無し（説明文の @@名前@@ は残る）
+            self.assertIn('PRIORITY="100"', text)
+            self.assertIn('NODE_INDEX="3"', text)
+            self.assertIn("ssh-ed25519 AAAA test", text)
+            self.assertIn("/etc/rancher/k3s/config.yaml", text)
+            self.assertIn("cluster-init: true", text)
+            self.assertIn("sh -s - server\n", text)
+            self.assertNotIn("--cluster-init", text)
+            self.assertIn("nopreempt", text)
+            self.assertIn("lab_read_object k3s/version", text)
+            self.assertIn("notify_backup", text)
+            self.assertNotIn("ssm", text.lower())   # Systems Manager は使わない
+        infra = self.infra("aws-ec2")
+        aws_text = aws_ec2.node_init_hooks(VmTargetTest().vm(), infra, infra.nodes[0])
+        self.assertIn("associate-address", aws_text)
+        self.assertIn("LAB_SECONDARY_IP=\"10.60.0.11\"", aws_text)
+        self.assertIn("litellm-lab-111111111111-cluster", aws_text)
+        ginfra = self.infra("gcp-vm")
+        gcp_text = gcp.node_init_hooks(VmTargetTest().vm("gcp-vm"), ginfra, ginfra.nodes[0])
+        self.assertIn("addAccessConfig", gcp_text)
+        self.assertIn("LAB_ADDRESS_NAME=\"litellm-lab-entry\"", gcp_text)
+        self.assertFalse(any(l.lstrip().startswith("gcloud ") or " gcloud " in l for l in gcp_text.splitlines()
+                             if not l.lstrip().startswith("#")))   # gcloud を呼ばない（REST API だけ）
         with self.assertRaises(ValueError):
-            cfn.render_node_init(self.ec2(), cfn.network_plan("10.60.0.0/16")["nodes"][0], cfn.network_plan("10.60.0.0/16"),
-                                 "/p", "eipalloc-1", "@@UNKNOWN@@")
+            vm.render_node_init(infra.nodes[0], infra.nodes, "", "k", script="x @@UNKNOWN@@")
 
-    def test_real_node_init_script_has_no_leftover_placeholders(self):
-        from labtool import cfn
-        plan = cfn.network_plan("10.60.0.0/16")
-        text = cfn.render_node_init(self.ec2(), plan["nodes"][2], plan, "/litellm-lab-ec2/k3s-token", "eipalloc-1",
-                                    version_param="/litellm-lab-ec2/k3s-version")
-        self.assertIn('PRIORITY="100"', text)
-        self.assertIn('VERSION_PARAM="/litellm-lab-ec2/k3s-version"', text)
-        # 引数は config.yaml に書き、インストールスクリプトには server だけ渡す（版上げの再実行で引数が消えない）
-        self.assertIn("/etc/rancher/k3s/config.yaml", text)
-        self.assertIn("cluster-init: true", text)
-        self.assertIn("sh -s - server\n", text)
-        self.assertNotIn("--cluster-init", text)
-        self.assertIn("nopreempt", text)
-        self.assertIn("associate-address", text)
-        eip = cfn.eip_template(self.ec2())
-        self.assertEqual(eip["Resources"]["EntryIp"]["Type"], "AWS::EC2::EIP")
+    def test_infra_helpers(self):
+        from labtool import clouds
+        infra = self.infra("aws-ec2")
+        self.assertEqual(infra.node_ids(), ["id-1", "id-2", "id-3"])
+        self.assertEqual(infra.node("id-2").private_ip, "10.60.1.10")
+        with self.assertRaises(Exception):
+            infra.node("id-9")
+        self.assertEqual(clouds.network_plan("10.60.0.0/16", True)["vpc"], "10.60.0.0/16")

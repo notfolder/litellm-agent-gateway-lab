@@ -9,7 +9,7 @@ LiteLLM を AI エージェント向けゲートウェイとして使うため�
 - **スケール検証**: Mac 1 台の Kubernetes（OrbStack + k3d）で、複数レプリカ構成の LiteLLM を検証する
 - **冗長化と監査ログ**: PostgreSQL（CloudNativePG、3 台）と Valkey（Sentinel）をマネージドサービスを使わずに冗長化し、LLM への入出力を改ざんできない形で 90 日残す。利用者ごとの利用料（概算と按分）と入出力の履歴を検索するアプリ（`/lab-audit/`）付き
 
-全体の構成図は [docs/aws_architecture.md](docs/aws_architecture.md)（Mac と EKS）と [docs/ec2_architecture.md](docs/ec2_architecture.md)（EC2 3 台）、仕様は [docs/spec.md](docs/spec.md)、詳細設計は [docs/design.md](docs/design.md) を参照してください。各エージェントが自分の中に持つ LLM 審査（Claude Code の auto mode、Codex の Auto-review、Copilot Studio のリアルタイム保護）と設定方法の調査は [docs/agent-builtin-review.md](docs/agent-builtin-review.md) にあります。変更ごとの経緯（変更仕様書と変更設計書）は `.history/<日付>-<目的>/` にあります。
+全体の構成図は [docs/aws_architecture.md](docs/aws_architecture.md)（Mac と EKS）と [docs/ec2_architecture.md](docs/ec2_architecture.md)（EC2 3 台。GCP 版を足した形への書き直しは配備と試験の後）、仕様は [docs/spec.md](docs/spec.md)、詳細設計は [docs/design.md](docs/design.md) を参照してください。各エージェントが自分の中に持つ LLM 審査（Claude Code の auto mode、Codex の Auto-review、Copilot Studio のリアルタイム保護）と設定方法の調査は [docs/agent-builtin-review.md](docs/agent-builtin-review.md) にあります。変更ごとの経緯（変更仕様書と変更設計書）は `.history/<日付>-<目的>/` にあります。
 
 ## 構築
 
@@ -44,17 +44,18 @@ aws configure sso              # プロファイルを作り、aws sso login --p
 
 人が行うこと: Bedrock のモデルアクセス（Anthropic の Claude）を有効にする、ACM の検証用 CNAME（配備の途中で表示）と、ホスト名 → ALB の CNAME（`./lab litellm` が表示）を手持ちの DNS に足す。`./lab down` は AWS の有料リソース（EKS、ALB、Aurora、ElastiCache、EFS、NAT、S3 の監査ログ、秘密情報）をすべて消します。残るのは無料のもの（ACM の証明書、Identity Center、DNS の CNAME、CDK の bootstrap）だけです。
 
-## AWS の EC2 3 台と S3 だけで動かす（`LAB_TARGET=aws-ec2`）
+## VM 3 台とオブジェクトストレージだけで動かす（`LAB_TARGET=aws-ec2` / `gcp-vm`）
 
-マネージドサービスを使わず、EC2 3 台（別 AZ、k3s の server 3 台）と S3 だけで同じ構成を動かす 3 つ目の環境です。Kubernetes の中は Mac の k3d と同じ（CloudNativePG 3 台、Valkey と Sentinel、Traefik）で、RustFS だけ S3 に替わります。1 台が落ちても処理が続き、`./lab down` で有料のものがすべて消えます（経緯は `.history/2026-10-25-EC2三台構成/`。実装済み、配備はアカウントの制限の解除待ち）。
+マネージドサービスを使わず、クラウドの部品を計算資源とオブジェクトストレージに限って同じ構成を動かす環境です。AWS は EC2 3 台（別 AZ）と S3、GCP は Compute Engine 3 台（別ゾーン）と Cloud Storage。どちらも Ubuntu 24.04 LTS arm64 の k3s（server 3 台）で、Kubernetes の中は Mac の k3d と同じ（CloudNativePG 3 台、Valkey と Sentinel、Traefik）、RustFS だけがクラウドのバケットに替わります。クラウドの違いは `labtool/clouds/`（計算資源、ネットワーク、浮動 IP、バケットと静的キー、削除）に閉じ、VM の中と Kubernetes の中は 1 つのコードです。1 台が落ちても処理が続き、`./lab down` で有料のものがすべて消えます（経緯は `.history/2026-10-25-EC2三台構成/` と `.history/2026-10-30-VM環境の共通化とGCP追加/`。実装済み、配備はまだ）。
 
 ```bash
-brew install awscli kubectl-cnpg && brew install --cask session-manager-plugin
-# .env: LAB_TARGET=aws-ec2、LAB_AWS_PROFILE、LAB_AWS_HOSTNAME、LAB_CLOUDFLARE_API_TOKEN（Zone / DNS / Edit）、LAB_ACME_EMAIL
-./lab up   # CloudFormation（Elastic IP、S3 と IAM ユーザー、VPC、EC2 3 台）→ k3s → イメージを中の registry へ → LiteLLM → Let's Encrypt
+brew install kubectl-cnpg awscli            # GCP は brew install --cask google-cloud-sdk、gcloud auth application-default login
+# .env: LAB_TARGET=aws-ec2 か gcp-vm、LAB_HOSTNAME、LAB_CLOUDFLARE_API_TOKEN（Zone / DNS / Edit）、LAB_ACME_EMAIL、
+#       LAB_JUDGE_ANTHROPIC_API_KEY（審査官）。AWS は LAB_AWS_PROFILE、GCP は LAB_GCP_PROJECT
+./lab up   # 基盤（API を直接呼ぶ: ネットワーク → 浮動 IP → バケットと静的キー → VM 3 台）→ k3s → イメージを中の registry へ → LiteLLM → Let's Encrypt
 ```
 
-人が行うこと: `./lab litellm` が表示する Elastic IP への A レコードを Cloudflare に足す（DNS のみ）。入口は keepalived が Elastic IP を 3 台の間で移し、HTTPS は cert-manager が Let's Encrypt（DNS-01）で取ります。構築ツールは Systems Manager の Session Manager で k3s の API に届くので、SSH も 6443 も開けません。障害の試験は Mac と同じ場面に `--scenario eip-node`（入口の台を止める）が加わります。Kubernetes（k3s）の版は `./lab upgrade-k8s <版>` が 1 台ずつ上げます（Pod を他の台へ追い出してから k3s を再起動。Elastic IP の台は最後。`./lab up` では版を変えません。経緯は `.history/2026-10-26-k3s版上げ/`）。
+人が行うこと: `./lab litellm` が表示する浮動 IP（Elastic IP / 静的な外部 IP）への A レコードを Cloudflare に足す（DNS のみ）。入口は keepalived が浮動 IP を 3 台の間で移し、HTTPS は cert-manager が Let's Encrypt（DNS-01）で取ります。構築ツールは SSH で VM に届き、22 は `./lab` を流すたびに操作者の今の IP だけに開け直します（6443 は開けず、SSH のポート転送で届く）。Claude Code のモデルは Mac と同じ Claude Max のトークンの転送、2 つの審査官は Anthropic の API キーの Claude Haiku 4.5 です（Bedrock / Vertex AI は使わない）。障害の試験は Mac と同じ場面に `--scenario entry-node`（入口の台を止める）が加わります。Kubernetes（k3s）の版は `./lab upgrade-k8s <版>` が 1 台ずつ上げます（Pod を他の台へ追い出してから k3s を再起動。浮動 IP の台は最後。`./lab up` では版を変えません。経緯は `.history/2026-10-26-k3s版上げ/`）。
 
 ## よく使うコマンド
 
@@ -64,10 +65,10 @@ brew install awscli kubectl-cnpg && brew install --cask session-manager-plugin
 | `./lab rebuild` | クラスタを作り直す（DB と監査ログは消える。`.env`、ChatGPT のトークン、イメージの置き場は残る） |
 | `./lab status` | 状態の表示 |
 | `./lab upgrade v1.x.y` | LiteLLM のローリング更新 |
-| `./lab upgrade-k8s v1.x.y+k3s1 [--measure]` | EC2 3 台の k3s（Kubernetes）を 1 台ずつ上げる（`aws-ec2` だけ。マイナー版は 1 つずつ。`--measure` で上げている間の要求の失敗を測る） |
+| `./lab upgrade-k8s v1.x.y+k3s1 [--measure]` | VM 3 台の k3s（Kubernetes）を 1 台ずつ上げる（`aws-ec2` / `gcp-vm` だけ。マイナー版は 1 つずつ。`--measure` で上げている間の要求の失敗を測る） |
 | `./lab test-unit` / `test-smoke` / `test-idempotency` / `test-load` | 試験 |
 | `./lab test-judge [--context \| --isolated]` | 審査官の事例試験（本物の審査官を呼ぶので ChatGPT の利用枠を使う。指定なしは両方の審査） |
-| `./lab test-failover [--pooler direct]` / `test-restore` | DB と Redis の障害の試験（EKS 版は `--scenario litellm-drain` / `aurora-failover` / `valkey-failover`、EC2 3 台は Mac の場面 ＋ `eip-node`） / バックアップから任意の時点に戻す試験 |
+| `./lab test-failover [--pooler direct]` / `test-restore` | DB と Redis の障害の試験（EKS 版は `--scenario litellm-drain` / `aurora-failover` / `valkey-failover`、VM 3 台は Mac の場面 ＋ `entry-node`） / バックアップから任意の時点に戻す試験 |
 | `./lab test-audit` | 監査ログの試験（記録、整形、検索アプリ、精算、改ざんの防止、退避と再送） |
 | `./lab audit-synth` / `audit-bench` / `audit-compact` | 検索の速さの試験用の合成データ / 速さの試験 / 監査ログの整形を手で流す |
 | `./lab review-log` | 審査の判定ログの集計 |

@@ -68,17 +68,18 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
     """
     codex_model = env.get("LAB_CODEX_MODEL", "gpt-5.6-terra")
     judge_model = env.get("LAB_JUDGE_MODEL", "gpt-5.6-luna")
-    # AWS 環境では Jev を使わない（セルフホスト版が無く、ツールコールの内容が社外に出るため。変更仕様書 0.2 節）
-    use_jev = env.has_jev() and env.get("LAB_USE_JEV", "true").lower() == "true" and not env.on_aws
+    # クラウドの環境では Jev を使わない（セルフホスト版が無く、ツールコールの内容が社外に出るため。変更仕様書 0.2 節）
+    use_jev = env.has_jev() and env.get("LAB_USE_JEV", "true").lower() == "true" and not env.on_cloud
 
-    if env.on_aws:
-        # Claude Code は Bedrock の Claude（Claude Max のトークン転送は AWS 環境では使わない）
+    if env.is_aws:
+        # EKS 版: Claude Code は Bedrock の Claude（Claude Max のトークン転送は使わない）
         model_list: list[dict] = [
             {"model_name": name, "litellm_params": bedrock_params(env, model_id)}
             for name, model_id in aws_claude_models(env).items()
         ]
     else:
-        # Claude Code（Claude Max のトークンを転送する。api_key は書かない）
+        # Mac と VM の環境: Claude Code（Claude Max のトークンを転送する。api_key は書かない。
+        # 変更仕様書 2026-10-30-VM環境の共通化とGCP追加 4 章）
         model_list = [{"model_name": "anthropic/*", "litellm_params": {"model": "anthropic/*"}}]
     if has_chatgpt:
         # Codex（ChatGPT Plus）。単価は概算用（ChatGPT の定額の契約は単価表に無く、そのままでは 0 になるため）
@@ -90,11 +91,14 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
     # 試験用の単価（1 百万トークンあたり 1 / 2 USD）。精算の按分を試すには、概算（A）が 0 でないことが要るため
     model_list.append({"model_name": "fake-tools", "litellm_params": _fake_params(),
                        "model_info": {"input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6}})
-    # 二次判定（審査官）。Mac は ChatGPT Plus のモデル、AWS は Bedrock の Claude Haiku 4.5（日本内で処理するプロファイル。
-    # 変更仕様書 4.2 節）。どちらも無ければ試験用の偽 LLM
+    # 二次判定（審査官）。Mac は ChatGPT Plus のモデル、EKS 版は Bedrock の Claude Haiku 4.5（日本内で処理するプロファイル）、
+    # VM の環境は Anthropic の API キーで Claude Haiku 4.5（キーの環境変数は ANTHROPIC_API_KEY ではない名前。
+    # Pod にその名前があると anthropic/* の転送がトークンの代わりにキーを使いうるため。変更設計書 8 章）。無ければ試験用の偽 LLM
     def judge_params(model_name: str, chatgpt_model: str) -> tuple[dict, dict | None]:
-        if env.on_aws:
+        if env.is_aws:
             return bedrock_params(env, aws_judge_model(env)), None
+        if env.is_vm:
+            return {"model": f"anthropic/{vm_judge_model(env)}", "api_key": f"os.environ/{JUDGE_KEY_ENV}"}, None
         if has_chatgpt:
             return {"model": f"chatgpt/{chatgpt_model}"}, model_prices(env, model_name, chatgpt_model)
         return _fake_params(), None
@@ -265,7 +269,7 @@ def to_yaml(data: dict, header: str = "") -> str:
 def helm_overrides(env: Env, image_repo: str, image_tag: str, config_hash: str, aws_out: dict | None = None) -> dict:
     """values.yaml に重ねる、環境ごとの値。aws では CloudFormation の出力（aws_out）から接続先を入れる
     （変更仕様書 2026-10-24-AWS構成 2.3 節。差分はここに閉じ込め、values.yaml の骨格は共通）。
-    aws-ec2 は Kubernetes の中が Mac と同じなので local の値を使い、監査ログの S3 とイメージの取り方だけ変える。"""
+    VM の環境（aws-ec2 / gcp-vm）は Kubernetes の中が Mac と同じなので local の値を使い、監査ログのバケットとイメージの取り方だけ変える。"""
     pooler = db_pooler(env) == "pooler" and not env.is_aws   # EKS 版は直結のみ（変更仕様書 3.1 節）
     env_vars = {
         "LITELLM_MODE": "PRODUCTION",
@@ -297,11 +301,12 @@ def helm_overrides(env: Env, image_repo: str, image_tag: str, config_hash: str, 
         })
         # チャートは db.useExisting のとき、DATABASE_URL を Pod の env に直接書く（接続先はここで切り替える）
         overrides["db"] = {"endpoint": "litellm-pg-pooler-rw" if pooler else "litellm-pg-rw"}
-        if env.is_aws_ec2:
+        if env.is_vm:
             env_vars.update({
-                # 監査ログは AWS の S3（接続先は空で既定のエンドポイント。資格情報は IAM ユーザーの静的キー。接頭辞付きの名前）
-                "AUDIT_S3_ENDPOINT": "",
-                "AUDIT_S3_REGION": env.aws_region,
+                # 監査ログはクラウドのバケット（接続先はクラウド固有層の s3_endpoint。AWS は空＝既定、GCP は storage.googleapis.com。
+                # 資格情報は静的キー。接頭辞付きの名前）
+                "AUDIT_S3_ENDPOINT": vm_s3_endpoint(env),
+                "AUDIT_S3_REGION": env.vm_region,
                 "AUDIT_S3_BUCKET": bucket_name(env, AUDIT_RAW),
             })
             # イメージはクラスタの中の置き場（registry）から。chatgpt/ のトークンは置かない（共有ファイルシステムが無い。
@@ -373,11 +378,10 @@ def secrets_for_litellm(env: Env) -> dict[str, str]:
                  "GOOGLE_OAUTH_CLIENT_ID": cid, "GOOGLE_OAUTH_CLIENT_SECRET": secret}
     if env.has_jev():
         data["TYPESAFE_API_KEY"] = env.get("TYPESAFE_API_KEY")
-    if env.is_aws_ec2:
-        # Bedrock の静的キー（IAM ユーザー litellm-bedrock。CloudFormation の出力を labtool/ec2.py が Env に載せる）。
-        # AWS_ACCESS_KEY_ID の名前は使わない（監査ログの S3 の資格情報と混ざらないように、モデルの設定で明示して渡す）
-        data["BEDROCK_ACCESS_KEY_ID"] = env.get("BEDROCK_ACCESS_KEY_ID")
-        data["BEDROCK_SECRET_ACCESS_KEY"] = env.get("BEDROCK_SECRET_ACCESS_KEY")
+    if env.is_vm:
+        # 審査官の Anthropic の API キー。ANTHROPIC_API_KEY の名前は使わない（Pod にあると anthropic/* の転送が
+        # Max のトークンの代わりにキーを使いうる。変更設計書 2026-10-30-VM環境の共通化とGCP追加 8 章）
+        data[JUDGE_KEY_ENV] = env.get(JUDGE_KEY_ENV)
     return data
 
 
@@ -401,8 +405,8 @@ def client_files(env: Env, claude_key: str, codex_key: str, codex_home: Path,
         f"export ANTHROPIC_CUSTOM_HEADERS='x-litellm-api-key: Bearer {claude_key}'\n"
         f"export LAB_LITELLM_KEY='{claude_key}'\n"
     )
-    if env.on_aws:
-        # Bedrock のモデルは名前を固定で登録するので、Claude Code の別名（sonnet / haiku / opus）をその名前に向ける
+    if env.is_aws:
+        # EKS 版: Bedrock のモデルは名前を固定で登録するので、Claude Code の別名（sonnet / haiku / opus）をその名前に向ける
         for var, name in claude_code_model_env(env).items():
             files["claude.env"] += f"export {var}='{name}'\n"
     host = env.public_host
@@ -569,15 +573,20 @@ def initial_contracts(env: Env) -> dict:
     from datetime import datetime, timedelta, timezone
     month = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m")
     codex = env.get("LAB_CODEX_MODEL", "gpt-5.6-terra")
-    if env.on_aws:
-        # Claude Code と審査官は Bedrock の従量課金（実費は月ごとに請求書から入れる）、Codex は ChatGPT Plus の定額のまま
-        # （aws-ec2 は chatgpt/ を置かないので Bedrock だけ）
-        contracts = [{"id": "bedrock", "name": "Amazon Bedrock", "kind": "invoice", "currency": "USD",
-                      "models": ["claude-*", "review-judge", "isolated-judge"], "fees": {}}]
-        if not env.is_aws_ec2:
-            contracts.append({"id": "chatgpt-plus", "name": "ChatGPT Plus", "kind": "subscription", "currency": "USD",
-                              "models": [codex], "fees": {month: 20.0}})
-        return {"schema": 1, "contracts": contracts}
+    if env.is_aws:
+        # EKS 版: Claude Code と審査官は Bedrock の従量課金（実費は月ごとに請求書から入れる）、Codex は ChatGPT Plus の定額のまま
+        return {"schema": 1, "contracts": [
+            {"id": "bedrock", "name": "Amazon Bedrock", "kind": "invoice", "currency": "USD",
+             "models": ["claude-*", "review-judge", "isolated-judge"], "fees": {}},
+            {"id": "chatgpt-plus", "name": "ChatGPT Plus", "kind": "subscription", "currency": "USD",
+             "models": [codex], "fees": {month: 20.0}}]}
+    if env.is_vm:
+        # VM の環境: Claude Code は Mac と同じ Claude Max の定額、審査官は Anthropic の API の従量（chatgpt/ は置かない）
+        return {"schema": 1, "contracts": [
+            {"id": "claude-max", "name": "Claude Max", "kind": "subscription", "currency": "USD",
+             "models": ["anthropic/*", "claude-*"], "fees": {month: 100.0}},
+            {"id": "anthropic-api", "name": "Anthropic API", "kind": "invoice", "currency": "USD",
+             "models": ["review-judge", "isolated-judge"], "fees": {}}]}
     return {"schema": 1, "contracts": [
         {"id": "chatgpt-plus", "name": "ChatGPT Plus", "kind": "subscription", "currency": "USD",
          "models": [codex, "review-judge", "isolated-judge"], "fees": {month: 20.0}},
@@ -618,23 +627,39 @@ ESO_STORE = "aws-secretsmanager"
 
 
 def bucket_prefix(env: Env, account: str) -> str:
-    """S3 のバケット名の接頭辞。AWS では全世界で一意にするため <接頭辞>-<アカウント>-。Mac（RustFS）は空。"""
-    return f"{env.aws_prefix}-{account}-" if env.on_aws else ""
+    """バケット名の接頭辞。クラウドでは全世界で一意にするため <接頭辞>-<アカウント / プロジェクト>-。Mac（RustFS）は空。
+    VM の環境の接頭辞はクラウド固有層（clouds.*.bucket_prefix）が決め、preflight が LAB_BUCKET_PREFIX に載せる。"""
+    if env.is_vm:
+        return env.get("LAB_BUCKET_PREFIX", "")
+    return f"{env.aws_prefix}-{account}-" if env.is_aws else ""
 
 
 def bucket_name(env: Env, logical: str) -> str:
-    """論理名（audit-raw など）から実際のバケット名。AWS では LAB_AWS_BUCKET_PREFIX（preflight が Env に載せる）を付ける。"""
-    return env.get("LAB_AWS_BUCKET_PREFIX", "") + logical if env.on_aws else logical
+    """論理名（audit-raw など）から実際のバケット名。クラウドでは接頭辞（preflight が Env の LAB_BUCKET_PREFIX に載せる。
+    EKS 版の LAB_AWS_BUCKET_PREFIX も読む）を付ける。"""
+    if not env.on_cloud:
+        return logical
+    return (env.get("LAB_BUCKET_PREFIX") or env.get("LAB_AWS_BUCKET_PREFIX", "")) + logical
 
 
 def bedrock_params(env: Env, model_id: str) -> dict:
-    """Bedrock のモデルの litellm_params。EKS 版は Pod Identity（資格情報チェーン）、aws-ec2 は IAM ユーザーの静的キーを
-    環境変数（Secret litellm-secrets の BEDROCK_*）で明示して渡す。"""
-    params = {"model": f"bedrock/{model_id}", "aws_region_name": env.aws_region}
-    if env.is_aws_ec2:
-        params.update({"aws_access_key_id": "os.environ/BEDROCK_ACCESS_KEY_ID",
-                       "aws_secret_access_key": "os.environ/BEDROCK_SECRET_ACCESS_KEY"})
-    return params
+    """Bedrock のモデルの litellm_params（EKS 版。Pod Identity の資格情報チェーン）。"""
+    return {"model": f"bedrock/{model_id}", "aws_region_name": env.aws_region}
+
+
+# VM の環境（aws-ec2 / gcp-vm）の審査官: Anthropic の API キーで Claude Haiku 4.5（変更仕様書 2026-10-30 4 章）
+JUDGE_KEY_ENV = "LAB_JUDGE_ANTHROPIC_API_KEY"
+DEFAULT_VM_JUDGE_MODEL = "claude-haiku-4-5-20251001"
+
+
+def vm_judge_model(env: Env) -> str:
+    return env.get("LAB_VM_JUDGE_MODEL") or DEFAULT_VM_JUDGE_MODEL
+
+
+def vm_s3_endpoint(env: Env) -> str:
+    """クラスタの中の S3 互換の設定に渡す接続先（AWS は空＝既定、GCP は storage.googleapis.com）。"""
+    from . import clouds
+    return clouds.for_env(env).s3_endpoint(env)
 
 
 def aws_claude_models(env: Env) -> dict[str, str]:
@@ -826,35 +851,36 @@ def alb_ingress_manifest(env: Env, out: dict, viewer: bool) -> str:
     return yaml.safe_dump_all(docs, sort_keys=False)
 
 
-# ---- EC2 3 台の環境（LAB_TARGET=aws-ec2）。変更設計書 .history/2026-10-25-EC2三台構成/ 2 章、4.6 節 ----
-EC2_REGISTRY_NAME = "lab-registry"
-EC2_REGISTRY_IMAGE = "registry:3.0.0"
-EC2_TLS_SECRET = "litellm-tls"
+# ---- VM 3 台の環境（LAB_TARGET=aws-ec2 / gcp-vm）。変更設計書 .history/2026-10-25-EC2三台構成/ 2 章、4.6 節 ----
+VM_REGISTRY_NAME = "lab-registry"
+VM_REGISTRY_IMAGE = "registry:3.0.0"
+VM_TLS_SECRET = "litellm-tls"
 ACME_PRODUCTION = "https://acme-v02.api.letsencrypt.org/directory"
 ACME_STAGING = "https://acme-staging-v02.api.letsencrypt.org/directory"
 
 
-def ec2_registry_manifest(env: Env, bucket: str, node_port: int) -> str:
+def vm_registry_manifest(env: Env, bucket: str, node_port: int) -> str:
     """クラスタの中のイメージ置き場（Docker の registry。保存先は S3 の images バケットなので、どの台が落ちても続く）。
-    2 Pod を別々の台に置き、NodePort で各ノードが自分の IP から引く（containerd のミラー設定は cfn/node-init.sh）。
+    2 Pod を別々の台に置き、NodePort で各ノードが自分の IP から引く（containerd のミラー設定は vm/node-init.sh）。
     Mac からは ./lab images が kubectl port-forward で push する。"""
-    labels = {"app": EC2_REGISTRY_NAME}
+    labels = {"app": VM_REGISTRY_NAME}
     env_vars = [
         {"name": "REGISTRY_STORAGE", "value": "s3"},
-        {"name": "REGISTRY_STORAGE_S3_REGION", "value": env.aws_region},
+        {"name": "REGISTRY_STORAGE_S3_REGION", "value": env.vm_region},
+        {"name": "REGISTRY_STORAGE_S3_REGIONENDPOINT", "value": vm_s3_endpoint(env)},
         {"name": "REGISTRY_STORAGE_S3_BUCKET", "value": bucket},
         {"name": "REGISTRY_STORAGE_S3_ROOTDIRECTORY", "value": "/registry"},
         {"name": "REGISTRY_STORAGE_DELETE_ENABLED", "value": "true"},
         {"name": "REGISTRY_HTTP_ADDR", "value": ":5000"},
     ]
-    secret_ref = [{"secretRef": {"name": EC2_REGISTRY_NAME}}]
+    secret_ref = [{"secretRef": {"name": VM_REGISTRY_NAME}}]
     docs = [
         {"apiVersion": "v1", "kind": "Service",
-         "metadata": {"name": EC2_REGISTRY_NAME, "namespace": "litellm-lab"},
+         "metadata": {"name": VM_REGISTRY_NAME, "namespace": "litellm-lab"},
          "spec": {"type": "NodePort", "selector": labels,
                   "ports": [{"port": 5000, "targetPort": 5000, "nodePort": node_port}]}},
         {"apiVersion": "apps/v1", "kind": "Deployment",
-         "metadata": {"name": EC2_REGISTRY_NAME, "namespace": "litellm-lab"},
+         "metadata": {"name": VM_REGISTRY_NAME, "namespace": "litellm-lab"},
          "spec": {"replicas": 2, "selector": {"matchLabels": labels},
                   "template": {"metadata": {"labels": labels}, "spec": {
                       "affinity": {"podAntiAffinity": {"preferredDuringSchedulingIgnoredDuringExecution": [
@@ -865,7 +891,7 @@ def ec2_registry_manifest(env: Env, bucket: str, node_port: int) -> str:
                            "tolerationSeconds": 30},
                           {"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute",
                            "tolerationSeconds": 30}],
-                      "containers": [{"name": "registry", "image": EC2_REGISTRY_IMAGE, "env": env_vars,
+                      "containers": [{"name": "registry", "image": VM_REGISTRY_IMAGE, "env": env_vars,
                                       "envFrom": secret_ref,
                                       "ports": [{"containerPort": 5000}],
                                       "readinessProbe": {"httpGet": {"path": "/v2/", "port": 5000}, "periodSeconds": 5},
@@ -875,7 +901,7 @@ def ec2_registry_manifest(env: Env, bucket: str, node_port: int) -> str:
     return yaml.safe_dump_all(docs, sort_keys=False)
 
 
-def ec2_registry_secret(env: Env) -> dict[str, str]:
+def vm_registry_secret(env: Env) -> dict[str, str]:
     """registry の Pod に渡す秘密: S3 の静的キー（IAM ユーザー registry）と、2 Pod で共通の HTTP の秘密。"""
     key_name, secret_name = s3_env_names("registry")
     return {"REGISTRY_STORAGE_S3_ACCESSKEY": env.get(key_name), "REGISTRY_STORAGE_S3_SECRETKEY": env.get(secret_name),
@@ -886,11 +912,11 @@ def acme_staging(env: Env) -> bool:
     return env.get("LAB_ACME_STAGING", "false").lower() == "true"
 
 
-def ec2_issuer_manifest(env: Env) -> str:
+def vm_issuer_manifest(env: Env) -> str:
     """Let's Encrypt の ClusterIssuer（DNS-01、Cloudflare）。API トークンは cert-manager の名前空間の Secret。"""
     email = env.get("LAB_ACME_EMAIL")
     if not email:
-        raise ValueError("LAB_TARGET=aws-ec2 には LAB_ACME_EMAIL（Let's Encrypt の連絡先）が要ります")
+        raise ValueError(f"LAB_TARGET={env.target} には LAB_ACME_EMAIL（Let's Encrypt の連絡先）が要ります")
     doc = {"apiVersion": "cert-manager.io/v1", "kind": "ClusterIssuer",
            "metadata": {"name": "letsencrypt"},
            "spec": {"acme": {
@@ -902,16 +928,16 @@ def ec2_issuer_manifest(env: Env) -> str:
     return yaml.safe_dump(doc, sort_keys=False)
 
 
-def ec2_certificate_manifest(env: Env) -> str:
+def vm_certificate_manifest(env: Env) -> str:
     doc = {"apiVersion": "cert-manager.io/v1", "kind": "Certificate",
-           "metadata": {"name": EC2_TLS_SECRET, "namespace": "litellm-lab"},
-           "spec": {"secretName": EC2_TLS_SECRET, "dnsNames": [env.aws_hostname],
+           "metadata": {"name": VM_TLS_SECRET, "namespace": "litellm-lab"},
+           "spec": {"secretName": VM_TLS_SECRET, "dnsNames": [env.hostname],
                     "issuerRef": {"name": "letsencrypt", "kind": "ClusterIssuer"},
                     "privateKey": {"rotationPolicy": "Always"}}}
     return yaml.safe_dump(doc, sort_keys=False)
 
 
-def tls_ingressroutes(manifest_text: str, secret_name: str = EC2_TLS_SECRET) -> str:
+def tls_ingressroutes(manifest_text: str, secret_name: str = VM_TLS_SECRET) -> str:
     """マニフェストの中の IngressRoute（web）を、websecure に TLS 付きで写す（名前は <元の名前>-tls）。
     経路と Middleware は共通の定義（k8s/ingress.yaml、audit-viewer.yaml）をそのまま使い、入口の HTTPS 化だけを足す。"""
     docs = []
@@ -927,9 +953,11 @@ def tls_ingressroutes(manifest_text: str, secret_name: str = EC2_TLS_SECRET) -> 
 
 
 def pg_backup_values(env: Env) -> dict[str, str]:
-    """k8s/postgres-cnpg.yaml に渡す値。Mac は RustFS（endpointURL あり、接頭辞なし）、aws-ec2 は AWS の S3
-    （endpointURL の行を省く、接頭辞付き、リージョンは AWS）。"""
-    if env.is_aws_ec2:
-        return {"S3_BUCKET_PREFIX": env.get("LAB_AWS_BUCKET_PREFIX"), "S3_ENDPOINT_LINE": "", "S3_REGION": env.aws_region}
+    """k8s/postgres-cnpg.yaml に渡す値。Mac は RustFS（endpointURL あり、接頭辞なし）、VM の環境はクラウドのバケット
+    （接頭辞付き、リージョンはクラウド。endpointURL は AWS は省き、GCP は storage.googleapis.com）。"""
+    if env.is_vm:
+        endpoint = vm_s3_endpoint(env)
+        return {"S3_BUCKET_PREFIX": bucket_name(env, ""), "S3_ENDPOINT_LINE": f"endpointURL: {endpoint}" if endpoint else "",
+                "S3_REGION": env.vm_region}
     return {"S3_BUCKET_PREFIX": "", "S3_ENDPOINT_LINE": f"endpointURL: {env.get('LAB_S3_ENDPOINT', DEFAULT_S3_ENDPOINT)}",
             "S3_REGION": env.get("LAB_S3_REGION", "us-east-1")}

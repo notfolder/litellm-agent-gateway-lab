@@ -32,8 +32,10 @@ ENV_EXAMPLE = ROOT / ".env.example"
 CLUSTER = "litellm"
 KUBE_CONTEXT = f"k3d-{CLUSTER}"          # Mac（k3d）。AWS は Env.load() が set_kube_context で差し替える
 AWS_KUBE_CONTEXT = "litellm-lab-aws"      # aws eks update-kubeconfig --alias で付ける名前
-EC2_KUBE_CONTEXT = "litellm-lab-ec2"      # EC2 3 台の k3s（Session Manager のポート転送の先。labtool/ec2.py が書く）
-TARGETS = ("local", "aws", "aws-ec2")
+EC2_KUBE_CONTEXT = "litellm-lab-ec2"      # EC2 3 台の k3s（SSH のポート転送の先。labtool/vm.py が書く）
+GCP_KUBE_CONTEXT = "litellm-lab-gcp"      # Compute Engine 3 台の k3s（同上）
+VM_KUBE_CONTEXTS = {"aws-ec2": EC2_KUBE_CONTEXT, "gcp-vm": GCP_KUBE_CONTEXT}
+TARGETS = ("local", "aws", "aws-ec2", "gcp-vm")
 NS = "litellm-lab"
 HELM_RELEASE = "litellm"
 LITELLM_CHART = "oci://ghcr.io/berriai/litellm-helm"
@@ -124,7 +126,7 @@ class Env:
         if env.target not in TARGETS:
             raise LabError(f"LAB_TARGET は {' / '.join(TARGETS)} のどれかです（{env.target}）")
         # kubectl / helm が向くクラスタを環境に合わせる（変更仕様書 2026-10-24-AWS構成 2.3 節）
-        set_kube_context({"aws": AWS_KUBE_CONTEXT, "aws-ec2": EC2_KUBE_CONTEXT}.get(env.target, f"k3d-{CLUSTER}"))
+        set_kube_context({"aws": AWS_KUBE_CONTEXT, **VM_KUBE_CONTEXTS}.get(env.target, f"k3d-{CLUSTER}"))
         # 設定は .env だけから読む。コマンドの前に付けた値は効かないので、食い違えば知らせる
         shell = os.environ.get("LAB_NOREVIEW_KEYS", "").strip()
         if shell and shell.lower() != env.get("LAB_NOREVIEW_KEYS", "false").lower():
@@ -152,7 +154,8 @@ class Env:
     @property
     def target(self) -> str:
         """向ける環境: local（Mac の k3d）、aws（EKS 版。変更仕様書 2026-10-24-AWS構成 0.2 節）、
-        aws-ec2（EC2 3 台と S3 だけ。変更仕様書 2026-10-25-EC2三台構成 0.2 節）。"""
+        aws-ec2（EC2 3 台と S3。変更仕様書 2026-10-25-EC2三台構成 0.2 節）、
+        gcp-vm（Compute Engine 3 台と Cloud Storage。変更仕様書 2026-10-30-VM環境の共通化とGCP追加 0.2 節）。"""
         return self.get("LAB_TARGET", "local")
 
     @property
@@ -162,13 +165,28 @@ class Env:
 
     @property
     def is_aws_ec2(self) -> bool:
-        """EC2 3 台の k3s か（Kubernetes の中は Mac と同じ構成。基盤と入口と S3 だけが AWS）。"""
+        """EC2 3 台の k3s か（AWS の資格情報の読み方だけに使う。段階の分岐は is_vm）。"""
         return self.target == "aws-ec2"
 
     @property
+    def is_gcp_vm(self) -> bool:
+        return self.target == "gcp-vm"
+
+    @property
+    def is_vm(self) -> bool:
+        """VM 3 台の k3s（aws-ec2 と gcp-vm）か。Kubernetes の中は Mac と同じ構成で、基盤と入口とバケットだけがクラウド。
+        クラウドの違いは labtool/clouds/ に閉じ、段階のコードはこの判定だけで分岐する。"""
+        return self.target in VM_KUBE_CONTEXTS
+
+    @property
     def on_aws(self) -> bool:
-        """AWS のどちらか（HTTPS のホスト名、S3 のバケット名の接頭辞、Bedrock のモデルが共通）。"""
+        """AWS のどちらか（boto3 の資格情報、リージョン）。"""
         return self.is_aws or self.is_aws_ec2
+
+    @property
+    def on_cloud(self) -> bool:
+        """Mac 以外（HTTPS のホスト名、バケット名の接頭辞、Jev を使わない）。"""
+        return self.is_aws or self.is_vm
 
     @property
     def data_dir(self) -> Path:
@@ -181,22 +199,29 @@ class Env:
     @property
     def base_url(self) -> str:
         """クライアントとこのツールが使う入口。Mac は http://localhost:<port>、AWS は https://<ホスト名>。"""
-        if self.on_aws:
-            return f"https://{self.aws_hostname}"
+        if self.on_cloud:
+            return f"https://{self.hostname}"
         return f"http://localhost:{self.http_port}"
 
     @property
     def public_host(self) -> str:
         """入口のホスト名（ポート付き）。Claude Code の信頼するドメインの記述に使う。"""
-        return self.aws_hostname if self.on_aws else f"localhost:{self.http_port}"
+        return self.hostname if self.on_cloud else f"localhost:{self.http_port}"
 
-    # ---- AWS（LAB_TARGET=aws / aws-ec2 のときだけ使う） ----
+    # ---- クラウド共通（LAB_TARGET が local 以外のときだけ使う） ----
+    @property
+    def hostname(self) -> str:
+        """HTTPS のホスト名（LAB_HOSTNAME。EKS 版・EC2 版の LAB_AWS_HOSTNAME も読む）。"""
+        host = self.get("LAB_HOSTNAME") or self.get("LAB_AWS_HOSTNAME")
+        if not host:
+            raise LabError(f"LAB_TARGET={self.target} には LAB_HOSTNAME（HTTPS のホスト名）が要ります")
+        return host
+
     @property
     def aws_hostname(self) -> str:
-        host = self.get("LAB_AWS_HOSTNAME")
-        if not host:
-            raise LabError(f"LAB_TARGET={self.target} には LAB_AWS_HOSTNAME（HTTPS のホスト名）が要ります")
-        return host
+        return self.hostname
+
+    # ---- AWS（LAB_TARGET=aws / aws-ec2 のときだけ使う） ----
 
     @property
     def aws_region(self) -> str:
@@ -215,32 +240,61 @@ class Env:
     def aws_cluster_name(self) -> str:
         return f"{self.aws_prefix}-eks"
 
-    # ---- EC2 3 台（LAB_TARGET=aws-ec2。変更設計書 2026-10-25-EC2三台構成 6 章） ----
+    # ---- VM 3 台（LAB_TARGET=aws-ec2 / gcp-vm。変更設計書 2026-10-30-VM環境の共通化とGCP追加 2 章、9 章） ----
     @property
     def ec2_prefix(self) -> str:
-        """CloudFormation のスタック、IAM ユーザー、SSM のパラメータの接頭辞（EKS 版の名前と衝突しない）。"""
+        """AWS の資源（IAM ユーザー、タグ）の接頭辞（EKS 版の名前と衝突しない）。"""
         return f"{self.aws_prefix}-ec2"
+
+    @property
+    def gcp_prefix(self) -> str:
+        return self.get("LAB_GCP_PREFIX", "litellm-lab")
+
+    @property
+    def vm_prefix(self) -> str:
+        """クラウドの資源を探す目印（AWS はタグ lab:prefix、GCP はラベル lab-prefix）と名前の接頭辞。"""
+        return self.gcp_prefix if self.is_gcp_vm else self.ec2_prefix
 
     @property
     def ec2_instance_type(self) -> str:
         return self.get("LAB_EC2_INSTANCE_TYPE", "t4g.large")
 
     @property
-    def ec2_vpc_cidr(self) -> str:
-        return self.get("LAB_EC2_VPC_CIDR", "10.60.0.0/16")
+    def gcp_project(self) -> str:
+        project = self.get("LAB_GCP_PROJECT")
+        if not project:
+            raise LabError("LAB_TARGET=gcp-vm には LAB_GCP_PROJECT（プロジェクト ID）が要ります")
+        return project
 
     @property
-    def ec2_disk_gib(self) -> int:
-        return int(self.get("LAB_EC2_DISK_GIB", "40"))
+    def gcp_region(self) -> str:
+        return self.get("LAB_GCP_REGION", "asia-northeast1")
 
     @property
-    def ec2_local_port(self) -> int:
-        """Session Manager のポート転送のローカル側（k3s の API 6443 の宛先）。"""
-        return int(self.get("LAB_EC2_LOCAL_PORT", "16443"))
+    def gcp_machine_type(self) -> str:
+        return self.get("LAB_GCP_MACHINE_TYPE", "c4a-standard-2")
 
     @property
-    def ec2_keep_eip(self) -> bool:
-        return self.get("LAB_EC2_KEEP_EIP", "false").lower() == "true"
+    def vm_cidr(self) -> str:
+        return self.get("LAB_VM_CIDR", "10.60.0.0/16")
+
+    @property
+    def vm_disk_gib(self) -> int:
+        return int(self.get("LAB_VM_DISK_GIB", "40"))
+
+    @property
+    def vm_local_port(self) -> int:
+        """SSH のポート転送のローカル側（k3s の API 6443 の宛先）。"""
+        return int(self.get("LAB_VM_LOCAL_PORT", "16443"))
+
+    @property
+    def vm_keep_entry_ip(self) -> bool:
+        return self.get("LAB_VM_KEEP_ENTRY_IP", "false").lower() == "true"
+
+    @property
+    def vm_region(self) -> str:
+        """クラウドのリージョン名（S3 互換の設定に渡す）。"""
+        return self.gcp_region if self.is_gcp_vm else self.aws_region
 
     @property
     def litellm_version(self) -> str:

@@ -1,33 +1,43 @@
 #!/bin/bash
-# EC2 ノードの初期化（cloud-init の user data。LAB_TARGET=aws-ec2。変更設計書 .history/2026-10-25-EC2三台構成/ 3.4〜3.5 節）。
-# labtool/cfn.py が @@名前@@ を置き換えてから CloudFormation に渡す。3 台で同じ内容で、台ごとの値だけが違う。
-# 秘密（k3s の参加トークン）はここに書かず、Systems Manager のパラメータから取る。
+# VM ノードの初期化（LAB_TARGET=aws-ec2 は cloud-init の user data、gcp-vm は startup-script。
+# 変更設計書 .history/2026-10-30-VM環境の共通化とGCP追加/ 6 章）。Ubuntu 24.04 LTS arm64。
+# labtool/vm.py が @@名前@@ を置き換え、クラウド固有の手順（vm/hooks-aws.sh / hooks-gcp.sh）を HOOKS の印に差し込む。
+# 3 台で同じ内容で、台ごとの値だけが違う。秘密（k3s の参加トークン）はここに書かず、バケットから自分の権限で読む。
 set -euo pipefail
 exec > >(tee -a /var/log/lab-node-init.log) 2>&1
 
-REGION="@@REGION@@"
 NODE_INDEX="@@NODE_INDEX@@"            # 1〜3
 SELF_IP="@@SELF_IP@@"                  # 自分のプライベート IP（固定）
 FIRST_IP="@@FIRST_IP@@"                # 1 番の台のプライベート IP
 PEER_IPS="@@PEER_IPS@@"                # 他の 2 台のプライベート IP（空白区切り）
-SECONDARY_IP="@@SECONDARY_IP@@"        # Elastic IP を付ける 2 つ目のプライベート IP
-VERSION_PARAM="@@VERSION_PARAM@@"      # k3s の版を置く SSM のパラメータ名（例の値 v1.35.5+k3s1。版上げ後は新しい版）
-TOKEN_PARAM="@@TOKEN_PARAM@@"          # SSM のパラメータ名（SecureString）
-EIP_ALLOCATION_ID="@@EIP_ALLOCATION_ID@@"
 PRIORITY="@@PRIORITY@@"                # keepalived の優先度（1 番が高い）
 REGISTRY_HOST="@@REGISTRY_HOST@@"      # クラスタの中のイメージ置き場の名前（例 lab-registry:5000）
 REGISTRY_NODEPORT="@@REGISTRY_NODEPORT@@"
+SSH_PUBKEY="@@SSH_PUBKEY@@"            # 構築ツールの SSH の公開鍵
+
+# ---- クラウド固有の手順（関数: lab_install_tools、lab_read_object、lab_self_id、lab_take_entry_ip、lab_ensure_egress、lab_hook_values） ----
+@@HOOKS@@
+# ---- ここからクラウドを知らない ----
+
+# 構築ツールの SSH の鍵（GCP はメタデータからも入るが、同じ行があっても害は無い）
+install -d -m 700 -o ubuntu -g ubuntu /home/ubuntu/.ssh
+grep -qF "$SSH_PUBKEY" /home/ubuntu/.ssh/authorized_keys 2>/dev/null || echo "$SSH_PUBKEY" >> /home/ubuntu/.ssh/authorized_keys
+chmod 600 /home/ubuntu/.ssh/authorized_keys && chown ubuntu:ubuntu /home/ubuntu/.ssh/authorized_keys
 
 if [ -f /var/lib/lab/ready ]; then
+  # 2 回目以降の起動（GCP の startup-script は毎回走る）: 外向きの IP だけ確かめて抜ける
+  lab_ensure_egress || true
   echo "already initialized"; exit 0
 fi
 mkdir -p /var/lib/lab /etc/rancher/k3s /etc/keepalived /usr/local/bin
 
 # ---- 道具 ----
-dnf install -y keepalived
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -q
+apt-get install -y -q keepalived curl
+lab_install_tools   # hooks: クラウドの API を呼ぶ道具（AWS は aws-cli の snap。GCP は curl で足りる）
 
 # ---- イメージ置き場（クラスタの中の registry）を、各ノードが自分の NodePort 経由で引く ----
-# 名前は解決できなくても、containerd はミラーの endpoint に向かう。/etc/hosts にも足して確実にする
 cat > /etc/rancher/k3s/registries.yaml <<EOF
 mirrors:
   "${REGISTRY_HOST}":
@@ -38,11 +48,10 @@ REGISTRY_NAME="${REGISTRY_HOST%%:*}"
 grep -q " ${REGISTRY_NAME}\$" /etc/hosts || echo "127.0.0.1 ${REGISTRY_NAME}" >> /etc/hosts
 
 # ---- k3s ----
-# 版は SSM のパラメータから（user data に書かない。./lab upgrade-k8s が上げた後に作り直した台も、同じ版で参加する）
-K3S_VERSION="$(aws ssm get-parameter --region "$REGION" --name "$VERSION_PARAM" \
-                --query Parameter.Value --output text)"
-TOKEN="$(aws ssm get-parameter --region "$REGION" --name "$TOKEN_PARAM" --with-decryption \
-          --query Parameter.Value --output text)"
+# 版とトークンはバケットから（user data に書かない。./lab upgrade-k8s が上げた後に作り直した台も、同じ版で参加する）
+K3S_VERSION="$(lab_read_object k3s/version | tr -d '[:space:]')"
+TOKEN="$(lab_read_object k3s/token | tr -d '[:space:]')"
+[ -n "$K3S_VERSION" ] && [ -n "$TOKEN" ] || { echo "k3s version or token is missing in the bucket"; exit 1; }
 
 alive() {  # 6443 が何か答えるか（k3s の server が起きているか）
   local code
@@ -92,7 +101,7 @@ for _ in $(seq 1 120); do
   sleep 5
 done
 
-# ---- keepalived: Elastic IP の持ち主を 3 台の多数決で決める（ユニキャスト VRRP） ----
+# ---- keepalived: 浮動 IP の持ち主を 3 台の多数決で決める（ユニキャスト VRRP） ----
 IFACE="$(ip -o -4 route show to default | awk '{print $5}' | head -1)"
 
 cat > /usr/local/bin/lab-health.sh <<'EOF'
@@ -103,23 +112,22 @@ curl -s -o /dev/null --max-time 2 http://127.0.0.1:80/ || exit 1
 exit 0
 EOF
 
-cat > /usr/local/bin/lab-take-eip.sh <<EOF
+# 主系になったとき（notify_master）と、主系を降りたとき（notify_backup）に呼ぶ。中身はクラウド固有の関数
+cat > /usr/local/bin/lab-take-entry-ip.sh <<EOF
 #!/bin/bash
-# 主系になったとき: Elastic IP を自分の 2 つ目のプライベート IP に付け替える（1 つ目のパブリック IP は残る）
-IMDS_TOKEN="\$(curl -sX PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')"
-INSTANCE_ID="\$(curl -s -H "X-aws-ec2-metadata-token: \$IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)"
-for i in 1 2 3 4 5 6; do
-  if aws ec2 associate-address --region "${REGION}" --allocation-id "${EIP_ALLOCATION_ID}" \
-       --instance-id "\$INSTANCE_ID" --private-ip-address "${SECONDARY_IP}" --allow-reassociation; then
-    logger -t lab-eip "took ${EIP_ALLOCATION_ID} on \$INSTANCE_ID (${SECONDARY_IP})"
-    exit 0
-  fi
-  sleep 5
-done
-logger -t lab-eip "failed to take ${EIP_ALLOCATION_ID}"
-exit 1
+source /var/lib/lab/hooks.sh
+lab_take_entry_ip
 EOF
-chmod 755 /usr/local/bin/lab-health.sh /usr/local/bin/lab-take-eip.sh
+cat > /usr/local/bin/lab-release-entry-ip.sh <<EOF
+#!/bin/bash
+source /var/lib/lab/hooks.sh
+lab_ensure_egress
+EOF
+# hooks の関数（補助の関数も含めて全部）と値を、keepalived の通知スクリプトが読む形で残す
+declare -f > /var/lib/lab/hooks.sh
+lab_hook_values >> /var/lib/lab/hooks.sh
+chmod 755 /usr/local/bin/lab-health.sh /usr/local/bin/lab-take-entry-ip.sh /usr/local/bin/lab-release-entry-ip.sh
+chmod 600 /var/lib/lab/hooks.sh
 
 PEER_BLOCK=""
 for ip in $PEER_IPS; do PEER_BLOCK="${PEER_BLOCK}    ${ip}
@@ -147,14 +155,15 @@ vrrp_instance LAB {
   unicast_src_ip ${SELF_IP}
   unicast_peer {
 ${PEER_BLOCK}  }
-  # 仮想 IP は使わないリンクローカルのダミー。実際の経路は Elastic IP の付け替えで切り替わる
+  # 仮想 IP は使わないリンクローカルのダミー。実際の経路は浮動 IP の付け替えで切り替わる
   virtual_ipaddress {
     169.254.60.1/32 dev ${IFACE}
   }
   track_script {
     chk_lab
   }
-  notify_master "/usr/local/bin/lab-take-eip.sh"
+  notify_master "/usr/local/bin/lab-take-entry-ip.sh"
+  notify_backup "/usr/local/bin/lab-release-entry-ip.sh"
 }
 EOF
 systemctl enable --now keepalived

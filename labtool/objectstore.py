@@ -1,4 +1,4 @@
-"""オブジェクトストレージ（RustFS）の設定: バケット、利用者、権限（変更設計書 2 章）。
+"""オブジェクトストレージの設定: バケット、利用者、権限（変更設計書 2 章）。Mac は RustFS、VM の環境はクラウドのバケット。
 
 S3 の API（boto3）と RustFS の管理 API（/rustfs/admin/v3。SigV4 で署名）を使う。./lab は Mac の上で動くので、
 呼ぶ側が port_forward で張った接続先（http://127.0.0.1:<ポート>）を渡す。
@@ -29,14 +29,17 @@ def s3_client(endpoint: str, access_key: str, secret_key: str):
                         config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 3}))
 
 
-def aws_user_client(env: Env, user: str):
-    """利用者（IAM ユーザーの静的キー。aws-ec2）としてつなぐ AWS の S3 のクライアント。"""
+def cloud_user_client(env: Env, user: str):
+    """利用者（静的キー。aws-ec2 は IAM ユーザー、gcp-vm は HMAC キー）としてつなぐ S3 互換のクライアント。
+    接続先は labtool/clouds の s3_endpoint（AWS は空＝既定、GCP は storage.googleapis.com）。"""
     import boto3
     from botocore.config import Config
 
+    from . import clouds
+    cloud = clouds.for_env(env)
     access, secret = user_credentials(env, user)
-    return boto3.client("s3", region_name=env.aws_region, aws_access_key_id=access, aws_secret_access_key=secret,
-                        config=Config(retries={"max_attempts": 3}))
+    return boto3.client("s3", region_name=env.vm_region, aws_access_key_id=access, aws_secret_access_key=secret,
+                        endpoint_url=cloud.s3_endpoint(env) or None, config=Config(retries={"max_attempts": 3}))
 
 
 @contextlib.contextmanager
@@ -46,6 +49,10 @@ def admin_s3(env: Env):
         from . import aws
         yield aws.client(env, "s3")
         return
+    if env.is_gcp_vm:
+        from .clouds import gcp
+        yield gcp.admin_s3_client(env)
+        return
     with port_forward("svc/rustfs", 9000) as endpoint:
         yield s3_client(endpoint, *admin_credentials(env))
 
@@ -53,23 +60,24 @@ def admin_s3(env: Env):
 @contextlib.contextmanager
 def user_s3(env: Env, user: str):
     """利用者の静的キーでつなぐ S3 クライアント（Mac は RustFS の利用者、aws-ec2 は IAM ユーザー。EKS 版には無い）。"""
-    if env.is_aws_ec2:
-        from . import ec2
-        ec2.load_credentials(env, ec2.load_outputs(env))
-        yield aws_user_client(env, user)
+    if env.is_vm:
+        from . import vm
+        vm.load_static_keys(env)
+        yield cloud_user_client(env, user)
         return
     with port_forward("svc/rustfs", 9000) as endpoint:
         yield s3_client(endpoint, *user_credentials(env, user))
 
 
-def check_buckets(env: Env, s3) -> None:
-    """AWS: バケット（EKS 版は CDK、aws-ec2 は CloudFormation が作る）が仕様どおりかを確かめる。
+def check_buckets(env: Env, s3, specs: dict[str, dict] | None = None) -> None:
+    """AWS: バケット（EKS 版は CDK、aws-ec2 は labtool/clouds/aws_ec2.py が作る）が仕様どおりかを確かめる。
+    specs は実名 → 仕様（省くと render.s3_buckets の 4 つを接頭辞付きの名前で）。
     違えばエラーで止める（作り直しは基盤のコードで）。"""
     problems: list[str] = []
-    for logical, spec in render.s3_buckets(env).items():
-        if logical == render.PG_BACKUP and env.is_aws:
-            continue   # Aurora のバックアップは RDS が持つので、このバケットは EKS 版では作らない
-        bucket = render.bucket_name(env, logical)
+    if specs is None:
+        specs = {render.bucket_name(env, logical): spec for logical, spec in render.s3_buckets(env).items()
+                 if not (logical == render.PG_BACKUP and env.is_aws)}   # Aurora のバックアップは RDS が持つ
+    for bucket, spec in specs.items():
         try:
             s3.head_bucket(Bucket=bucket)
         except Exception:  # noqa: BLE001
@@ -165,14 +173,19 @@ def _lock_rule(s3, bucket: str) -> tuple[bool, dict | None]:
     return enabled, (cfg.get("Rule") or {}).get("DefaultRetention")
 
 
-def ensure_buckets(env: Env, s3) -> None:
+def ensure_buckets(env: Env, s3, specs: dict[str, dict] | None = None, region: str | None = None) -> None:
+    """バケットを仕様（実名 → render.s3_buckets の形。省くと Mac の 4 つ）に合わせる。Mac の RustFS も AWS の S3 も同じ関数。
+    region は AWS で us-east-1 以外にバケットを作るときの LocationConstraint。"""
     from botocore.exceptions import ClientError
 
+    if specs is None:
+        specs = render.s3_buckets(env)
     existing = {b["Name"] for b in s3.list_buckets().get("Buckets", [])}
-    for name, spec in render.s3_buckets(env).items():
+    for name, spec in specs.items():
         lock = spec["lock"]
         if name not in existing:
-            s3.create_bucket(Bucket=name, **({"ObjectLockEnabledForBucket": True} if lock else {}))
+            location = {"CreateBucketConfiguration": {"LocationConstraint": region}} if region and region != "us-east-1" else {}
+            s3.create_bucket(Bucket=name, **({"ObjectLockEnabledForBucket": True} if lock else {}), **location)
             info(f"バケット {name} を作りました" + ("（Object Lock あり）" if lock else ""))
         if spec["versioning"] and s3.get_bucket_versioning(Bucket=name).get("Status") != "Enabled":
             s3.put_bucket_versioning(Bucket=name, VersioningConfiguration={"Status": "Enabled"})
