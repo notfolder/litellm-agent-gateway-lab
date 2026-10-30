@@ -252,7 +252,10 @@ def audit_test(env: Env) -> None:
                         c.check("文脈独立審査: Claude Code の要求には、isolated の記録だけが残る",
                                 lambda: list(kinds(ids["messages_claude_leak"])) == ["isolated"])
             mine = {cid for cid in ids.values()}
-            no_user = [r for r in rows if r.get("type") == "request" and not r.get("user_id")]
+            # 認証されない要求（キーが無い・違う。公開の入口にはインターネットからの総当たりが来る。GCP の配備で判明 2026-10-30）は
+            # 失敗として記録されるのが正しく、審査官の呼び出しの検査とは関係ないので除く
+            no_user = [r for r in rows if r.get("type") == "request" and not r.get("user_id")
+                       and r.get("error_class") != "KeyNotFoundError"]
             c.check("審査官の呼び出しは要求として記録されない（利用者なしの記録は、マスターキーの 1 件だけ）",
                     lambda: [r["call_id"] for r in no_user if r["call_id"] not in mine] == []
                     and ids["master"] in {r["call_id"] for r in no_user})
