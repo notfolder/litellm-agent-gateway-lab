@@ -358,6 +358,10 @@ def bucket_bindings(env: Env, prefix: str) -> dict[str, list[dict]]:
                     if action == "s3:ListBucket" and obj:
                         continue
                     role = ROLE_FOR_ACTION[action]
+                    if action == "s3:PutObject" and not obj_prefix:
+                        # バケット全体への書き込みは上書きを含む（整形の parquet など）。GCS の上書きは delete の権限が要るので
+                        # objectUser（create/get/list/update/delete）。接頭辞に限った書き込み（raw/ の原本）は objectCreator の追記だけ
+                        role = "roles/storage.objectUser"
                     entry = {"user": user, "role": role, "prefix": obj_prefix if obj else ""}
                     if entry not in out.setdefault(prefix + logical, []):
                         out[prefix + logical].append(entry)

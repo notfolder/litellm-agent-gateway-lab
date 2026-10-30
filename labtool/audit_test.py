@@ -272,7 +272,7 @@ def audit_test(env: Env) -> None:
 
             key0 = by_id[ids["chat"]]["body"]["key"]
             raw_bucket = render.bucket_name(env, render.AUDIT_RAW)
-            ver = s3.head_object(Bucket=raw_bucket, Key=key0).get("VersionId")
+            ver = objstore.object_version(s3, raw_bucket, key0)
             if env.is_aws:
                 # EKS 版の利用者は IAM ロール（Pod Identity）で、Mac からは借りられない。ロールごとの検査はクラスタの中で
                 # 行う（変更仕様書 2026-10-24-AWS構成 7.2 節。別の試験）。ここでは管理者の資格情報だけで確かめる

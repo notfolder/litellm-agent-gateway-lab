@@ -237,6 +237,13 @@ def ensure_users(env: Env, admin: Admin) -> None:
     ok("利用者と権限は最新です")
 
 
+def object_version(s3, bucket: str, key: str) -> str | None:
+    """オブジェクトの版の識別子。S3 と RustFS は HeadObject の VersionId、GCS は S3 互換の API では x-goog-generation ヘッダーにしか
+    出ない（VersionId として渡せる。配備で判明 2026-10-30）。"""
+    head = s3.head_object(Bucket=bucket, Key=key)
+    return head.get("VersionId") or head["ResponseMetadata"]["HTTPHeaders"].get("x-goog-generation")
+
+
 def self_check(env: Env, admin_client, user_client) -> None:
     """許した操作ができ、許していない操作（原本の読み取り・削除、保持の回避なしの削除）が拒否されることを確かめる。
     admin_client は管理者の S3 クライアント、user_client(利用者名) は利用者の静的キーのクライアント
