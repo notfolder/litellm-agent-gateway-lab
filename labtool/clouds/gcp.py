@@ -55,6 +55,9 @@ def _sa_email(env: Env, account_id: str) -> str:
     return f"{account_id}@{env.gcp_project}.iam.gserviceaccount.com"
 
 
+_zones_warned: list[str] = []
+
+
 def assign_zones(available: list[str], count: int = NODE_COUNT) -> list[str]:
     """台 1〜count をゾーンに割り振る。使えるゾーンが台数より少なければ順に繰り返す（東京の C4A は b と c の 2 つ。配備で判明）。"""
     if not available:
@@ -76,7 +79,8 @@ def _zones(env: Env) -> list[str]:
             usable.append(zone)
     if not usable:
         raise LabError(f"{env.gcp_region} に {env.gcp_machine_type} を置けるゾーンがありません（ゾーン: {', '.join(zones) or '無し'}）")
-    if len(usable) < NODE_COUNT:
+    if len(usable) < NODE_COUNT and not _zones_warned:
+        _zones_warned.append(env.gcp_region)
         warn(f"{env.gcp_machine_type} が使えるゾーンは {', '.join(usable)} の {len(usable)} つなので、{NODE_COUNT} 台を繰り返して割り振ります")
     return assign_zones(usable)
 

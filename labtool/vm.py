@@ -128,8 +128,15 @@ def ensure_ssh_key() -> str:
 def ssh_base(node: Node, *extra: str) -> list[str]:
     if not node.public_ip:
         raise LabError(f"ノード {node.id} に公開 IP がありません（起動を待つか、外向きの IP を確かめてください）")
+    # known_hosts は IP でなく台の識別子で引く（GCP は浮動 IP を取った台の公開 IP が静的 IP に入れ替わり、障害で別の台に移る）
     return ["ssh", "-i", str(SSH_KEY), "-o", f"UserKnownHostsFile={KNOWN_HOSTS}", "-o", "StrictHostKeyChecking=accept-new",
-            "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR", *extra, f"{SSH_USER}@{node.public_ip}"]
+            "-o", f"HostKeyAlias={host_alias(node)}", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
+            *extra, f"{SSH_USER}@{node.public_ip}"]
+
+
+def host_alias(node: Node) -> str:
+    """known_hosts の鍵にする台の識別子（GCP の <ゾーン>/<名前> の / は _ に）。"""
+    return node.id.replace("/", "_")
 
 
 def run_on(node: Node, script: str, timeout: int = 120) -> str:
@@ -141,10 +148,29 @@ def run_on(node: Node, script: str, timeout: int = 120) -> str:
 
 
 def forget_host(node: Node) -> None:
-    """台を作り直したとき、known_hosts からその IP の行を消す。"""
-    if KNOWN_HOSTS.exists() and node.public_ip:
-        lines = [line for line in KNOWN_HOSTS.read_text().splitlines() if not line.startswith(node.public_ip + " ")]
+    """台を作り直したとき、known_hosts からその台の行を消す。"""
+    if KNOWN_HOSTS.exists():
+        lines = [line for line in KNOWN_HOSTS.read_text().splitlines() if not line.startswith(host_alias(node) + " ")]
         KNOWN_HOSTS.write_text("\n".join(lines) + ("\n" if lines else ""))
+
+
+def refresh_public_ips(env: Env, infra: Infra) -> bool:
+    """台の公開 IP をクラウドから引き直す（GCP は浮動 IP を取った台の公開 IP が静的 IP に変わる。配備で判明 2026-10-30）。
+    変わっていれば .build に保存して True。"""
+    found = clouds.for_env(env).discover(env)
+    if found is None:
+        return False
+    by_index = {n.index: n for n in found.nodes}
+    changed = False
+    for n in infra.nodes:
+        fresh = by_index.get(n.index)
+        if fresh and fresh.public_ip and fresh.public_ip != n.public_ip:
+            info(f"{n.id} の公開 IP が {n.public_ip or '(無し)'} → {fresh.public_ip} に変わりました")
+            n.public_ip = fresh.public_ip
+            changed = True
+    if changed:
+        save_infra(infra)
+    return changed
 
 
 def _port_open(ip: str, port: int) -> bool:
@@ -153,10 +179,18 @@ def _port_open(ip: str, port: int) -> bool:
         return s.connect_ex((ip, port)) == 0
 
 
-def wait_nodes_ready(nodes: list[Node]) -> None:
-    """3 台の 22 が開き、初期化（vm/node-init.sh）が終わる（/var/lib/lab/ready）まで待つ。"""
-    wait_until(600, "3 台の SSH（22）", lambda: all(_port_open(n.public_ip, 22) for n in nodes if n.public_ip)
-               and all(n.public_ip for n in nodes))
+def wait_nodes_ready(env: Env, infra: Infra) -> None:
+    """3 台の 22 が開き、初期化（vm/node-init.sh）が終わる（/var/lib/lab/ready）まで待つ。
+    届かない台があれば公開 IP を引き直す（主系が浮動 IP を取ると GCP では公開 IP が変わる）。"""
+    nodes = infra.nodes
+
+    def reachable() -> bool:
+        if all(n.public_ip and _port_open(n.public_ip, 22) for n in nodes):
+            return True
+        refresh_public_ips(env, infra)
+        return False
+
+    wait_until(600, "3 台の SSH（22）", reachable)
 
     def initialized() -> bool:
         for n in nodes:
@@ -164,6 +198,7 @@ def wait_nodes_ready(nodes: list[Node]) -> None:
                 if run_on(n, "test -f /var/lib/lab/ready && echo ready", timeout=30).strip() != "ready":
                     return False
             except LabError:
+                refresh_public_ips(env, infra)
                 return False
         return True
 
@@ -204,6 +239,7 @@ def ensure_forward(env: Env, infra: Infra, avoid: str | None = None) -> None:
     avoid の台（版上げで k3s を再起動する台）に張ってあれば、別の台へ張り直す。"""
     if forward_alive() and (avoid is None or forward_target() != avoid):
         return
+    refresh_public_ips(env, infra)
     nodes = [n for n in infra.nodes if n.id != avoid and n.public_ip and _port_open(n.public_ip, 22)]
     if not nodes:
         raise LabError("SSH で届くノードがありません（./lab cluster で作るか、起動を待ってください）")

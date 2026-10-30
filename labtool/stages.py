@@ -229,7 +229,7 @@ def _cluster_vm(env: Env) -> None:
     infra.extra["ssh_pubkey"] = pubkey
     infra.nodes = cloud.ensure_nodes(env, infra, vm.user_data_renderer(env, cloud, infra, pubkey))
     vm.save_infra(infra)
-    vm.wait_nodes_ready(infra.nodes)
+    vm.wait_nodes_ready(env, infra)
     vm.ensure_forward(env, infra)
     wait_until(300, "全ノードの Ready", kc("wait", "--for=condition=Ready", "nodes", "--all", "--timeout=5s"))
     kapply(files=[K8S / "traefik-config-vm.yaml"], namespaced=False)
