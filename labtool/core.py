@@ -201,7 +201,12 @@ class Env:
 
     @property
     def base_url(self) -> str:
-        """クライアントとこのツールが使う入口。Mac は http://localhost:<port>、AWS は https://<ホスト名>。"""
+        """クライアントとこのツールが使う入口。Mac は http://localhost:<port>、EKS は https://<ホスト名>。
+        VM の環境は、入口が内部ロードバランサ（VPC の内側）なので、操作者の Mac は踏み台経由の SSH の転送口に
+        Mac 用の別名（LAB_LOCAL_HOSTNAME。A レコードは 127.0.0.1、証明書の SAN に入る）で届く
+        （変更設計書 2026-10-31-内部LBとVM側の防御とZabbix 6 章）。別名が無ければ本番のホスト名（内側から呼ぶとき）。"""
+        if self.is_vm and self.local_hostname:
+            return f"https://{self.local_hostname}:{self.vm_local_https_port}"
         if self.on_cloud:
             return f"https://{self.hostname}"
         return f"http://localhost:{self.http_port}"
@@ -209,7 +214,14 @@ class Env:
     @property
     def public_host(self) -> str:
         """入口のホスト名（ポート付き）。Claude Code の信頼するドメインの記述に使う。"""
+        if self.is_vm and self.local_hostname:
+            return f"{self.local_hostname}:{self.vm_local_https_port}"
         return self.hostname if self.on_cloud else f"localhost:{self.http_port}"
+
+    @property
+    def local_hostname(self) -> str:
+        """Mac 用の別名（空なら使わない）。"""
+        return self.get("LAB_LOCAL_HOSTNAME", "").strip()
 
     # ---- クラウド共通（LAB_TARGET が local 以外のときだけ使う） ----
     @property
@@ -291,8 +303,46 @@ class Env:
         return int(self.get("LAB_VM_LOCAL_PORT", "16443"))
 
     @property
-    def vm_keep_entry_ip(self) -> bool:
-        return self.get("LAB_VM_KEEP_ENTRY_IP", "false").lower() == "true"
+    def vm_local_https_port(self) -> int:
+        """SSH のポート転送のローカル側（踏み台経由で内部ロードバランサの 443 へ）。"""
+        return int(self.get("LAB_VM_LOCAL_HTTPS_PORT", "18443"))
+
+    @property
+    def vm_bastion_host(self) -> str:
+        """踏み台の SSH の宛先（公開 IP かホスト名。managed は provision が中継の VM の公開 IP を書く）。"""
+        return self.get("LAB_VM_BASTION_HOST", "").strip()
+
+    @property
+    def vm_bastion_cidr(self) -> str:
+        """踏み台の内部 IP（/32 か CIDR）。nftables の 22 と Traefik の管理系の経路の許可に使う。"""
+        return self.get("LAB_VM_BASTION_CIDR", "").strip()
+
+    # ---- Zabbix（変更設計書 2026-10-31 7 章） ----
+    @property
+    def zabbix_vm(self) -> bool:
+        """managed で踏み台（中継）の VM に Zabbix サーバー（Docker Compose）を立てるか。"""
+        return self.get("LAB_ZABBIX_VM", "false").lower() == "true"
+
+    @property
+    def zabbix_server(self) -> str:
+        """agent 2 と zabbix-proxy が送る宛先（host:10051）。空なら Zabbix を使わない。"""
+        return self.get("LAB_ZABBIX_SERVER", "").strip()
+
+    @property
+    def zabbix_enabled(self) -> bool:
+        return bool(self.zabbix_server) or self.zabbix_vm
+
+    @property
+    def zabbix_local_port(self) -> int:
+        """Zabbix の web（と API）への SSH の転送口（踏み台の 127.0.0.1:8080 → Mac）。"""
+        return int(self.get("LAB_ZABBIX_LOCAL_PORT", "18080"))
+
+    @property
+    def zabbix_api_url(self) -> str:
+        """Zabbix の API。LAB_ZABBIX_VM=true なら転送口、provided は .env の LAB_ZABBIX_API_URL。"""
+        if self.zabbix_vm:
+            return f"http://127.0.0.1:{self.zabbix_local_port}/api_jsonrpc.php"
+        return self.get("LAB_ZABBIX_API_URL", "").strip()
 
     @property
     def vm_region(self) -> str:
@@ -333,7 +383,7 @@ class Env:
 
     @property
     def vm_entry_ip_id(self) -> str:
-        """浮動 IP の識別子（AWS: eipalloc-…、GCP: アドレスの名前）。"""
+        """入口（内部ロードバランサ）の識別子（AWS: NLB の ARN、GCP: 転送ルールの名前）。"""
         return self.get("LAB_VM_ENTRY_IP_ID")
 
     @property
@@ -383,7 +433,9 @@ class Env:
             raise LabError("LAB_EGRESS_PROXY_MAC には LAB_EGRESS_CA_FILE（中継の CA の PEM）が要ります")
         for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
             os.environ[name] = proxy
-        os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1,localhost"
+        # 転送口（127.0.0.1 と Mac 用の別名）は中継を通さない
+        no_proxy = "127.0.0.1,localhost" + (f",{self.local_hostname}" if self.local_hostname else "")
+        os.environ["NO_PROXY"] = os.environ["no_proxy"] = no_proxy
         for name in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "AWS_CA_BUNDLE", "CURL_CA_BUNDLE",
                      "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "NODE_EXTRA_CA_CERTS"):
             os.environ[name] = str(ca)

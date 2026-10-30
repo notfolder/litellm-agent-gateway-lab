@@ -1,9 +1,11 @@
-"""VM 共通層（LAB_TARGET=aws-ec2 / gcp-vm。変更設計書 .history/2026-10-30-既存資源からの構築と出口プロキシ/ 3 章・5 章・6 章）。
+"""VM 共通層（LAB_TARGET=aws-ec2 / gcp-vm。変更設計書 .history/2026-10-30-既存資源からの構築と出口プロキシ/ 3 章・5 章・6 章、
+.history/2026-10-31-内部LBとVM側の防御とZabbix/ 4 章・6 章）。
 
-クラウドを知らない部分: .env の識別子から基盤を組む（load_infra）、SSH（鍵、コマンドの実行、kubeconfig、6443 のポート転送）、
-VM の初期化スクリプトの描画と SSH での実行、k3s のトークンと版（バケットの cluster/ ディレクトリ）、VM 上でのイメージのビルド、
-中継（出口プロキシ）の VM の初期化、k3s の版上げの部品、証明書の退避、A レコード、アンインストール。
-クラウドの API は labtool/clouds/ のモジュール（clouds.for_env(env)）を通してだけ呼ぶ。
+クラウドを知らない部分: .env の識別子から基盤を組む（load_infra）、SSH（鍵、コマンドの実行、kubeconfig、ポート転送 3 本:
+k3s の 6443 はノード経由、入口の 443 と Zabbix の web は踏み台経由）、VM の初期化スクリプト（nftables、Zabbix agent 2 を含む）の
+描画と SSH での実行、k3s のトークンと版（バケットの cluster/ ディレクトリ）、VM 上でのイメージのビルド、中継（出口プロキシ。
+踏み台と Zabbix サーバーを兼ねる）の VM の初期化、k3s の版上げの部品、証明書の退避、A レコード、アンインストール。
+クラウドの API は labtool/clouds/ のモジュール（clouds.for_env(env)）を通してだけ呼ぶ。VM 自身はクラウドの API を呼ばない。
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ import yaml
 
 from . import clouds, render
 from . import objectstore as objstore
-from .clouds import PRIORITIES, PROXY_PORT, REGISTRY_HOST, REGISTRY_NODEPORT, TOKEN_KEY, VERSION_KEY, Infra, Node
+from .clouds import PROXY_PORT, REGISTRY_HOST, REGISTRY_NODEPORT, TOKEN_KEY, VERSION_KEY, ZABBIX_SERVER_PORT, Infra, Node
 from .core import (
     BUILD_DIR, K3S_IMAGE, NS, ROOT, VM_KUBE_CONTEXTS, Env, LabError, gen_secret, info, kc, kn, ok, output, run,
     succeeds, wait_until, warn, write_if_changed,
@@ -39,6 +41,13 @@ KNOWN_HOSTS = BUILD_DIR / "vm-known-hosts"
 FORWARD_PID_FILE = BUILD_DIR / "vm-forward.pid"
 FORWARD_TARGET_FILE = BUILD_DIR / "vm-forward.target"   # 転送先の Node.id（版上げでその台を避けるため）
 FORWARD_LOG = BUILD_DIR / "vm-forward.log"
+HTTPS_FORWARD_PID_FILE = BUILD_DIR / "vm-https-forward.pid"     # 踏み台経由の入口（443）の転送
+ZABBIX_FORWARD_PID_FILE = BUILD_DIR / "vm-zabbix-forward.pid"   # 踏み台経由の Zabbix の web（8080）の転送
+ZABBIX_WEB_PORT = 8080           # 踏み台の 127.0.0.1 で Zabbix の web が聞くポート
+POD_CIDR = "10.42.0.0/16"        # k3s の既定
+SVC_CIDR = "10.43.0.0/16"
+ZABBIX_RELEASE_URL = "https://repo.zabbix.com/zabbix/7.0/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest_7.0+ubuntu24.04_all.deb"
+ZABBIX_NODE_METADATA = "litellm-lab-node"
 INFRA_FILE = BUILD_DIR / "vm-infra.json"                 # 最後に組んだ基盤（目安。正は .env と API）
 TLS_BACKUP = BUILD_DIR / "vm-tls-secret.json"
 EGRESS_CA_FILE = BUILD_DIR / "egress-ca.pem"             # 中継の VM から取った CA（managed）
@@ -51,7 +60,9 @@ IP_LOOKUPS = ["http://checkip.amazonaws.com", "http://api.ipify.org"]
 UNRETAINED_PREFIXES = [f"{s}/" for s in render.VM_STORES if s not in render.RETAINED_STORES]
 # .env に provision が書く項目（managed の down で消す）
 PROVISIONED_ENV_KEYS = ["LAB_VM_NODES", "LAB_VM_BUCKET", "LAB_VM_ENTRY_IP_ID", "LAB_VM_PROXY_NODE", "LAB_EGRESS_PROXY",
-                        "LAB_EGRESS_PROXY_MAC", "LAB_EGRESS_CA_FILE", render.GCS_REGISTRY_KEY_ENV]
+                        "LAB_EGRESS_PROXY_MAC", "LAB_EGRESS_CA_FILE", render.GCS_REGISTRY_KEY_ENV,
+                        "LAB_VM_BASTION_HOST", "LAB_VM_BASTION_CIDR", "LAB_ZABBIX_SERVER", "LAB_ZABBIX_API_TOKEN",
+                        "LAB_ZABBIX_ADMIN_PASSWORD"]
 
 
 def kube_context(env: Env) -> str:
@@ -87,10 +98,17 @@ def check_upgrade_step(current: str, target: str) -> None:
 
 
 def upgrade_order(node_ids: list[str], entry_holder: str | None, forward_target: str | None = None) -> list[str]:
-    """上げる順。浮動 IP を持つ台は最後（入口の移動を 1 回にする）。転送先の台はその前（転送の張り直しを 1 回にする）。"""
+    """上げる順。入口（Traefik の Pod）が載る台は最後（Traefik の移動を 1 回にする）。転送先の台はその前（転送の張り直しを 1 回にする）。"""
     rest = [i for i in node_ids if i not in (entry_holder, forward_target)]
     tail = [i for i in (forward_target, entry_holder) if i and i in node_ids]
     return rest + list(dict.fromkeys(tail))
+
+
+def traefik_nodes() -> list[str]:
+    """Traefik の Pod が載っている Kubernetes のノード名（入口。ロードバランサはどの台にも流すが、Traefik が無い台では
+    ServiceLB が別の台に送るので、Traefik の台が止まると一時的に失敗する）。"""
+    pods = json.loads(output(kc("-n", "kube-system", "get", "pods", "-l", "app.kubernetes.io/name=traefik", "-o", "json")))
+    return sorted({p["spec"].get("nodeName", "") for p in pods["items"] if p["spec"].get("nodeName")})
 
 
 # ---- 操作者の IP と SSH ----
@@ -107,13 +125,16 @@ def operator_cidr(env: Env, lookup=None) -> str:
     return f"{text}/32"
 
 
-def web_cidr(env: Env) -> str:
-    """80/443 を開ける送信元。.env の LAB_WEB_ALLOW_CIDR があればそれ、無ければ 22 と同じ（操作者の IP）。
-    公開の入口には API キーの総当たりが来るので、検証環境は操作者の回線だけに開く（ユーザーの判断 2026-10-30: A）。"""
-    fixed = env.get("LAB_WEB_ALLOW_CIDR", "").strip()
-    if fixed:
-        return fixed if "/" in fixed else f"{fixed}/32"
-    return operator_cidr(env)
+def admin_cidrs(env: Env, infra: Infra | None = None) -> list[str]:
+    """VM の 22 を通す送信元: 踏み台の CIDR（LAB_VM_BASTION_CIDR）と、managed では操作者の IP（SSH で初期化・版上げするため）。
+    provided では操作者の IP を入れない（用意する側の踏み台から入る）。"""
+    out = []
+    bastion = (infra.bastion_cidr if infra is not None and infra.bastion_cidr else env.vm_bastion_cidr)
+    if bastion:
+        out.append(bastion if "/" in bastion else f"{bastion}/32")
+    if not env.is_provided:
+        out.append(operator_cidr(env))
+    return list(dict.fromkeys(out))
 
 
 def _lookup_public_ip() -> str:
@@ -193,9 +214,12 @@ def require_provided_env(env: Env) -> None:
     missing = []
     if len(env.vm_nodes) != clouds.NODE_COUNT:
         missing.append(f"LAB_VM_NODES（VM の識別子 {clouds.NODE_COUNT} つをカンマ区切り。今 {len(env.vm_nodes)} つ）")
-    for key, what in (("LAB_VM_BUCKET", "バケット名"), ("LAB_VM_ENTRY_IP_ID", "浮動 IP の識別子")):
+    for key, what in (("LAB_VM_BUCKET", "バケット名"), ("LAB_VM_ENTRY_IP_ID", "内部ロードバランサの識別子（AWS: NLB の ARN、GCP: 転送ルールの名前）"),
+                      ("LAB_VM_BASTION_HOST", "踏み台の SSH の宛先"), ("LAB_VM_BASTION_CIDR", "踏み台の内部 IP（/32 か CIDR）")):
         if not env.get(key):
             missing.append(f"{key}（{what}）")
+    if env.zabbix_server and not env.zabbix_vm and not (env.get("LAB_ZABBIX_API_URL") and env.get("LAB_ZABBIX_API_TOKEN")):
+        missing.append("LAB_ZABBIX_API_URL / LAB_ZABBIX_API_TOKEN（LAB_ZABBIX_SERVER があるとき。ホストの登録に使う）")
     users = [*clouds.STATIC_KEY_USERS] + ([clouds.OPERATOR_USER] if env.is_gcp_vm else [])
     for user in users:
         if user == "registry" and env.is_gcp_vm:
@@ -218,7 +242,8 @@ def load_infra(env: Env) -> Infra:
         raise LabError(f"{env.target} の基盤の識別子（LAB_VM_NODES、LAB_VM_BUCKET）が .env にありません。"
                        "managed なら ./lab cluster が作って書き、provided なら用意する側から受け取って書いてください")
     cloud = clouds.for_env(env)
-    infra = Infra(region=env.vm_region, bucket=env.vm_bucket, entry_ip_id=env.vm_entry_ip_id)
+    infra = Infra(region=env.vm_region, bucket=env.vm_bucket, entry_ip_id=env.vm_entry_ip_id,
+                  bastion_host=env.vm_bastion_host, bastion_cidr=env.vm_bastion_cidr)
     infra.nodes = cloud.describe_nodes(env, env.vm_nodes)
     if env.vm_entry_ip_id:
         infra.entry_ip = cloud.describe_entry_ip(env, env.vm_entry_ip_id)
@@ -226,8 +251,22 @@ def load_infra(env: Env) -> Infra:
     if proxy_id:
         infra.proxy = cloud.describe_nodes(env, [proxy_id])[0]
         infra.proxy.index = 0
+        if not infra.bastion_host:   # managed: 中継の VM が踏み台（公開 IP は起こし直すと変わるので毎回引く）
+            infra.bastion_host = infra.proxy.public_ip
+        if not infra.bastion_cidr:
+            infra.bastion_cidr = f"{infra.proxy.private_ip}/32"
     save_infra(infra)
     return infra
+
+
+def bastion_node(infra: Infra) -> Node:
+    """踏み台に SSH するための Node（managed は中継の VM、provided は LAB_VM_BASTION_HOST）。"""
+    if infra.proxy is not None and infra.proxy.public_ip:
+        return infra.proxy
+    if not infra.bastion_host:
+        raise LabError("踏み台がありません（LAB_VM_BASTION_HOST。managed は LAB_EGRESS_PROXY_VM=true で中継の VM が兼ねる）")
+    return Node(id=f"bastion/{infra.bastion_host}", index=0, private_ip=infra.bastion_cidr.split("/")[0],
+                public_ip=infra.bastion_host, zone="")
 
 
 def try_load_infra(env: Env) -> Infra | None:
@@ -238,8 +277,9 @@ def try_load_infra(env: Env) -> Infra | None:
 
 
 def ensure_access(env: Env, forward: bool = True) -> None:
-    """VM に届く状態にする: managed は 22 と 80/443（と中継）の許可を操作者の今の IP に合わせ、ポート転送を確かめる。
-    provided はネットワークを触らず、転送だけ。基盤が無ければ何もしない。forward=False なら許可だけ（初期化の前）。"""
+    """VM に届く状態にする: managed は 22（と中継）のクラウド側の許可を操作者の今の IP に合わせ、ポート転送 3 本を確かめる。
+    provided はネットワークを触らず、転送だけ。基盤が無ければ何もしない。forward=False なら許可だけ（初期化の前）。
+    VM 側の nftables の 22 の許可（操作者の IP）は init_nodes が書く（IP が変わったら ./lab cluster で直る）。"""
     infra = try_load_infra(env)
     if infra is None or not infra.nodes:
         return
@@ -247,11 +287,13 @@ def ensure_access(env: Env, forward: bool = True) -> None:
         cloud = clouds.for_env(env)
         cidr = operator_cidr(env)
         cloud.allow_ssh_from(env, cidr)
-        cloud.allow_web_from(env, web_cidr(env))
         if env.egress_proxy_vm:
             cloud.allow_proxy_from(env, cidr)
     if forward:
         ensure_forward(env, infra)
+        ensure_https_forward(env, infra)
+        if env.zabbix_vm:
+            ensure_zabbix_forward(env, infra)
 
 
 def refresh_public_ips(env: Env, infra: Infra) -> bool:
@@ -349,15 +391,66 @@ def ensure_forward(env: Env, infra: Infra, avoid: str | None = None) -> None:
     wait_until(90, "k3s の API への接続", lambda: proc.poll() is None and forward_alive())
 
 
-def stop_forward() -> None:
-    FORWARD_TARGET_FILE.unlink(missing_ok=True)
-    if not FORWARD_PID_FILE.exists():
+def _kill_pidfile(pidfile: Path) -> None:
+    if not pidfile.exists():
         return
     try:
-        os.killpg(int(FORWARD_PID_FILE.read_text().strip()), signal.SIGTERM)
+        os.killpg(int(pidfile.read_text().strip()), signal.SIGTERM)
     except (ValueError, ProcessLookupError, PermissionError):
         pass
-    FORWARD_PID_FILE.unlink(missing_ok=True)
+    pidfile.unlink(missing_ok=True)
+
+
+def stop_forward() -> None:
+    """3 本の転送（6443、入口の 443、Zabbix の web）を止める。"""
+    FORWARD_TARGET_FILE.unlink(missing_ok=True)
+    for pidfile in (FORWARD_PID_FILE, HTTPS_FORWARD_PID_FILE, ZABBIX_FORWARD_PID_FILE):
+        _kill_pidfile(pidfile)
+
+
+def _pid_alive(pidfile: Path) -> bool:
+    try:
+        os.kill(int(pidfile.read_text().strip()), 0)
+        return True
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        return False
+
+
+def _bastion_forward(env: Env, infra: Infra, pidfile: Path, local_port: int, remote: str, what: str, check) -> None:
+    """踏み台に SSH し、127.0.0.1:<local_port> → <remote>（host:port）の転送を背景で張る。check() が通れば何もしない。"""
+    if _pid_alive(pidfile) and check():
+        return
+    _kill_pidfile(pidfile)
+    bastion = bastion_node(infra)
+    wait_ssh(env, [bastion])
+    if _port_open("127.0.0.1", local_port):
+        raise LabError(f"ローカルのポート {local_port} が別のプロセスに使われています（.env の転送口のポートを変えてください）")
+    FORWARD_LOG.parent.mkdir(parents=True, exist_ok=True)
+    log = open(FORWARD_LOG, "ab")
+    proc = subprocess.Popen(
+        ssh_base(env, bastion, "-N", "-o", "ServerAliveInterval=30", "-o", "ExitOnForwardFailure=yes",
+                 "-L", f"127.0.0.1:{local_port}:{remote}"),
+        stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+    pidfile.write_text(str(proc.pid))
+    info(f"SSH のポート転送を張ります（踏み台 {bastion.public_ip} 経由で {remote} → 127.0.0.1:{local_port}。{what}）")
+    wait_until(90, f"{what}への接続", lambda: proc.poll() is None and check())
+
+
+def ensure_https_forward(env: Env, infra: Infra) -> None:
+    """入口（内部ロードバランサの 443）への転送（踏み台経由）。Mac の HTTPS（試験、クライアント）はこれを使う。
+    送信元は踏み台の内部 IP になるので、管理系の経路（admin-only）も通る。"""
+    if not infra.entry_ip:
+        raise LabError("入口（内部ロードバランサ）の IP が分かりません（LAB_VM_ENTRY_IP_ID）")
+    port = env.vm_local_https_port
+    _bastion_forward(env, infra, HTTPS_FORWARD_PID_FILE, port, f"{infra.entry_ip}:443", "入口（443）",
+                     lambda: _port_open("127.0.0.1", port))
+
+
+def ensure_zabbix_forward(env: Env, infra: Infra) -> None:
+    """Zabbix の web と API（踏み台の 127.0.0.1:8080）への転送（LAB_ZABBIX_VM=true のとき）。"""
+    port = env.zabbix_local_port
+    _bastion_forward(env, infra, ZABBIX_FORWARD_PID_FILE, port, f"127.0.0.1:{ZABBIX_WEB_PORT}", "Zabbix の web",
+                     lambda: _port_open("127.0.0.1", port))
 
 
 @contextlib.contextmanager
@@ -415,18 +508,56 @@ def egress_values(env: Env, infra: Infra) -> dict[str, str]:
             "EGRESS_CA_B64": base64.b64encode(ca.encode()).decode() if ca else ""}
 
 
-def render_node_init(node: Node, all_nodes: list[Node], hooks: str, pubkey: str, values: dict[str, str] | None = None,
+def firewall_values(env: Env, infra: Infra) -> dict[str, str]:
+    """初期化スクリプトに渡す nftables の値（変更設計書 2026-10-31 4.1 節）。CIDR はカンマ区切り。
+    EGRESS_CIDRS: 中継を通さず直接届いてよい宛先（中継、踏み台、クラウドのメタデータ・DNS・NTP）。"""
+    cloud = clouds.for_env(env)
+    def cidr(v: str) -> str:
+        return v if "/" in v else f"{v}/32"
+    egress = [cidr(x) for x in cloud.meta_ips(env)]
+    if env.egress_proxy:
+        host = re.sub(r"^\w+://", "", env.egress_proxy).split("/")[0].split(":")[0]
+        if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host):
+            egress.append(cidr(host))
+    if infra.bastion_cidr:
+        egress.append(cidr(infra.bastion_cidr))
+    zabbix_host = env.zabbix_server.split(":")[0] if env.zabbix_server else ""
+    if zabbix_host and re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", zabbix_host):
+        egress.append(cidr(zabbix_host))
+    return {
+        "NODE_IPS": ",".join(n.private_ip for n in sorted(infra.nodes, key=lambda n: n.index) if n.private_ip),
+        "VPC_CIDR": env.vm_cidr, "LB_IP": infra.entry_ip, "HC_RANGES": ",".join(cloud.health_check_ranges(env)),
+        "ADMIN_CIDRS": ",".join(admin_cidrs(env, infra)), "EGRESS_CIDRS": ",".join(dict.fromkeys(egress)),
+        "POD_CIDR": POD_CIDR, "SVC_CIDR": SVC_CIDR,
+    }
+
+
+def zabbix_values(env: Env, node: Node) -> dict[str, str]:
+    """初期化スクリプトに渡す Zabbix agent 2 の値（サーバーが無ければ空で、agent は入らない）。"""
+    return {"ZABBIX_SERVER": env.zabbix_server, "ZABBIX_HOSTNAME": zabbix_hostname(node),
+            "ZABBIX_METADATA": ZABBIX_NODE_METADATA, "ZABBIX_RELEASE_URL": ZABBIX_RELEASE_URL}
+
+
+def zabbix_hostname(node: Node) -> str:
+    """Zabbix のホスト名（VM の名前。GCP は <ゾーン>/<名前> の名前、AWS はインスタンス ID）。"""
+    return node.id.split("/", 1)[-1]
+
+
+def render_node_init(node: Node, all_nodes: list[Node], pubkey: str, values: dict[str, str] | None = None,
                      script: str | None = None) -> str:
-    """vm/node-init.sh の @@名前@@ をこの台の値で置き換え、クラウド固有の hooks を差し込む。
-    values: K3S_VERSION、K3S_TOKEN、EGRESS_PROXY、EGRESS_NO_PROXY、EGRESS_CA_B64、SSH_USER。"""
+    """vm/node-init.sh の @@名前@@ をこの台の値で置き換える。
+    values: K3S_VERSION、K3S_TOKEN、EGRESS_*、SSH_USER、nftables（firewall_values）、Zabbix（zabbix_values）。"""
     text = script if script is not None else NODE_INIT_SCRIPT.read_text()
     ordered = sorted(all_nodes, key=lambda n: n.index)
     peers = [n.private_ip for n in ordered if n.index != node.index]
     filled = {
         "NODE_INDEX": str(node.index), "SELF_IP": node.private_ip, "FIRST_IP": ordered[0].private_ip,
-        "PEER_IPS": " ".join(peers), "PRIORITY": str(PRIORITIES[node.index - 1]), "REGISTRY_HOST": REGISTRY_HOST,
-        "REGISTRY_NODEPORT": str(REGISTRY_NODEPORT), "SSH_PUBKEY": pubkey, "HOOKS": hooks,
+        "PEER_IPS": " ".join(peers), "NODE_IPS": ",".join(n.private_ip for n in ordered), "REGISTRY_HOST": REGISTRY_HOST,
+        "REGISTRY_NODEPORT": str(REGISTRY_NODEPORT), "SSH_PUBKEY": pubkey,
         "K3S_VERSION": "", "K3S_TOKEN": "", "EGRESS_PROXY": "", "EGRESS_NO_PROXY": "", "EGRESS_CA_B64": "", "SSH_USER": "ubuntu",
+        "VPC_CIDR": "", "LB_IP": "", "HC_RANGES": "", "ADMIN_CIDRS": "", "EGRESS_CIDRS": "", "POD_CIDR": POD_CIDR, "SVC_CIDR": SVC_CIDR,
+        "ZABBIX_SERVER": "", "ZABBIX_HOSTNAME": zabbix_hostname(node), "ZABBIX_METADATA": ZABBIX_NODE_METADATA,
+        "ZABBIX_RELEASE_URL": ZABBIX_RELEASE_URL,
     }
     filled.update(values or {})
     for k, v in filled.items():
@@ -438,19 +569,20 @@ def render_node_init(node: Node, all_nodes: list[Node], hooks: str, pubkey: str,
 
 
 def init_nodes(env: Env, infra: Infra, pubkey: str) -> None:
-    """3 台を 1 番から順に SSH で初期化する（1 番がクラスタを起こし、2・3 番が参加する）。2 回目以降は中継と CA の設定だけ直す。
-    中継を通さないか、まだ中継の VM が無い間は、外へ出る手順（apt、k3s）が失敗するので、中継は先に初期化しておく。"""
-    cloud = clouds.for_env(env)
+    """3 台を 1 番から順に SSH で初期化する（1 番がクラスタを起こし、2・3 番が参加する）。2 回目以降は中継・CA・nftables・
+    Zabbix agent の設定だけ直す。中継を通さないか、まだ中継の VM が無い間は、外へ出る手順（apt、k3s）が失敗するので、
+    中継は先に初期化しておく。"""
     token, version = ensure_cluster_objects(env)
     wait_ssh(env, infra.nodes, infra)
-    common = {"K3S_VERSION": version, "K3S_TOKEN": token, "SSH_USER": env.vm_ssh_user, **egress_values(env, infra)}
+    common = {"K3S_VERSION": version, "K3S_TOKEN": token, "SSH_USER": env.vm_ssh_user, **egress_values(env, infra),
+              **firewall_values(env, infra)}
     for node in sorted(infra.nodes, key=lambda n: n.index):
-        script = render_node_init(node, infra.nodes, cloud.node_init_hooks(env, infra, node), pubkey, common)
+        script = render_node_init(node, infra.nodes, pubkey, {**common, **zabbix_values(env, node)})
         info(f"{node.id}（node{node.index}）を初期化します（SSH）")
         out = run_on(env, node, script, timeout=1500)
         tail = out.strip().splitlines()[-1] if out.strip() else ""
         ok(f"{node.id}: {tail}")
-        refresh_public_ips(env, infra)   # GCP は 1 番が浮動 IP を取ると公開 IP が入れ替わる
+        refresh_public_ips(env, infra)   # 止めて起こした台の一時的な外部 IP が変わっていることがある
 
 
 def node_arch(env: Env, node: Node) -> str:
@@ -514,14 +646,28 @@ def build_and_push_on_node(env: Env, infra: Infra, name: str, tag: str, context_
 
 
 # ---- 中継（出口プロキシ）の VM ----
+def render_proxy_init(env: Env, script: str | None = None) -> str:
+    """vm/proxy-init.sh の @@名前@@ を埋める（中継のポート、VPC、操作者の IP、Zabbix）。"""
+    text = script if script is not None else PROXY_INIT_SCRIPT.read_text()
+    filled = {"PORT": str(PROXY_PORT), "VPC_CIDR": env.vm_cidr, "ADMIN_CIDRS": "" if env.is_provided else operator_cidr(env),
+              "ZABBIX": "true" if env.zabbix_vm else "false", "ZABBIX_WEB_PORT": str(ZABBIX_WEB_PORT),
+              "ZABBIX_RELEASE_URL": ZABBIX_RELEASE_URL}
+    for k, v in filled.items():
+        text = text.replace(f"@@{k}@@", v)
+    left = re.findall(r"@@[A-Z_0-9]+@@", text)
+    if left:
+        raise ValueError(f"proxy-init.sh に置き換えていない名前が残っています: {left}")
+    return text
+
+
 def init_proxy(env: Env, infra: Infra) -> None:
-    """中継の VM を SSH で初期化し（mitmproxy、独自 CA）、CA を .build/egress-ca.pem に取って .env の中継の項目を埋める。"""
+    """中継の VM を SSH で初期化し（mitmproxy、独自 CA、nftables、Zabbix サーバー）、CA を .build/egress-ca.pem に取って
+    .env の中継・踏み台・Zabbix の項目を埋める。"""
     proxy = infra.proxy
     if proxy is None:
         raise LabError("中継の VM がありません（LAB_VM_PROXY_NODE）")
     wait_ssh(env, [proxy])
-    script = PROXY_INIT_SCRIPT.read_text().replace("@@PORT@@", str(PROXY_PORT))
-    run_on(env, proxy, script, timeout=600)
+    run_on(env, proxy, render_proxy_init(env), timeout=900)
     ca = run_on(env, proxy, "cat /etc/mitmproxy/mitmproxy-ca-cert.pem", timeout=30)
     if "BEGIN CERTIFICATE" not in ca:
         raise LabError("中継の CA を読めませんでした")
@@ -530,8 +676,14 @@ def init_proxy(env: Env, infra: Infra) -> None:
     env.set("LAB_EGRESS_CA_FILE", str(EGRESS_CA_FILE.relative_to(ROOT)))
     env.set("LAB_EGRESS_PROXY", f"http://{proxy.private_ip}:{PROXY_PORT}")
     env.set("LAB_EGRESS_PROXY_MAC", f"http://{proxy.public_ip}:{PROXY_PORT}")
+    env.set("LAB_VM_BASTION_HOST", proxy.public_ip)
+    env.set("LAB_VM_BASTION_CIDR", f"{proxy.private_ip}/32")
+    if env.zabbix_vm:
+        env.set("LAB_ZABBIX_SERVER", f"{proxy.private_ip}:{ZABBIX_SERVER_PORT}")
+    infra.bastion_host, infra.bastion_cidr = proxy.public_ip, f"{proxy.private_ip}/32"
     env.apply_mac_proxy()
-    ok(f"中継の VM {proxy.id} の準備ができました（VM と Pod は http://{proxy.private_ip}:{PROXY_PORT}、Mac は http://{proxy.public_ip}:{PROXY_PORT}）")
+    ok(f"中継（踏み台）の VM {proxy.id} の準備ができました（VM と Pod は http://{proxy.private_ip}:{PROXY_PORT}、"
+       f"Mac は http://{proxy.public_ip}:{PROXY_PORT}" + (f"、Zabbix サーバー {proxy.private_ip}:{ZABBIX_SERVER_PORT}" if env.zabbix_vm else "") + "）")
 
 
 def proxy_log(env: Env, since: str) -> dict[str, int]:
@@ -551,11 +703,11 @@ def proxy_log(env: Env, since: str) -> dict[str, int]:
 
 # ---- アンインストール（provided の down） ----
 def uninstall(env: Env, infra: Infra) -> None:
-    """3 台の k3s と keepalived を外し、初期化の印を消す（用意された VM は残す）。"""
-    script = ("set +e; /usr/local/bin/k3s-uninstall.sh >/dev/null 2>&1; systemctl disable --now keepalived lab-egress >/dev/null 2>&1; "
+    """3 台の k3s と Zabbix agent を外し、nftables の表を消して（用意された VM の元の状態に戻す）、初期化の印を消す。"""
+    script = ("set +e; /usr/local/bin/k3s-uninstall.sh >/dev/null 2>&1; systemctl disable --now zabbix-agent2 keepalived lab-egress >/dev/null 2>&1; "
+              "nft delete table inet lab >/dev/null 2>&1; rm -f /etc/nftables.conf.lab; "
               "rm -f /var/lib/lab/ready /var/lib/lab/hooks.sh /etc/keepalived/keepalived.conf; echo uninstalled")
     for node in infra.nodes:
-        # 前の台の k3s を外すと keepalived が浮動 IP を次の台に移し、その台の公開 IP が入れ替わる（GCP）。台ごとに引き直す
         refresh_public_ips(env, infra)
         if node.public_ip and _port_open(node.public_ip, 22) and _ssh_ok(env, node):
             run_on(env, node, script, timeout=600)
@@ -648,10 +800,11 @@ def _cloudflare(env: Env, method: str, path: str, body: dict | None = None) -> d
     return out
 
 
-def ensure_a_record(env: Env, ip: str) -> None:
-    """ホスト名 → 浮動 IP の A レコードを Cloudflare に作る（あれば IP を直す。プロキシは使わず DNS のみ、TTL は自動）。
+def ensure_a_record(env: Env, ip: str, host: str | None = None) -> None:
+    """ホスト名 → IP の A レコードを Cloudflare に作る（あれば IP を直す。プロキシは使わず DNS のみ、TTL は自動）。
+    本番のホスト名 → 内部ロードバランサの IP と、Mac 用の別名 → 127.0.0.1 の 2 本に使う。
     LAB_CLOUDFLARE_API_TOKEN（Zone / DNS / Edit と Zone / Zone / Read）で足りる（ユーザーの指示 2026-10-30）。"""
-    host = env.hostname
+    host = host or env.hostname
     zone = None
     for name in zone_candidates(host):
         found = _cloudflare(env, "GET", f"/zones?name={name}")["result"]
@@ -676,10 +829,10 @@ def ensure_a_record(env: Env, ip: str) -> None:
         info(f"余分な A レコードを消しました: {host} → {extra['content']}")
 
 
-def wait_for_a_record(env: Env, ip: str) -> None:
-    """手持ちの DNS の A レコード（ホスト名 → 浮動 IP）が引けるまで待つ。引けない間は手順を知らせる。"""
+def wait_for_a_record(env: Env, ip: str, host: str | None = None) -> None:
+    """手持ちの DNS の A レコード（ホスト名 → IP）が引けるまで待つ。引けない間は手順を知らせる。"""
     import sys
-    host = env.hostname
+    host = host or env.hostname
     start = time.monotonic()
     told = False
     while True:

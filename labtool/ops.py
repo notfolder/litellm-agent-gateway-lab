@@ -35,9 +35,9 @@ def down(everything: bool = False) -> None:
     if env.is_vm:
         from . import clouds, vm
         # 証明書を退避してから（Let's Encrypt の発行数の上限を避ける）。
-        # managed: クラウド固有層が作った順の逆に全部消す。残るのは DNS の A レコードと .build/ の退避だけ。
-        # provided: 用意された物は残し、k3s を外して保持の無いディレクトリを空にする。--all なら VM・浮動 IP・バケットも消す
-        # （変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 8 章）
+        # managed: クラウド固有層が作った順の逆に全部消す（ロードバランサの部品を含む）。残るのは DNS の A レコードと .build/ の退避だけ。
+        # provided: 用意された物は残し、k3s を外して保持の無いディレクトリを空にする。--all なら VM・ロードバランサ・バケットも消す
+        # （変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 8 章、2026-10-31 9 章）
         cloud = clouds.for_env(env)
         infra = None
         try:
@@ -53,15 +53,15 @@ def down(everything: bool = False) -> None:
             vm.uninstall(env, infra)
             vm.empty_unretained(env)
             if everything:
-                cloud.destroy_provided(env, infra, keep_entry_ip=env.vm_keep_entry_ip)
-                ok(f"{env.target} の既存資源をすべて消しました（VM、浮動 IP、バケット。静的キーとネットワークは用意する側の物なので残る）")
+                cloud.destroy_provided(env, infra)
+                ok(f"{env.target} の既存資源をすべて消しました（VM、ロードバランサ、バケット。静的キー・踏み台・ネットワークは用意する側の物なので残る）")
             else:
-                ok(f"{env.target} の k3s を外し、バケットの保持の無いディレクトリを空にしました（VM、バケット、浮動 IP、静的キーは残る。"
+                ok(f"{env.target} の k3s を外し、バケットの保持の無いディレクトリを空にしました（VM、バケット、ロードバランサ、静的キーは残る。"
                    "全部消すなら ./lab down --all）")
         else:
             if env.egress_proxy_vm:
                 env.drop_mac_proxy()   # 中継の VM も消すので、消した後の API が中継越しだと届かない（2026-10-31）
-            cloud.destroy(env, keep_entry_ip=env.vm_keep_entry_ip)
+            cloud.destroy(env)
             for key in vm.PROVISIONED_ENV_KEYS:
                 if env.get(key):
                     env.set(key, "")
@@ -69,8 +69,8 @@ def down(everything: bool = False) -> None:
                 for name in render.s3_env_names(user, env):
                     if env.get(name):
                         env.set(name, "")
-            ok(f"{env.target} の有料リソースを削除しました（VM、ディスク、バケット、静的キー、中継"
-               + ("。浮動 IP は残しました）" if env.vm_keep_entry_ip else "、浮動 IP）") + "。.env の識別子も消しました")
+            ok(f"{env.target} の有料リソースを削除しました（VM、ディスク、バケット、静的キー、中継（踏み台）、内部ロードバランサ）。"
+               ".env の識別子も消しました")
         vm.INFRA_FILE.unlink(missing_ok=True)
         return
     if cluster_exists():
@@ -106,18 +106,23 @@ ChatGPT:         {yn(env.has_chatgpt())}  → Codex 用のモデルと二次判�
 検証ユーザー:    {env.get('LAB_USER1_EMAIL', '（未設定）')} {env.get('LAB_USER2_EMAIL')}
 クライアント:    clients/claude-lab、clients/codex-lab""")
     if env.is_vm:
-        from . import clouds, vm
+        from . import clouds, vm, zabbix
         try:
             infra = vm.load_infra(env)
-            holder = clouds.for_env(env).entry_ip_holder(env, infra)
+            health = clouds.for_env(env).lb_targets_healthy(env, infra) if infra.entry_ip_id else {}
             print(f"基盤:            LAB_INFRA={env.infra_mode}（バケット {infra.bucket}）\n"
                   f"VM:              {', '.join(f'{n.id}({n.public_ip})' for n in infra.nodes)}\n"
-                  f"浮動 IP:         {infra.entry_ip}（持ち主 {holder or '無し'}）\n"
-                  f"k3s の版:        {', '.join(sorted(set(vm.node_versions().values())))}\n"
+                  f"入口（内部 LB）: {infra.entry_ip}（健全 {sum(health.values())}/{len(health)} 台: "
+                  f"{', '.join(k for k, v in health.items() if v) or '無し'}）\n"
+                  f"踏み台:          {infra.bastion_host or '無し'}（{infra.bastion_cidr or '-'}）。管理系の経路（/ui、検索アプリ）はここからだけ\n"
+                  f"Mac の転送口:    {env.base_url}（443）、127.0.0.1:{env.vm_local_port}（k3s）"
+                  + (f"、http://127.0.0.1:{env.zabbix_local_port}/（Zabbix）" if env.zabbix_vm else "") + "\n"
+                  f"k3s の版:        {', '.join(sorted(set(vm.node_versions().values())))}（Traefik の台: {', '.join(vm.traefik_nodes())}）\n"
                   f"出口プロキシ:    {env.egress_proxy or '無し'}"
                   + (f"（中継の VM {infra.proxy.id}、Mac は {env.egress_proxy_mac or '通さない'}）" if infra.proxy else ""))
             if not env.is_provided:
-                print(f"22 の許可:       {vm.operator_cidr(env)}\n80/443 の許可:   {vm.web_cidr(env)}")
+                print(f"22 の許可:       {', '.join(vm.admin_cidrs(env, infra))}")
+            print("\n".join(zabbix.summary(env)))
         except LabError as e:
             warn(str(e))
     if http_ok(f"{env.base_url}/health/liveliness"):
@@ -142,7 +147,7 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
     """VM の環境（aws-ec2 / gcp-vm）: k3s（Kubernetes）の版を 1 台ずつ上げる（変更設計書 2026-10-26-k3s版上げ 4 章）。
     順: etcd のスナップショット → 台ごとに「転送先を別の台へ → cordon と drain → インストールスクリプトの再実行 →
     Ready と版を待つ → uncordon → DB と Redis と LiteLLM がそろうのを待つ」→ バケットの版を更新。
-    浮動 IP を持つ台は最後。マイナー版は 1 つずつ（Kubernetes の版の差の規則）。
+    Traefik（入口）の Pod が載る台は最後。入口は内部ロードバランサなので IP の移動は無い（2026-10-31）。マイナー版は 1 つずつ。
     measure=True なら偽 LLM への要求を流し続け、失敗の数と時間を報告する（test-failover と同じ測り方）。
     途中で止まっても、もう一度流せば上げ終わった台を飛ばして続きから進む。"""
     import time as _time
@@ -153,7 +158,6 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
     if not env.is_vm:
         raise LabError("k3s の版上げの手順は LAB_TARGET=aws-ec2 / gcp-vm だけです（Mac の k3d は K3S_IMAGE を変えて ./lab rebuild、"
                        "EKS 版は cdk の kubernetes_version を変えて ./lab cluster）")
-    cloud = clouds.for_env(env)
     target = vm.normalize_k3s_version(version)
     infra = vm.load_infra(env)
     vm.ensure_forward(env, infra)
@@ -166,14 +170,15 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
         vm.set_version(env, target)
         ok(f"3 台とも {target} です")
         return {"version": target, "upgraded": []}
-    holder = cloud.entry_ip_holder(env, infra)
+    traefik = vm.traefik_nodes()
+    holder = next((n.id for n in infra.nodes if vm.k8s_name_for_node(n) in traefik), None)
     order = vm.upgrade_order(infra.node_ids(), holder, vm.forward_target())
     failover.wait_healthy(env)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     vm.etcd_snapshot(env, infra.node(order[-1]), f"lab-pre-upgrade-{stamp}")
     todo = [i for i in order if versions.get(vm.k8s_name_for_node(infra.node(i))) != target]
     eta = datetime.now() + timedelta(minutes=8 * len(todo))
-    info(f"{len(todo)} 台を {' → '.join(todo)} の順に上げます（浮動 IP の台 {holder} は最後）。"
+    info(f"{len(todo)} 台を {' → '.join(todo)} の順に上げます（Traefik の台 {holder} は最後）。"
          f"終了見込み {eta:%H:%M} ごろ（1 台 5〜8 分）")
 
     restarts_before = failover.litellm_restarts()

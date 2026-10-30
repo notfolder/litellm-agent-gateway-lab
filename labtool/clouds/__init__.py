@@ -1,8 +1,11 @@
-"""クラウド固有層（LAB_TARGET=aws-ec2 / gcp-vm。変更設計書 .history/2026-10-30-既存資源からの構築と出口プロキシ/ 3 章）。
+"""クラウド固有層（LAB_TARGET=aws-ec2 / gcp-vm。変更設計書 .history/2026-10-30-既存資源からの構築と出口プロキシ/ 3 章、
+.history/2026-10-31-内部LBとVM側の防御とZabbix/ 3 章）。
 
 provision（作る・消す。LAB_INFRA=managed だけ）と setup（.env の識別子の資源を読む・止める・起こす。両モード）の関数を、
 aws_ec2.py と gcp.py が同じ組（FUNCTIONS）で持つ。構築ツールは for_env(env) で選んだモジュールだけを呼ぶ。
 VM の中の手順、SSH、k3s の版上げ、障害試験（labtool/vm.py）はクラウドを知らない。
+入口は内部ロードバランサ（AWS: 内部 NLB、GCP: 内部パススルー NLB）の固定の内部 IP。VM はクラウドの API を呼ばない
+（keepalived と浮動 IP の付け替えは 2026-10-31 に廃止）。
 """
 
 from __future__ import annotations
@@ -25,19 +28,28 @@ VERSION_KEY = "cluster/k3s/version"
 REGISTRY_USER = "registry"
 STATIC_KEY_USERS = ["litellm-writer", "audit-compactor", "audit-viewer", "pg-backup", REGISTRY_USER]
 OPERATOR_USER = "operator"
-# keepalived の優先度（1 番が高い。健全性の検査に失敗すると 100 下がる）
-PRIORITIES = [200, 150, 100]
-# 中継（出口プロキシ）の VM が聞くポートと、サブネットの中の位置（.20）
+# 中継（出口プロキシ。検証では踏み台と Zabbix サーバーも兼ねる）の VM が聞くポートと、サブネットの中の位置（.20）
 PROXY_PORT = 3128
 PROXY_HOST_INDEX = 19
+# 内部ロードバランサの固定の内部 IP の位置（各サブネットの .5。AWS は 3 サブネットに 1 つずつ、GCP は 1 つ）
+LB_HOST_INDEX = 4
+# Zabbix（agent 2 は 10050 で聞き、サーバーと proxy は 10051 で受ける）
+ZABBIX_AGENT_PORT = 10050
+ZABBIX_SERVER_PORT = 10051
+# 内部ロードバランサのヘルスチェックの送信元（nftables とクラウドのファイアウォールで通す）。
+# GCP は Google の範囲、AWS は VPC の中（NLB のアドレス）なので VPC の CIDR
+GCP_HEALTH_CHECK_RANGES = ["35.191.0.0/16", "130.211.0.0/22"]
+# VM が中継を通さず直接届く必要があるクラウドの内部アドレス（メタデータ、DNS、NTP）
+GCP_META_IPS = ["169.254.169.254"]
+AWS_META_IPS = ["169.254.169.254", "169.254.169.253", "169.254.169.123"]
 
 # 両方の実装が持つ公開関数（単体試験が名前と引き数の一致を確かめる）
 FUNCTIONS = [
     # 共通
-    "identity", "ensure_apis", "s3_endpoint", "describe_nodes", "describe_entry_ip", "entry_ip_holder",
-    "stop_node", "start_node", "node_init_hooks", "check_bucket", "snapshot", "empty_bucket",
+    "identity", "ensure_apis", "s3_endpoint", "describe_nodes", "describe_entry_ip", "lb_targets_healthy",
+    "health_check_ranges", "meta_ips", "stop_node", "start_node", "check_bucket", "snapshot", "empty_bucket",
     # provision（managed だけ）
-    "provision", "destroy", "allow_ssh_from", "allow_web_from", "allow_proxy_from", "recreate_node",
+    "provision", "destroy", "allow_ssh_from", "allow_proxy_from", "recreate_node",
     # provided の全削除
     "destroy_provided",
 ]
@@ -55,13 +67,17 @@ class Node:
 
 @dataclass
 class Infra:
-    """setup が使う基盤のまとめ（.env の識別子から describe_* で組む）。"""
+    """setup が使う基盤のまとめ（.env の識別子から describe_* で組む）。
+    entry_ip は内部ロードバランサの固定の内部 IP、entry_ip_id はその識別子（AWS: NLB の ARN、GCP: 転送ルールの名前）。
+    bastion_host は踏み台の SSH の宛先、bastion_cidr は踏み台の内部 IP（管理系の経路と 22 の許可）。"""
     nodes: list[Node] = field(default_factory=list)
     entry_ip: str = ""
     entry_ip_id: str = ""
     bucket: str = ""
     region: str = ""
     proxy: Node | None = None
+    bastion_host: str = ""
+    bastion_cidr: str = ""
     extra: dict = field(default_factory=dict)
 
     def node(self, node_id: str) -> Node:
@@ -87,8 +103,9 @@ def for_env(env: Env) -> ModuleType:
 
 def network_plan(cidr: str, subnets_per_node: bool) -> dict:
     """VM の CIDR（/16）から各台の固定 IP を決める。
-    AWS（subnets_per_node=True）は先頭の /24 × 3 を別 AZ の公開サブネットにし、各台は自分のサブネットの .10（と浮動 IP 用の .11）。
-    GCP（False）はリージョンのサブネット 1 つ（先頭の /24）に 3 台を置き、.10 / .11 / .12。中継の VM は先頭のサブネットの .20。"""
+    AWS（subnets_per_node=True）は先頭の /24 × 3 を別 AZ の公開サブネットにし、各台は自分のサブネットの .10。
+    GCP（False）はリージョンのサブネット 1 つ（先頭の /24）に 3 台を置き、.10 / .11 / .12。中継（踏み台）の VM は先頭のサブネットの .20。
+    内部ロードバランサの固定の内部 IP（lb_ips）は各サブネットの .5（AWS は 3 つ、GCP は 1 つ。入口は先頭のもの）。"""
     net = ipaddress.ip_network(cidr)
     blocks = list(net.subnets(new_prefix=24))
     nodes = []
@@ -96,14 +113,15 @@ def network_plan(cidr: str, subnets_per_node: bool) -> dict:
         subnets = [str(b) for b in blocks[:NODE_COUNT]]
         for i, sn in enumerate(blocks[:NODE_COUNT], start=1):
             hosts = list(sn.hosts())
-            nodes.append({"index": i, "subnet": str(sn), "private_ip": str(hosts[9]), "secondary_ip": str(hosts[10])})
+            nodes.append({"index": i, "subnet": str(sn), "private_ip": str(hosts[9])})
     else:
         subnets = [str(blocks[0])]
         hosts = list(blocks[0].hosts())
         for i in range(1, NODE_COUNT + 1):
-            nodes.append({"index": i, "subnet": subnets[0], "private_ip": str(hosts[8 + i]), "secondary_ip": ""})
+            nodes.append({"index": i, "subnet": subnets[0], "private_ip": str(hosts[8 + i])})
     proxy_ip = str(list(blocks[0].hosts())[PROXY_HOST_INDEX])
-    return {"vpc": str(net), "subnets": subnets, "nodes": nodes, "proxy_ip": proxy_ip}
+    lb_ips = [str(list(ipaddress.ip_network(s).hosts())[LB_HOST_INDEX]) for s in subnets]
+    return {"vpc": str(net), "subnets": subnets, "nodes": nodes, "proxy_ip": proxy_ip, "lb_ips": lb_ips}
 
 
 def static_key_policies(env: Env) -> dict[str, dict]:

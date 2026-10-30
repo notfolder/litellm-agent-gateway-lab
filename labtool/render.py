@@ -1011,13 +1011,60 @@ def vm_issuer_manifest(env: Env) -> str:
     return yaml.safe_dump(doc, sort_keys=False)
 
 
+def vm_certificate_names(env: Env) -> list[str]:
+    """証明書に入れる名前: 本番のホスト名と、あれば Mac 用の別名（LAB_LOCAL_HOSTNAME。SSH の転送口に届くときの SNI）。"""
+    names = [env.hostname]
+    if env.local_hostname and env.local_hostname != env.hostname:
+        names.append(env.local_hostname)
+    return names
+
+
 def vm_certificate_manifest(env: Env) -> str:
     doc = {"apiVersion": "cert-manager.io/v1", "kind": "Certificate",
            "metadata": {"name": VM_TLS_SECRET, "namespace": "litellm-lab"},
-           "spec": {"secretName": VM_TLS_SECRET, "dnsNames": [env.hostname],
+           "spec": {"secretName": VM_TLS_SECRET, "dnsNames": vm_certificate_names(env),
                     "issuerRef": {"name": "letsencrypt", "kind": "ClusterIssuer"},
                     "privateKey": {"rotationPolicy": "Always"}}}
     return yaml.safe_dump(doc, sort_keys=False)
+
+
+# ---- 管理系の経路の送信元制限（変更設計書 2026-10-31 5.1 節） ----
+ADMIN_MIDDLEWARE = "admin-only"
+# 踏み台からだけ通す経路の接頭辞。LiteLLM の管理画面（/ui とそのサインイン）、Prometheus の指標、監査ログの検索アプリ
+ADMIN_PATH_PREFIXES = ["/ui", "/login", "/sso", "/metrics"]
+ADMIN_ROUTE_NAMES = ["audit-viewer"]   # 既存の IngressRoute のうち、管理系として制限するもの
+
+
+def admin_only_manifest(env: Env) -> str:
+    """Middleware admin-only（ipAllowList: 踏み台）と、LiteLLM の管理系の経路（優先度 95。素通しの拒否 100 と MCP の GET 90 の後、
+    検索アプリ 50 と利用者の経路 1 の前）。踏み台の CIDR（LAB_VM_BASTION_CIDR）が無ければ誰にも開けない（127.0.0.255/32）。"""
+    ranges = [env.vm_bastion_cidr or "127.0.0.255/32"]
+    middleware = {"apiVersion": "traefik.io/v1alpha1", "kind": "Middleware",
+                  "metadata": {"name": ADMIN_MIDDLEWARE, "namespace": "litellm-lab"},
+                  "spec": {"ipAllowList": {"sourceRange": ranges}}}
+    match = " || ".join(f"PathPrefix(`{p}`)" for p in ADMIN_PATH_PREFIXES)
+    route = {"apiVersion": "traefik.io/v1alpha1", "kind": "IngressRoute",
+             "metadata": {"name": "litellm-admin", "namespace": "litellm-lab"},
+             "spec": {"entryPoints": ["web"],
+                      "routes": [{"kind": "Rule", "priority": 95, "match": match,
+                                  "middlewares": [{"name": ADMIN_MIDDLEWARE}],
+                                  "services": [{"name": "litellm", "port": 4000}]}]}}
+    return yaml.safe_dump_all([middleware, route], sort_keys=False)
+
+
+def add_admin_middleware(manifest_text: str, names: list[str] | None = None) -> str:
+    """マニフェストの中の IngressRoute（names のもの）の全経路に admin-only を足す（VM の環境だけ。Mac の k3d には無い）。"""
+    names = ADMIN_ROUTE_NAMES if names is None else names
+    docs = []
+    for d in yaml.safe_load_all(manifest_text):
+        if d and d.get("kind") == "IngressRoute" and d["metadata"]["name"] in names:
+            for r in d["spec"].get("routes", []):
+                mws = r.setdefault("middlewares", [])
+                if not any(m.get("name") == ADMIN_MIDDLEWARE for m in mws):
+                    mws.insert(0, {"name": ADMIN_MIDDLEWARE})
+        if d:
+            docs.append(d)
+    return yaml.safe_dump_all(docs, sort_keys=False)
 
 
 def tls_ingressroutes(manifest_text: str, secret_name: str = VM_TLS_SECRET) -> str:

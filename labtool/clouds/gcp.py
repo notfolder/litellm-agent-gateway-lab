@@ -1,9 +1,12 @@
-"""GCP のクラウド固有層（LAB_TARGET=gcp-vm。変更設計書 .history/2026-10-30-既存資源からの構築と出口プロキシ/ 3 章）。
+"""GCP のクラウド固有層（LAB_TARGET=gcp-vm。変更設計書 .history/2026-10-30-既存資源からの構築と出口プロキシ/ 3 章、
+.history/2026-10-31-内部LBとVM側の防御とZabbix/ 3.2 節）。
 
-provision（managed）: VPC とファイアウォール、静的な外部 IP、Cloud Storage のバケット 1 つ（オブジェクト保持ロック）、
-サービスアカウントと HMAC キー、カスタムロール、Compute Engine 3 台（C4A、Ubuntu 24.04 arm64。startup-script は使わず
-SSH で初期化する）、中継（出口プロキシ）の VM。資源は名前（<env.vm_prefix>-…）とラベル lab-prefix で探し、無ければ作る。
-setup（両モード）: .env の識別子（<ゾーン>/<名前>、アドレスの名前、バケット名）を読む。
+provision（managed）: VPC とファイアウォール（通す規則だけ。守りは VM の nftables）、内部パススルー ネットワーク ロードバランサ
+（静的内部 IP、TCP のヘルスチェック、バックエンドサービス、ゾーンごとの非マネージドインスタンスグループ、転送ルール）、
+Cloud Storage のバケット 1 つ（オブジェクト保持ロック）、サービスアカウントと HMAC キー、カスタムロール、Compute Engine 3 台
+（C4A、Ubuntu 24.04 arm64。サービスアカウント無し。startup-script は使わず SSH で初期化する）、中継（出口プロキシ。踏み台と
+Zabbix サーバーも兼ねる）の VM。資源は名前（<env.vm_prefix>-…）とラベル lab-prefix で探し、無ければ作る。
+setup（両モード）: .env の識別子（<ゾーン>/<名前>、転送ルールの名前、バケット名）を読む。
 資格情報はアプリケーション既定の資格情報（gcloud auth application-default login）。Google のライブラリは関数の中で読み込む。
 """
 
@@ -15,27 +18,24 @@ import time
 
 from .. import objectstore as objstore
 from .. import render
-from ..core import ROOT, Env, LabError, info, ok, warn
+from ..core import Env, LabError, info, ok, warn
 from . import (
-    GCS_ROLE_LISTER, GCS_ROLE_WRITER, NODE_COUNT, OPERATOR_USER, PROXY_PORT, STATIC_KEY_USERS, Infra, Node, gcs_bindings,
-    network_plan,
+    GCP_HEALTH_CHECK_RANGES, GCP_META_IPS, GCS_ROLE_LISTER, GCS_ROLE_WRITER, NODE_COUNT, OPERATOR_USER, PROXY_PORT,
+    STATIC_KEY_USERS, ZABBIX_SERVER_PORT, Infra, Node, gcs_bindings, network_plan,
 )
 
 LABEL_KEY = "lab-prefix"
-HOOKS_SCRIPT = ROOT / "vm" / "hooks-gcp.sh"
 IMAGE_PROJECT = "ubuntu-os-cloud"
 IMAGE_FAMILY = "ubuntu-2404-lts-arm64"
 PROXY_IMAGE_FAMILY = "ubuntu-2404-lts-amd64"
-PROXY_MACHINE_TYPE = "e2-small"
+PROXY_MACHINE_TYPE = "e2-small"            # 中継だけ
+PROXY_MACHINE_TYPE_ZABBIX = "e2-medium"    # 中継 ＋ Zabbix サーバー（4 GiB）
 DISK_TYPE = "hyperdisk-balanced"   # C4A は pd-* を使えない
 S3_ENDPOINT = "https://storage.googleapis.com"
 SCOPE = "https://www.googleapis.com/auth/cloud-platform"
-# VM のサービスアカウントの権限（浮動 IP の付け替えと、自分の情報の読み取り。バケットの権限は要らない）
-NODE_PERMISSIONS = [
-    "compute.instances.get", "compute.instances.list", "compute.instances.addAccessConfig",
-    "compute.instances.deleteAccessConfig", "compute.addresses.get", "compute.addresses.list", "compute.addresses.use",
-    "compute.zoneOperations.get", "compute.subnetworks.use", "compute.subnetworks.useExternalIp",
-]
+# 内部ロードバランサのヘルスチェック（TCP 80。5 秒 × 2 回で外す）
+HC_INTERVAL = 5
+HC_THRESHOLD = 2
 # カスタムロール（custom:… → ロール ID の末尾と権限）
 CUSTOM_ROLES = {
     GCS_ROLE_WRITER: ("writer", ["storage.objects.create", "storage.objects.setRetention"]),
@@ -54,6 +54,8 @@ def _names(env: Env) -> dict[str, str]:
             "fw_ssh": f"{p}-ssh", "fw_proxy": f"{p}-proxy-in", "fw_egress_deny": f"{p}-egress-deny",
             "fw_egress_internal": f"{p}-egress-internal", "tag": f"{p}-node", "proxy_tag": f"{p}-proxy",
             "address": f"{p}-entry", "node_sa": f"{p}-node", "node_role": p.replace("-", "_") + "_node",
+            "lb_address": f"{p}-lb", "lb_health_check": f"{p}-lb-hc", "lb_backend": f"{p}-lb-backend",
+            "lb_forwarding_rule": f"{p}-lb", "lb_group": f"{p}-lb-group",   # インスタンスグループは <lb_group>-<ゾーン>
             "proxy": f"{p}-proxy", "bucket": f"{env.gcp_prefix}-{env.gcp_project}"}
 
 
@@ -171,7 +173,8 @@ def s3_endpoint(env: Env) -> str:
 # ---- ネットワーク ----
 def ensure_network(env: Env) -> dict:
     """VPC（カスタムモード）、リージョンのサブネット 1 つ（Private Google Access あり）、ファイアウォール。
-    中継の VM を使うときは、3 台の直接の外向き通信を egress の deny で塞ぎ、サブネットの中だけ許す（中継は .20）。"""
+    ファイアウォールは「通す」規則だけ（カスタム VPC は既定で入りを全部拒むため）。守りは VM の nftables
+    （変更設計書 2026-10-31 3.2 節）。80/443 はサブネットとロードバランサのヘルスチェックの送信元から。"""
     compute = _compute()
     names = _names(env)
     project = env.gcp_project
@@ -199,8 +202,8 @@ def ensure_network(env: Env) -> dict:
     wanted = {
         names["fw_web"]: compute.Firewall(
             name=names["fw_web"], network=network.self_link, direction="INGRESS",
-            allowed=[compute.Allowed(I_p_protocol="tcp", ports=["80", "443"])], source_ranges=["0.0.0.0/0"],
-            target_tags=[names["tag"]]),
+            allowed=[compute.Allowed(I_p_protocol="tcp", ports=["80", "443"])],
+            source_ranges=[cidr, *GCP_HEALTH_CHECK_RANGES], target_tags=[names["tag"]]),
         names["fw_internal"]: compute.Firewall(
             name=names["fw_internal"], network=network.self_link, direction="INGRESS",
             allowed=[compute.Allowed(I_p_protocol="all")], source_ranges=[cidr],
@@ -214,23 +217,23 @@ def ensure_network(env: Env) -> dict:
     if env.egress_proxy_vm:
         wanted[names["fw_proxy"]] = compute.Firewall(
             name=names["fw_proxy"], network=network.self_link, direction="INGRESS",
-            allowed=[compute.Allowed(I_p_protocol="tcp", ports=[str(PROXY_PORT)])], source_ranges=[cidr],
-            target_tags=[names["proxy_tag"]])
-        wanted[names["fw_egress_deny"]] = compute.Firewall(
-            name=names["fw_egress_deny"], network=network.self_link, direction="EGRESS", priority=1000,
-            denied=[compute.Denied(I_p_protocol="all")], destination_ranges=["0.0.0.0/0"], target_tags=[names["tag"]])
-        wanted[names["fw_egress_internal"]] = compute.Firewall(
-            name=names["fw_egress_internal"], network=network.self_link, direction="EGRESS", priority=900,
-            allowed=[compute.Allowed(I_p_protocol="all")], destination_ranges=[cidr], target_tags=[names["tag"]])
+            allowed=[compute.Allowed(I_p_protocol="tcp", ports=[str(PROXY_PORT), str(ZABBIX_SERVER_PORT)])],
+            source_ranges=[cidr], target_tags=[names["proxy_tag"]])
     for name, fw in wanted.items():
         if name not in existing:
             fws.insert(project=project, firewall_resource=fw).result()
             info(f"ファイアウォールの規則 {name} を作りました")
-    if not env.egress_proxy_vm:
-        for name in (names["fw_egress_deny"], names["fw_egress_internal"], names["fw_proxy"]):
-            if name in existing:
-                fws.delete(project=project, firewall=name).result()
-                info(f"ファイアウォールの規則 {name} を消しました（中継の VM を使わない）")
+        elif name == names["fw_web"]:
+            cur = fws.get(project=project, firewall=name)
+            if sorted(cur.source_ranges) != sorted(fw.source_ranges):
+                fws.patch(project=project, firewall=name, firewall_resource=compute.Firewall(source_ranges=list(fw.source_ranges))).result()
+                info(f"ファイアウォールの規則 {name} の送信元を {', '.join(fw.source_ranges)} にしました")
+    # 外向きの遮断はクラウドでなく VM の nftables で行う（2026-10-31）。前の版の規則が残っていれば消す
+    stale = [names["fw_egress_deny"], names["fw_egress_internal"]] + ([] if env.egress_proxy_vm else [names["fw_proxy"]])
+    for name in stale:
+        if name in existing:
+            fws.delete(project=project, firewall=name).result()
+            info(f"ファイアウォールの規則 {name} を消しました")
     ok("ネットワークは最新です")
     return {"network": network.self_link, "subnet": subnet.self_link, "plan": plan, "zones": _zones(env),
             "tag": names["tag"], "proxy_tag": names["proxy_tag"]}
@@ -254,57 +257,176 @@ def allow_ssh_from(env: Env, cidr: str) -> None:
     _allow_from(env, "fw_ssh", [cidr], "22")
 
 
-def allow_web_from(env: Env, cidr: str) -> None:
-    """80/443 の送信元を操作者の IP（LAB_WEB_ALLOW_CIDR か 22 と同じ自動検出）だけにする（ユーザーの判断 2026-10-30: A）。
-    Mac が中継を通すときは、中継の VM からの入口への接続も通す（サブネット）。"""
-    cidrs = [cidr]
-    if env.egress_proxy_vm:
-        # 中継の VM から入口（浮動 IP）への接続は、送信元が中継の内部 IP か外部 IP のどちらにも見えうるので両方を許す
-        cidrs.append(network_plan(env.vm_cidr, subnets_per_node=False)["subnets"][0])
-        for inst in _instances(env, role="proxy"):
-            public = _to_node(inst, index=0).public_ip
-            if public:
-                cidrs.append(f"{public}/32")
-    _allow_from(env, "fw_web", cidrs, "80/443")
-
-
 def allow_proxy_from(env: Env, cidr: str) -> None:
-    """中継（3128）の送信元: サブネット ＋ 操作者の IP（Mac も中継を通すため）。"""
+    """中継（3128）と Zabbix サーバー（10051）の送信元: サブネット ＋ 操作者の IP（Mac も中継を通すため）。"""
     plan = network_plan(env.vm_cidr, subnets_per_node=False)
     _allow_from(env, "fw_proxy", [plan["subnets"][0], cidr], f"中継（{PROXY_PORT}）")
 
 
-# ---- 浮動 IP ----
-def ensure_entry_ip(env: Env) -> tuple[str, str]:
+def health_check_ranges(env: Env) -> list[str]:
+    """内部ロードバランサのヘルスチェックの送信元（VM の nftables で通す）。"""
+    return list(GCP_HEALTH_CHECK_RANGES)
+
+
+def meta_ips(env: Env) -> list[str]:
+    """VM が中継を通さず直接届く必要があるクラウドの内部アドレス（メタデータサーバーが DNS と NTP も兼ねる）。"""
+    return list(GCP_META_IPS)
+
+
+# ---- 内部ロードバランサ（内部パススルー ネットワーク ロードバランサ。変更設計書 2026-10-31 3.2 節） ----
+def _region_path(env: Env, kind: str, name: str) -> str:
+    return f"projects/{env.gcp_project}/regions/{env.gcp_region}/{kind}/{name}"
+
+
+def ensure_load_balancer(env: Env, net: dict, nodes: list[Node]) -> tuple[str, str]:
+    """静的内部 IP → TCP 80 のヘルスチェック → ゾーンごとの非マネージドインスタンスグループ（3 台を入れる）→ バックエンドサービス →
+    転送ルール（80 と 443、内部 IP）。あれば使い、無ければ作る。(内部 IP, 転送ルールの名前) を返す。"""
     compute = _compute()
+    names, project, region = _names(env), env.gcp_project, env.gcp_region
+    plan = net["plan"]
     addrs = compute.AddressesClient()
-    name = _names(env)["address"]
     try:
-        addr = addrs.get(project=env.gcp_project, region=env.gcp_region, address=name)
+        addr = addrs.get(project=project, region=region, address=names["lb_address"])
     except _NotFound():
-        addrs.insert(project=env.gcp_project, region=env.gcp_region, address_resource=compute.Address(
-            name=name, address_type="EXTERNAL", network_tier="PREMIUM",
+        addrs.insert(project=project, region=region, address_resource=compute.Address(
+            name=names["lb_address"], address_type="INTERNAL", purpose="GCE_ENDPOINT", subnetwork=net["subnet"],
+            address=plan["lb_ips"][0], labels={LABEL_KEY: env.vm_prefix})).result()
+        addr = addrs.get(project=project, region=region, address=names["lb_address"])
+        info(f"ロードバランサの内部 IP {addr.address} を確保しました")
+    hcs = compute.RegionHealthChecksClient()
+    try:
+        hc = hcs.get(project=project, region=region, health_check=names["lb_health_check"])
+    except _NotFound():
+        hcs.insert(project=project, region=region, health_check_resource=compute.HealthCheck(
+            name=names["lb_health_check"], type_="TCP", tcp_health_check=compute.TCPHealthCheck(port=80),
+            check_interval_sec=HC_INTERVAL, timeout_sec=HC_INTERVAL, unhealthy_threshold=HC_THRESHOLD,
+            healthy_threshold=HC_THRESHOLD)).result()
+        hc = hcs.get(project=project, region=region, health_check=names["lb_health_check"])
+        info(f"ヘルスチェック {hc.name}（TCP 80、{HC_INTERVAL} 秒 × {HC_THRESHOLD} 回）を作りました")
+    groups = _ensure_instance_groups(env, net, nodes)
+    bes = compute.RegionBackendServicesClient()
+    backends = [compute.Backend(group=g, balancing_mode="CONNECTION") for g in groups]
+    try:
+        be = bes.get(project=project, region=region, backend_service=names["lb_backend"])
+        have = sorted(b.group.split("/projects/")[-1] for b in be.backends)
+        want = sorted(g.split("/projects/")[-1] for g in groups)
+        if have != want:
+            bes.patch(project=project, region=region, backend_service=names["lb_backend"],
+                      backend_service_resource=compute.BackendService(backends=backends, fingerprint=be.fingerprint)).result()
+            info("バックエンドサービスのインスタンスグループをそろえました")
+    except _NotFound():
+        bes.insert(project=project, region=region, backend_service_resource=compute.BackendService(
+            name=names["lb_backend"], load_balancing_scheme="INTERNAL", protocol="TCP", network=net["network"],
+            backends=backends, health_checks=[hc.self_link],
+            connection_draining=compute.ConnectionDraining(draining_timeout_sec=10))).result()
+        info(f"バックエンドサービス {names['lb_backend']}（TCP、3 台）を作りました")
+    frs = compute.ForwardingRulesClient()
+    try:
+        fr = frs.get(project=project, region=region, forwarding_rule=names["lb_forwarding_rule"])
+    except _NotFound():
+        frs.insert(project=project, region=region, forwarding_rule_resource=compute.ForwardingRule(
+            name=names["lb_forwarding_rule"], load_balancing_scheme="INTERNAL", I_p_protocol="TCP", ports=["80", "443"],
+            network=net["network"], subnetwork=net["subnet"], I_p_address=addr.self_link,
+            backend_service=_region_path(env, "backendServices", names["lb_backend"]),
             labels={LABEL_KEY: env.vm_prefix})).result()
-        addr = addrs.get(project=env.gcp_project, region=env.gcp_region, address=name)
-        info(f"静的な外部 IP {addr.address} を確保しました")
-    return addr.address, name
+        fr = frs.get(project=project, region=region, forwarding_rule=names["lb_forwarding_rule"])
+        info(f"転送ルール {fr.name}（{fr.I_p_address}、80/443）を作りました")
+    return fr.I_p_address, fr.name
+
+
+def _ensure_instance_groups(env: Env, net: dict, nodes: list[Node]) -> list[str]:
+    """ゾーンごとの非マネージドインスタンスグループに、そのゾーンの台を入れる。グループの selfLink の一覧を返す。"""
+    compute = _compute()
+    names, project = _names(env), env.gcp_project
+    igs = compute.InstanceGroupsClient()
+    links = []
+    by_zone: dict[str, list[Node]] = {}
+    for n in nodes:
+        by_zone.setdefault(n.zone, []).append(n)
+    for zone, members in sorted(by_zone.items()):
+        name = f"{names['lb_group']}-{zone}"
+        try:
+            ig = igs.get(project=project, zone=zone, instance_group=name)
+        except _NotFound():
+            igs.insert(project=project, zone=zone, instance_group_resource=compute.InstanceGroup(
+                name=name, network=net["network"], subnetwork=net["subnet"])).result()
+            ig = igs.get(project=project, zone=zone, instance_group=name)
+            info(f"インスタンスグループ {name} を作りました")
+        current = {i.instance.rsplit("/", 1)[-1] for i in igs.list_instances(
+            project=project, zone=zone, instance_group=name,
+            instance_groups_list_instances_request_resource=compute.InstanceGroupsListInstancesRequest())}
+        missing = [m for m in members if m.id.split("/", 1)[1] not in current]
+        if missing:
+            igs.add_instances(project=project, zone=zone, instance_group=name,
+                              instance_groups_add_instances_request_resource=compute.InstanceGroupsAddInstancesRequest(
+                                  instances=[compute.InstanceReference(
+                                      instance=f"projects/{project}/zones/{zone}/instances/{m.id.split('/', 1)[1]}") for m in missing])).result()
+            info(f"インスタンスグループ {name} に {', '.join(m.id for m in missing)} を入れました")
+        links.append(ig.self_link)
+    return links
 
 
 def describe_entry_ip(env: Env, entry_ip_id: str) -> str:
-    """浮動 IP の識別子（アドレスの名前）→ IP。"""
+    """入口の識別子（転送ルールの名前）→ ロードバランサの内部 IP。"""
     try:
-        return _compute().AddressesClient().get(project=env.gcp_project, region=env.gcp_region, address=entry_ip_id).address
+        return _compute().ForwardingRulesClient().get(project=env.gcp_project, region=env.gcp_region,
+                                                     forwarding_rule=entry_ip_id).I_p_address
     except _NotFound():
-        raise LabError(f"静的な外部 IP {entry_ip_id}（LAB_VM_ENTRY_IP_ID）が {env.gcp_region} にありません")
+        raise LabError(f"転送ルール {entry_ip_id}（LAB_VM_ENTRY_IP_ID）が {env.gcp_region} にありません")
 
 
-def entry_ip_holder(env: Env, infra: Infra) -> str | None:
-    """静的 IP を持つ Node.id（<ゾーン>/<名前>）。"""
-    addr = _compute().AddressesClient().get(project=env.gcp_project, region=env.gcp_region, address=infra.entry_ip_id)
-    for user in addr.users:
-        parts = user.split("/")   # .../zones/<zone>/instances/<name>
-        return f"{parts[-3]}/{parts[-1]}"
-    return None
+def lb_targets_healthy(env: Env, infra: Infra) -> dict[str, bool]:
+    """ロードバランサが見る 3 台の健全性（Node.id → healthy か）。"""
+    compute = _compute()
+    frs = compute.ForwardingRulesClient()
+    fr = frs.get(project=env.gcp_project, region=env.gcp_region, forwarding_rule=infra.entry_ip_id)
+    bes = compute.RegionBackendServicesClient()
+    be_name = fr.backend_service.rsplit("/", 1)[-1]
+    be = bes.get(project=env.gcp_project, region=env.gcp_region, backend_service=be_name)
+    out: dict[str, bool] = {}
+    for b in be.backends:
+        health = bes.get_health(project=env.gcp_project, region=env.gcp_region, backend_service=be_name,
+                                resource_group_reference_resource=compute.ResourceGroupReference(group=b.group))
+        for hs in health.health_status:
+            parts = hs.instance.split("/")   # .../zones/<zone>/instances/<name>
+            out[f"{parts[-3]}/{parts[-1]}"] = hs.health_state == "HEALTHY"
+    return out
+
+
+def _delete_load_balancer(env: Env, forwarding_rule: str | None) -> None:
+    """転送ルール → バックエンドサービス → ヘルスチェック → インスタンスグループ → 内部 IP の順で消す（無いものは飛ばす）。
+    forwarding_rule が与えられれば、その参照先（provided の資源）をたどって消す。"""
+    compute = _compute()
+    names, project, region = _names(env), env.gcp_project, env.gcp_region
+    frs, bes, hcs, igs = (compute.ForwardingRulesClient(), compute.RegionBackendServicesClient(),
+                          compute.RegionHealthChecksClient(), compute.InstanceGroupsClient())
+    be_name, hc_names, groups = names["lb_backend"], [names["lb_health_check"]], []
+    fr_name = forwarding_rule or names["lb_forwarding_rule"]
+    with contextlib.suppress(_NotFound()):
+        fr = frs.get(project=project, region=region, forwarding_rule=fr_name)
+        be_name = fr.backend_service.rsplit("/", 1)[-1] or be_name
+        frs.delete(project=project, region=region, forwarding_rule=fr_name).result()
+        info(f"転送ルール {fr_name} を消しました")
+    with contextlib.suppress(_NotFound()):
+        be = bes.get(project=project, region=region, backend_service=be_name)
+        hc_names = [h.rsplit("/", 1)[-1] for h in be.health_checks] or hc_names
+        groups = [b.group for b in be.backends]
+        bes.delete(project=project, region=region, backend_service=be_name).result()
+        info(f"バックエンドサービス {be_name} を消しました")
+    for hc in hc_names:
+        with contextlib.suppress(_NotFound()):
+            hcs.delete(project=project, region=region, health_check=hc).result()
+    if not groups:
+        groups = [f"projects/{project}/zones/{z}/instanceGroups/{names['lb_group']}-{z}"
+                  for z in sorted({zn.name for zn in compute.ZonesClient().list(project=project)
+                                   if zn.region.rsplit("/", 1)[-1] == region})]
+    for g in groups:
+        zone, name = g.split("/zones/")[1].split("/instanceGroups/")
+        with contextlib.suppress(_NotFound()):
+            igs.delete(project=project, zone=zone, instance_group=name).result()
+    with contextlib.suppress(_NotFound()):
+        compute.AddressesClient().delete(project=project, region=region, address=names["lb_address"]).result()
+        info(f"ロードバランサの内部 IP {names['lb_address']} を解放しました")
 
 
 # ---- バケット（1 つ）と静的キー ----
@@ -538,28 +660,7 @@ def ensure_static_keys(env: Env, bucket: str) -> dict[str, tuple[str, str]]:
     return keys
 
 
-# ---- VM 3 台 ----
-def _ensure_node_identity(env: Env) -> str:
-    """VM のサービスアカウントとカスタムロール（浮動 IP の付け替えだけ。バケットの権限は無い）。"""
-    from google.cloud import resourcemanager_v3
-    names = _names(env)
-    email = _ensure_service_account(env, names["node_sa"], "litellm-lab node (VM)")
-    role_name = f"projects/{env.gcp_project}/roles/{names['node_role']}"
-    _ensure_custom_role(env, role_name, "litellm-lab node", NODE_PERMISSIONS)
-    projects = resourcemanager_v3.ProjectsClient()
-    resource = f"projects/{env.gcp_project}"
-    policy = projects.get_iam_policy(request={"resource": resource})
-    member = f"serviceAccount:{email}"
-    binding = next((b for b in policy.bindings if b.role == role_name), None)
-    if binding is None:
-        policy.bindings.add(role=role_name, members=[member])
-        projects.set_iam_policy(request={"resource": resource, "policy": policy})
-    elif member not in binding.members:
-        binding.members.append(member)
-        projects.set_iam_policy(request={"resource": resource, "policy": policy})
-    return email
-
-
+# ---- VM 3 台（サービスアカウント無し。VM はクラウドの API を呼ばない） ----
 def _image(env: Env, existing: list, family: str) -> str:
     """配備済みの台があればそのディスクのイメージ（3 台が同時に置き換わらない）。初回は公式の Ubuntu 24.04 の最新。"""
     compute = _compute()
@@ -615,9 +716,9 @@ def _create_instance(env: Env, zone: str, name: str, machine_type: str, image: s
     compute.InstancesClient().insert(project=env.gcp_project, zone=zone, instance_resource=inst).result()
 
 
-def ensure_nodes(env: Env, net: dict, sa_email: str, pubkey: str) -> list[Node]:
-    """Compute Engine 3 台（別ゾーン、固定の内部 IP、一時的な外部 IP、Ubuntu 24.04 arm64、Hyperdisk）。無い台だけ作る。
-    初期化は SSH（labtool/vm.py）なので startup-script は無い。"""
+def ensure_nodes(env: Env, net: dict, pubkey: str) -> list[Node]:
+    """Compute Engine 3 台（別ゾーン、固定の内部 IP、一時的な外部 IP（SSH 用）、Ubuntu 24.04 arm64、Hyperdisk、サービスアカウント無し）。
+    無い台だけ作る。初期化は SSH（labtool/vm.py）なので startup-script は無い。"""
     plan, zones, names = net["plan"], net["zones"], _names(env)
     existing = _instances(env)
     by_index = {_to_node(i).index: i for i in existing}
@@ -629,7 +730,7 @@ def ensure_nodes(env: Env, net: dict, sa_email: str, pubkey: str) -> list[Node]:
         zone = zones[i - 1]
         name = f"{env.vm_prefix}-node{i}"
         _create_instance(env, zone, name, env.gcp_machine_type, image, DISK_TYPE, env.vm_disk_gib, net["subnet"],
-                         n["private_ip"], pubkey, sa_email, [names["tag"]],
+                         n["private_ip"], pubkey, None, [names["tag"]],
                          {LABEL_KEY: env.vm_prefix, "lab-role": "node", "lab-node-index": str(i)})
         info(f"Compute Engine {name}（{zone}、{n['private_ip']}）を起こしました")
     nodes = sorted((_to_node(i) for i in _instances(env)), key=lambda n: n.index)
@@ -639,12 +740,14 @@ def ensure_nodes(env: Env, net: dict, sa_email: str, pubkey: str) -> list[Node]:
 
 
 def ensure_proxy_node(env: Env, net: dict, pubkey: str) -> Node:
-    """中継（出口プロキシ）の VM 1 台（amd64 の小型、サブネットの .20、公開 IP あり）。"""
+    """中継（出口プロキシ）の VM 1 台（amd64、サブネットの .20、公開 IP あり）。検証では踏み台と Zabbix サーバーも兼ねるので、
+    LAB_ZABBIX_VM=true なら e2-medium（4 GiB）とディスク 20 GiB。"""
     plan, zones, names = net["plan"], net["zones"], _names(env)
     existing = _instances(env, role="proxy")
     if not existing:
         image = _image(env, [], PROXY_IMAGE_FAMILY)
-        _create_instance(env, zones[0], names["proxy"], PROXY_MACHINE_TYPE, image, "pd-balanced", 10, net["subnet"],
+        machine, disk = (PROXY_MACHINE_TYPE_ZABBIX, 20) if env.zabbix_vm else (PROXY_MACHINE_TYPE, 10)
+        _create_instance(env, zones[0], names["proxy"], machine, image, "pd-balanced", disk, net["subnet"],
                          plan["proxy_ip"], pubkey, None, [names["proxy_tag"]], {LABEL_KEY: env.vm_prefix, "lab-role": "proxy"})
         info(f"中継の VM {names['proxy']}（{zones[0]}、{plan['proxy_ip']}）を起こしました")
         existing = _instances(env, role="proxy")
@@ -676,7 +779,8 @@ def recreate_node(env: Env, infra: Infra, index: int, pubkey: str) -> Node:
             instances.delete(project=env.gcp_project, zone=zone, instance=name).result()
             info(f"Compute Engine {name}（node{index}）を消しました")
     net = ensure_network(env)
-    nodes = ensure_nodes(env, net, _ensure_node_identity(env), pubkey)
+    nodes = ensure_nodes(env, net, pubkey)
+    _ensure_instance_groups(env, net, nodes)   # 作り直した台をロードバランサの転送先に戻す
     return next(n for n in nodes if n.index == index)
 
 
@@ -690,30 +794,23 @@ def start_node(env: Env, node: Node) -> None:
     _compute().InstancesClient().start(project=env.gcp_project, zone=zone, instance=name).result()
 
 
-def node_init_hooks(env: Env, infra: Infra, node: Node) -> str:
-    text = HOOKS_SCRIPT.read_text()
-    for k, v in {"PROJECT": env.gcp_project, "REGION": env.gcp_region, "ADDRESS_NAME": infra.entry_ip_id}.items():
-        text = text.replace(f"@@{k}@@", v)
-    return text
-
-
 # ---- provision（managed） ----
-def provision(env: Env, pubkey: str, operator_cidr: str, web_cidr: str) -> dict:
-    """作る（無ければ）: ネットワーク → 22 / 80・443 / 中継の許可 → 浮動 IP → バケット → 静的キー → VM の権限 → VM 3 台 → 中継の VM。
-    戻り値を呼ぶ側が .env に書く。"""
+def provision(env: Env, pubkey: str, operator_cidr: str) -> dict:
+    """作る（無ければ）: ネットワーク → 22 / 中継の許可 → バケット → 静的キー → VM 3 台 → 内部ロードバランサ → 中継（踏み台）の VM。
+    戻り値を呼ぶ側が .env に書く（識別子、入口の IP、踏み台、Zabbix の宛先）。"""
     net = ensure_network(env)
     allow_ssh_from(env, operator_cidr)
-    allow_web_from(env, web_cidr)
     if env.egress_proxy_vm:
         allow_proxy_from(env, operator_cidr)
-    entry_ip, entry_ip_id = ensure_entry_ip(env)
     bucket = ensure_bucket(env)
     keys = ensure_static_keys(env, bucket)
-    sa_email = _ensure_node_identity(env)
-    nodes = ensure_nodes(env, net, sa_email, pubkey)
+    nodes = ensure_nodes(env, net, pubkey)
+    entry_ip, entry_ip_id = ensure_load_balancer(env, net, nodes)
     proxy = ensure_proxy_node(env, net, pubkey) if env.egress_proxy_vm else None
     return {"nodes": [n.id for n in nodes], "bucket": bucket, "entry_ip": entry_ip, "entry_ip_id": entry_ip_id,
-            "keys": keys, "proxy": proxy, "proxy_url": f"http://{net['plan']['proxy_ip']}:{PROXY_PORT}" if proxy else ""}
+            "keys": keys, "proxy": proxy, "proxy_url": f"http://{net['plan']['proxy_ip']}:{PROXY_PORT}" if proxy else "",
+            "bastion_host": proxy.public_ip if proxy else "", "bastion_cidr": f"{proxy.private_ip}/32" if proxy else "",
+            "zabbix_server": f"{proxy.private_ip}:{ZABBIX_SERVER_PORT}" if proxy and env.zabbix_vm else ""}
 
 
 # ---- 削除 ----
@@ -819,22 +916,20 @@ def _delete_instances(env: Env, node_ids: list[str]) -> None:
         info(f"Compute Engine {len(ops)} 台を消しました")
 
 
-def _delete_address(env: Env, name: str, keep: bool) -> None:
+def _delete_address(env: Env, name: str) -> None:
+    """前の版が作った静的な外部 IP（浮動 IP）が残っていれば解放する。"""
     compute = _compute()
     try:
         addr = compute.AddressesClient().get(project=env.gcp_project, region=env.gcp_region, address=name)
     except _NotFound():
         return
-    if keep:
-        info(f"静的な外部 IP {addr.address} は残しました（LAB_VM_KEEP_ENTRY_IP=true。付いていない間も料金が出ます）")
-        return
     compute.AddressesClient().delete(project=env.gcp_project, region=env.gcp_region, address=name).result()
     info(f"静的な外部 IP {addr.address} を解放しました")
 
 
-def destroy(env: Env, keep_entry_ip: bool) -> None:
-    """managed: 名前とラベルで探して全部消す。バケット → HMAC キーとサービスアカウント → VM（中継を含む）→ カスタムロール →
-    ファイアウォール → サブネット → ネットワーク →（静的 IP）。"""
+def destroy(env: Env) -> None:
+    """managed: 名前とラベルで探して全部消す。バケット → HMAC キーとサービスアカウント → ロードバランサ → VM（中継を含む）→
+    カスタムロール → ファイアウォール → サブネット → ネットワーク →（前の版の静的 IP）。"""
     from google.cloud import iam_admin_v1
     compute = _compute()
     names = _names(env)
@@ -853,6 +948,7 @@ def destroy(env: Env, keep_entry_ip: bool) -> None:
         with contextlib.suppress(_NotFound()):
             iam.delete_service_account(name=f"projects/{project}/serviceAccounts/{email}")
             info(f"サービスアカウント {email} を消しました")
+    _delete_load_balancer(env, None)
     ids = [_to_node(i).id for i in _instances(env)] + [_to_node(i).id for i in _instances(env, role="proxy")]
     _delete_instances(env, ids)
     for role_name in [f"projects/{project}/roles/{names['node_role']}",
@@ -868,13 +964,13 @@ def destroy(env: Env, keep_entry_ip: bool) -> None:
     with contextlib.suppress(_NotFound()):
         compute.NetworksClient().delete(project=project, network=names["network"]).result()
         info(f"VPC ネットワーク {names['network']} を消しました")
-    _delete_address(env, names["address"], keep_entry_ip)
+    _delete_address(env, names["address"])
 
 
-def destroy_provided(env: Env, infra: Infra, keep_entry_ip: bool) -> None:
-    """provided の全削除（./lab down --all）: .env の識別子の VM、浮動 IP、バケットを消す。
-    静的キーとネットワークは用意する側の物なので消さない。"""
+def destroy_provided(env: Env, infra: Infra) -> None:
+    """provided の全削除（./lab down --all）: .env の識別子の VM、ロードバランサ（転送ルールからたどる）、バケットを消す。
+    静的キー、踏み台、ネットワークは用意する側の物なので消さない。"""
     _delete_bucket(env, infra.bucket)
-    _delete_instances(env, [n.id for n in infra.nodes])
     if infra.entry_ip_id:
-        _delete_address(env, infra.entry_ip_id, keep_entry_ip)
+        _delete_load_balancer(env, infra.entry_ip_id)
+    _delete_instances(env, [n.id for n in infra.nodes])

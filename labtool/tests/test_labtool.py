@@ -583,7 +583,18 @@ class VmTargetTest(unittest.TestCase):
         self.assertEqual((e.base_url, g.base_url), ("https://lab.example.test", "https://lab.example.test"))
         self.assertEqual(env(LAB_TARGET="aws-ec2", LAB_AWS_HOSTNAME="old.example.test").hostname, "old.example.test")
         self.assertEqual((e.vm_prefix, g.vm_prefix), ("litellm-lab-ec2", "litellm-lab"))
-        self.assertEqual((e.vm_cidr, e.vm_disk_gib, e.vm_local_port, e.vm_keep_entry_ip), ("10.60.0.0/16", 40, 16443, False))
+        self.assertEqual((e.vm_cidr, e.vm_disk_gib, e.vm_local_port, e.vm_local_https_port), ("10.60.0.0/16", 40, 16443, 18443))
+        # 入口は内部ロードバランサなので、Mac は踏み台経由の転送口に別名で届く（変更設計書 2026-10-31 6 章）
+        local = self.vm("gcp-vm", LAB_LOCAL_HOSTNAME="lab-local.example.test")
+        self.assertEqual((local.base_url, local.public_host), ("https://lab-local.example.test:18443", "lab-local.example.test:18443"))
+        self.assertEqual(render.vm_certificate_names(local), ["lab.example.test", "lab-local.example.test"])
+        self.assertEqual(render.vm_certificate_names(e), ["lab.example.test"])
+        self.assertEqual(yaml.safe_load(render.vm_certificate_manifest(local))["spec"]["dnsNames"], ["lab.example.test", "lab-local.example.test"])
+        self.assertEqual((e.zabbix_enabled, self.vm(LAB_ZABBIX_VM="true").zabbix_enabled, self.vm(LAB_ZABBIX_SERVER="10.0.0.20:10051").zabbix_enabled),
+                         (False, True, True))
+        self.assertEqual(self.vm(LAB_ZABBIX_VM="true").zabbix_api_url, "http://127.0.0.1:18080/api_jsonrpc.php")
+        self.assertEqual(self.vm(LAB_ZABBIX_API_URL="https://z.example.test/api_jsonrpc.php").zabbix_api_url,
+                         "https://z.example.test/api_jsonrpc.php")
         self.assertEqual((e.vm_region, g.vm_region, g.gcp_machine_type), ("ap-northeast-1", "asia-northeast1", "c4a-standard-2"))
         # VM の環境は 1 つのバケットのディレクトリ（変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 4.1 節）
         self.assertEqual(render.store_location(e, "audit-raw"), ("lab-bucket", "audit-raw/"))
@@ -704,13 +715,14 @@ class VmTargetTest(unittest.TestCase):
         self.assertEqual(failover.scenarios_for(self.vm("gcp-vm")), [*failover.SCENARIOS, "entry-node"])
         self.assertEqual(failover.scenarios_for(env()), failover.SCENARIOS)
         self.assertEqual(failover.scenarios_for(env(LAB_TARGET="aws", LAB_AWS_HOSTNAME="x")), failover.SCENARIOS_AWS)
-        self.assertEqual(failover.LIMITS["entry-node"], 30)
-        # GCP だけ、台を止める場面の目安を広げる（浮動 IP の付け替えが遅い。2026-10-30 の判断 2A）
+        # 入口は内部ロードバランサ（Traefik の台を止める場面）。目安は両クラウド 60 秒（変更仕様書 2026-10-31 R22）
+        self.assertEqual(failover.LIMITS["entry-node"], 60)
+        # GCP だけ、台を止める場面の目安を広げる（2026-10-30 の判断 2A）
         gcp = VmTargetTest().vm("gcp-vm")
         self.assertEqual((failover.limit_for(gcp, "entry-node"), failover.limit_for(gcp, "pg-node"), failover.limit_for(gcp, "pg-pod")),
-                         (120, 180, 60))
+                         (60, 180, 60))
         ec2 = VmTargetTest().vm("aws-ec2")
-        self.assertEqual((failover.limit_for(ec2, "entry-node"), failover.limit_for(ec2, "pg-node")), (30, 120))
+        self.assertEqual((failover.limit_for(ec2, "entry-node"), failover.limit_for(ec2, "pg-node")), (60, 120))
         self.assertEqual(failover.SCENARIO_ALIASES["eip-node"], "entry-node")   # EC2 版の名前も受ける
 
     def test_k3s_version_rules(self):
@@ -749,12 +761,16 @@ class VmTargetTest(unittest.TestCase):
 
     def test_env_example_has_vm_items_and_no_ec2_leftovers(self):
         text = (Path(__file__).resolve().parents[2] / ".env.example").read_text()
-        for key in ("LAB_HOSTNAME", "LAB_VM_CIDR", "LAB_VM_KEEP_ENTRY_IP", "LAB_SSH_ALLOW_CIDR", "LAB_JUDGE_ANTHROPIC_API_KEY",
-                    "LAB_GCP_PROJECT", "LAB_GCP_MACHINE_TYPE", "LAB_INFRA", "LAB_VM_NODES", "LAB_VM_BUCKET", "LAB_VM_ENTRY_IP_ID",
+        for key in ("LAB_HOSTNAME", "LAB_LOCAL_HOSTNAME", "LAB_VM_CIDR", "LAB_VM_LOCAL_HTTPS_PORT", "LAB_SSH_ALLOW_CIDR",
+                    "LAB_JUDGE_ANTHROPIC_API_KEY", "LAB_GCP_PROJECT", "LAB_GCP_MACHINE_TYPE", "LAB_INFRA", "LAB_VM_NODES",
+                    "LAB_VM_BUCKET", "LAB_VM_ENTRY_IP_ID", "LAB_VM_BASTION_HOST", "LAB_VM_BASTION_CIDR",
                     "LAB_VM_SSH_KEY", "LAB_VM_S3_LITELLM_WRITER_KEY", "LAB_EGRESS_PROXY", "LAB_EGRESS_CA_FILE",
-                    "LAB_EGRESS_PROXY_MAC", "LAB_EGRESS_PROXY_VM", "LAB_VM_ARCH"):
+                    "LAB_EGRESS_PROXY_MAC", "LAB_EGRESS_PROXY_VM", "LAB_VM_ARCH", "LAB_ZABBIX_VM", "LAB_ZABBIX_SERVER",
+                    "LAB_ZABBIX_API_URL", "LAB_ZABBIX_API_TOKEN", "LAB_ZABBIX_LOCAL_PORT"):
             self.assertIn(f"\n{key}=", text)
-        for old in ("LAB_EC2_VPC_CIDR", "LAB_EC2_DISK_GIB", "LAB_EC2_LOCAL_PORT", "LAB_EC2_KEEP_EIP", "LAB_AWS_HOSTNAME="):
+        # 浮動 IP と公開の入口は無くなった（2026-10-31）
+        for old in ("LAB_EC2_VPC_CIDR", "LAB_EC2_DISK_GIB", "LAB_EC2_LOCAL_PORT", "LAB_EC2_KEEP_EIP", "LAB_AWS_HOSTNAME=",
+                    "LAB_VM_KEEP_ENTRY_IP", "LAB_WEB_ALLOW_CIDR"):
             self.assertNotIn(old, text)
 
 
@@ -772,10 +788,17 @@ class CloudLayerTest(unittest.TestCase):
         self.assertIn("LAB_VM_S3_LITELLM_WRITER_KEY", str(cm.exception))
         self.assertIn("LAB_VM_S3_OPERATOR_KEY", str(cm.exception))   # GCP は操作者の HMAC キーも必須
         self.assertIn(render.GCS_REGISTRY_KEY_ENV, str(cm.exception))   # GCP の registry は JSON キー
+        self.assertIn("LAB_VM_BASTION_HOST", str(cm.exception))   # 踏み台（管理系の経路と Mac の転送）も必須（2026-10-31）
         for user in ("litellm-writer", "audit-compactor", "audit-viewer", "pg-backup", "operator"):
             for name in render.s3_env_names(user, e):
                 e.values[name] = "x"
         e.values[render.GCS_REGISTRY_KEY_ENV] = "e30="
+        e.values["LAB_VM_BASTION_HOST"], e.values["LAB_VM_BASTION_CIDR"] = "203.0.113.9", "10.60.0.20/32"
+        vm.require_provided_env(e)
+        e.values["LAB_ZABBIX_SERVER"] = "10.60.0.20:10051"
+        with self.assertRaises(LabError):
+            vm.require_provided_env(e)   # 既存の Zabbix サーバーを使うなら API の URL とトークンが要る
+        e.values["LAB_ZABBIX_API_URL"], e.values["LAB_ZABBIX_API_TOKEN"] = "http://z/api_jsonrpc.php", "tok"
         vm.require_provided_env(e)
         e.values["LAB_EGRESS_PROXY"] = "http://10.0.0.20:3128"
         with self.assertRaises(LabError):
@@ -784,14 +807,16 @@ class CloudLayerTest(unittest.TestCase):
         with self.assertRaises(LabError) as cm:
             vm.require_provided_env(a)
         self.assertIn("LAB_VM_NODES", str(cm.exception))
-    def test_web_cidr_defaults_to_operator(self):
-        """80/443 の送信元: LAB_WEB_ALLOW_CIDR があればそれ、無ければ 22 と同じ操作者の IP（2026-10-30 の判断 A）。"""
+    def test_admin_cidrs(self):
+        """VM の 22 を通す送信元: 踏み台の CIDR ＋ managed では操作者の IP。provided は踏み台だけ（変更設計書 2026-10-31 4.1 節）。"""
         from labtool import vm
-        env = VmTargetTest().vm("gcp-vm")
-        env.values["LAB_SSH_ALLOW_CIDR"] = "203.0.113.5"
-        self.assertEqual(vm.web_cidr(env), "203.0.113.5/32")
-        env.values["LAB_WEB_ALLOW_CIDR"] = "0.0.0.0/0"
-        self.assertEqual(vm.web_cidr(env), "0.0.0.0/0")
+        env = VmTargetTest().vm("gcp-vm", LAB_SSH_ALLOW_CIDR="203.0.113.5", LAB_VM_BASTION_CIDR="10.60.0.20")
+        self.assertEqual(vm.admin_cidrs(env), ["10.60.0.20/32", "203.0.113.5/32"])
+        prov = VmTargetTest().vm("gcp-vm", LAB_INFRA="provided", LAB_SSH_ALLOW_CIDR="203.0.113.5", LAB_VM_BASTION_CIDR="10.1.0.0/24")
+        self.assertEqual(vm.admin_cidrs(prov), ["10.1.0.0/24"])
+        infra = self.infra("gcp-vm")
+        infra.bastion_cidr = "10.60.0.21/32"
+        self.assertEqual(vm.admin_cidrs(env, infra), ["10.60.0.21/32", "203.0.113.5/32"])   # 基盤の値が .env より優先
 
     def test_cloudflare_zone_candidates(self):
         """A レコードを作るときのゾーン名の候補: ホスト名から長い順に、TLD だけは除く。"""
@@ -815,8 +840,9 @@ class CloudLayerTest(unittest.TestCase):
         plan = clouds.network_plan("10.60.0.0/16", subnets_per_node=(target == "aws-ec2"))
         nodes = [clouds.Node(id=f"id-{n['index']}", index=n["index"], private_ip=n["private_ip"], public_ip="", zone=f"z{n['index']}")
                  for n in plan["nodes"]]
-        return clouds.Infra(nodes=nodes, entry_ip="203.0.113.10", entry_ip_id="eipalloc-1" if target == "aws-ec2" else "litellm-lab-entry",
-                            bucket="lab-bucket", region="r")
+        return clouds.Infra(nodes=nodes, entry_ip=plan["lb_ips"][0],
+                            entry_ip_id="arn:aws:elasticloadbalancing:r:1:loadbalancer/net/lb/1" if target == "aws-ec2" else "litellm-lab-lb",
+                            bucket="lab-bucket", region="r", bastion_host="203.0.113.20", bastion_cidr="10.60.0.20/32")
 
     def test_both_clouds_implement_the_same_functions(self):
         import inspect
@@ -835,13 +861,15 @@ class CloudLayerTest(unittest.TestCase):
         from labtool import clouds
         aws_plan = clouds.network_plan("10.60.0.0/16", subnets_per_node=True)
         self.assertEqual(aws_plan["subnets"], ["10.60.0.0/24", "10.60.1.0/24", "10.60.2.0/24"])
-        self.assertEqual(aws_plan["nodes"][0], {"index": 1, "subnet": "10.60.0.0/24", "private_ip": "10.60.0.10",
-                                                "secondary_ip": "10.60.0.11"})
+        self.assertEqual(aws_plan["nodes"][0], {"index": 1, "subnet": "10.60.0.0/24", "private_ip": "10.60.0.10"})
         self.assertEqual(aws_plan["nodes"][2]["private_ip"], "10.60.2.10")
+        # 内部ロードバランサの固定の内部 IP は各サブネットの .5（AWS は 3 つ、GCP は 1 つ）。浮動 IP 用の 2 つ目の IP は無い
+        self.assertEqual(aws_plan["lb_ips"], ["10.60.0.5", "10.60.1.5", "10.60.2.5"])
         gcp_plan = clouds.network_plan("10.60.0.0/16", subnets_per_node=False)
         self.assertEqual(gcp_plan["subnets"], ["10.60.0.0/24"])
         self.assertEqual([n["private_ip"] for n in gcp_plan["nodes"]], ["10.60.0.10", "10.60.0.11", "10.60.0.12"])
-        self.assertEqual([n["secondary_ip"] for n in gcp_plan["nodes"]], ["", "", ""])
+        self.assertEqual(gcp_plan["lb_ips"], ["10.60.0.5"])
+        self.assertFalse(any("secondary_ip" in n for n in gcp_plan["nodes"] + aws_plan["nodes"]))
 
     def test_single_bucket_layout_and_policies(self):
         """1 バケットのディレクトリ構成（変更設計書 4 章）: ライフサイクル、IAM ユーザーの権限の写し、GCS のバインディングの写し。"""
@@ -892,47 +920,250 @@ class CloudLayerTest(unittest.TestCase):
         self.assertEqual(objectstore.retention_put_args(e, "pg-backup"), {})
         self.assertEqual(objectstore.retention_put_args(env(), "audit-raw"), {})
     def test_node_init_rendering_for_both_clouds(self):
-        """SSH で流す初期化スクリプト（変更設計書 5 章）: トークンと版、中継と CA、hooks の関数、置き換え漏れ無し。"""
+        """SSH で流す初期化スクリプト（変更設計書 2026-10-31 4 章）: トークンと版、中継と CA、nftables の集合、Zabbix agent、
+        keepalived とクラウドの API が無いこと、置き換え漏れ無し。"""
         from labtool import vm
         from labtool.clouds import aws_ec2, gcp
         values = {"K3S_VERSION": "v1.35.5+k3s1", "K3S_TOKEN": "tok", "SSH_USER": "ubuntu",
                   "EGRESS_PROXY": "http://10.60.0.20:3128", "EGRESS_NO_PROXY": "127.0.0.1,10.60.0.0/16", "EGRESS_CA_B64": "Q0E="}
         for target, cloud in (("aws-ec2", aws_ec2), ("gcp-vm", gcp)):
-            e = VmTargetTest().vm(target)
+            e = VmTargetTest().vm(target, LAB_SSH_ALLOW_CIDR="203.0.113.5", LAB_EGRESS_PROXY="http://10.60.0.20:3128",
+                                  LAB_ZABBIX_SERVER="10.60.0.20:10051")
             infra = self.infra(target)
             node = infra.nodes[2]
-            if target == "gcp-vm":
-                hooks = cloud.node_init_hooks(e, infra, node)
-            else:
-                hooks = aws_ec2.HOOKS_SCRIPT.read_text().replace("@@REGION@@", "r").replace("@@EIP_ALLOCATION_ID@@", "eipalloc-1") \
-                    .replace("@@SECONDARY_IP@@", "10.60.2.11").replace("@@SUBNET_PREFIX@@", "24")   # AWS は API で 2 つ目の IP を読む
-            for fn in ("lab_install_tools", "lab_self_id", "lab_take_entry_ip", "lab_ensure_egress", "lab_hook_values"):
-                self.assertIn(f"{fn}()", hooks, f"{target} の hooks に {fn} がありません")
-            self.assertNotIn("lab_read_object", hooks)   # VM はバケットを読まない（トークンと版は SSH で渡す）
-            text = vm.render_node_init(node, infra.nodes, hooks, "ssh-ed25519 AAAA test", values)
+            fw = vm.firewall_values(e, infra)
+            self.assertEqual(fw["NODE_IPS"], ",".join(n.private_ip for n in infra.nodes))
+            self.assertEqual((fw["VPC_CIDR"], fw["LB_IP"], fw["POD_CIDR"]), ("10.60.0.0/16", infra.entry_ip, "10.42.0.0/16"))
+            self.assertEqual(fw["ADMIN_CIDRS"], "10.60.0.20/32,203.0.113.5/32")
+            self.assertEqual(fw["HC_RANGES"], ",".join(cloud.health_check_ranges(e)))
+            for needle in ("169.254.169.254", "10.60.0.20"):   # メタデータと中継（＝踏み台）は直接届く
+                self.assertIn(needle, fw["EGRESS_CIDRS"])
+            text = vm.render_node_init(node, infra.nodes, "ssh-ed25519 AAAA test", {**values, **fw, **vm.zabbix_values(e, node)})
             self.assertEqual(re.findall(r"@@[A-Z_0-9]+@@", text), [])
-            for needle in ('PRIORITY="100"', 'NODE_INDEX="3"', "ssh-ed25519 AAAA test", "/etc/rancher/k3s/config.yaml",
-                           "cluster-init: true", "sh -s - server\n", "nopreempt", "notify_backup", 'K3S_VERSION="v1.35.5+k3s1"',
-                           'K3S_TOKEN="tok"', 'EGRESS_PROXY="http://10.60.0.20:3128"', "update-ca-certificates",
-                           "/etc/systemd/system/k3s.service.env", "docker.io", "lab-egress.service", "/var/lib/lab/ready"):
+            for needle in ('NODE_INDEX="3"', "ssh-ed25519 AAAA test", "/etc/rancher/k3s/config.yaml", "cluster-init: true",
+                           "sh -s - server\n", 'K3S_VERSION="v1.35.5+k3s1"', 'K3S_TOKEN="tok"',
+                           'EGRESS_PROXY="http://10.60.0.20:3128"', "update-ca-certificates", "/etc/systemd/system/k3s.service.env",
+                           "docker.io", "/var/lib/lab/ready", "table inet lab", "hook prerouting priority -150",
+                           "tcp dport 22 ip saddr @admins accept", "tcp dport { 80, 443 } ip saddr @hc accept",
+                           "udp dport 8472 ip saddr @nodes accept", "add table inet lab", "delete table inet lab",
+                           'ZABBIX_SERVER="10.60.0.20:10051"', f'ZABBIX_HOSTNAME="{vm.zabbix_hostname(node)}"', "zabbix-agent2",
+                           'HC_RANGES="' + fw["HC_RANGES"] + '"'):
                 self.assertIn(needle, text, f"{target}: {needle}")
-            self.assertNotIn("--cluster-init", text)
+            for absent in ("keepalived", "lab_take_entry_ip", "addAccessConfig", "associate-address", "lab-egress.service",
+                           "--cluster-init", "gcloud ", "aws ec2"):
+                self.assertNotIn(absent, text, f"{target}: {absent} が残っている")
+            self.assertNotIn("\nflush ruleset", text)   # 全部を消すと kube-proxy の規則まで消える（説明文には書いてある）
+            self.assertEqual(fw["EGRESS_CIDRS"].count("10.60.0.20"), 1)   # 中継と踏み台が同じ IP なら 1 つ
             self.assertNotIn("ssm", text.lower())   # Systems Manager は使わない
-            self.assertNotIn("lab_read_object", text)
         ginfra = self.infra("gcp-vm")
-        gcp_text = gcp.node_init_hooks(VmTargetTest().vm("gcp-vm"), ginfra, ginfra.nodes[0])
-        self.assertIn("addAccessConfig", gcp_text)
-        self.assertIn("LAB_ADDRESS_NAME=\"litellm-lab-entry\"", gcp_text)
-        self.assertIn("--noproxy '*'", gcp_text)   # メタデータサーバーは中継を通さない
-        self.assertFalse(any(l.lstrip().startswith("gcloud ") or " gcloud " in l for l in gcp_text.splitlines()
-                             if not l.lstrip().startswith("#")))   # gcloud を呼ばない（REST API だけ）
         with self.assertRaises(ValueError):
-            vm.render_node_init(ginfra.nodes[0], ginfra.nodes, "", "k", script="x @@UNKNOWN@@")
-        # 中継の値: 中継が無ければ空、あれば除外に VM の CIDR と台の IP
+            vm.render_node_init(ginfra.nodes[0], ginfra.nodes, "k", script="x @@UNKNOWN@@")
+        # 中継の値: 中継が無ければ空、あれば除外に VM の CIDR と台の IP。無ければ nftables の外向きは遮断しない
         e = VmTargetTest().vm("gcp-vm")
         self.assertEqual(vm.egress_values(e, ginfra), {"EGRESS_PROXY": "", "EGRESS_NO_PROXY": "", "EGRESS_CA_B64": ""})
-        self.assertIn(vm.PROXY_INIT_SCRIPT.name, "proxy-init.sh")
-        self.assertIn("mitmdump --mode regular", vm.PROXY_INIT_SCRIPT.read_text())
+        plain = vm.render_node_init(ginfra.nodes[0], ginfra.nodes, "k", {**vm.firewall_values(e, ginfra)})
+        self.assertIn('EGRESS_PROXY=""', plain)
+        self.assertIn('EGRESS_ELEMS="0.0.0.0/0"', plain)
+        # 中継（踏み台）の初期化: nftables、Zabbix サーバー（LAB_ZABBIX_VM）
+        proxy_text = vm.render_proxy_init(VmTargetTest().vm("gcp-vm", LAB_SSH_ALLOW_CIDR="203.0.113.5", LAB_ZABBIX_VM="true",
+                                                            LAB_EGRESS_PROXY_VM="true"))
+        self.assertEqual(re.findall(r"@@[A-Z_0-9]+@@", proxy_text), [])
+        for needle in ("mitmdump --mode regular", 'ZABBIX="true"', "zabbix-server-pgsql:ubuntu-7.0-latest", '127.0.0.1:${ZABBIX_WEB_PORT}:8080',
+                       'ADMIN_CIDRS="203.0.113.5/32"', "tcp dport { ${PORT}, 10051 } ip saddr @internal accept"):
+            self.assertIn(needle, proxy_text)
+        self.assertIn('ZABBIX="false"', vm.render_proxy_init(VmTargetTest().vm("gcp-vm", LAB_SSH_ALLOW_CIDR="203.0.113.5")))
+
+    def test_admin_only_and_network_policies(self):
+        """管理系の経路は踏み台からだけ（変更設計書 2026-10-31 5 章）: Middleware と経路、既存の経路への差し込み、NetworkPolicy。"""
+        e = VmTargetTest().vm("gcp-vm", LAB_VM_BASTION_CIDR="10.60.0.20/32")
+        docs = list(yaml.safe_load_all(render.admin_only_manifest(e)))
+        self.assertEqual([d["kind"] for d in docs], ["Middleware", "IngressRoute"])
+        self.assertEqual(docs[0]["spec"]["ipAllowList"]["sourceRange"], ["10.60.0.20/32"])
+        route = docs[1]["spec"]["routes"][0]
+        self.assertEqual((route["priority"], route["middlewares"]), (95, [{"name": "admin-only"}]))
+        for p in ("/ui", "/login", "/sso", "/metrics"):
+            self.assertIn(f"PathPrefix(`{p}`)", route["match"])
+        self.assertNotIn("/v1", route["match"])
+        # 踏み台が無ければ誰にも開けない
+        none = list(yaml.safe_load_all(render.admin_only_manifest(VmTargetTest().vm("gcp-vm"))))[0]
+        self.assertEqual(none["spec"]["ipAllowList"]["sourceRange"], ["127.0.0.255/32"])
+        # 検索アプリの経路に差し込む（他の IngressRoute は変えない）
+        viewer = (Path(__file__).resolve().parents[2] / "k8s" / "audit-viewer.yaml").read_text().replace("${", "{")
+        viewer = re.sub(r"\{[A-Z_]+\}", "x", viewer)
+        out = list(yaml.safe_load_all(render.add_admin_middleware(viewer)))
+        for d in out:
+            if d.get("kind") == "IngressRoute" and d["metadata"]["name"] == "audit-viewer":
+                for r in d["spec"]["routes"]:
+                    self.assertEqual(r["middlewares"][0], {"name": "admin-only"})
+        twice = render.add_admin_middleware(render.add_admin_middleware(viewer))
+        self.assertEqual(twice.count("admin-only"), render.add_admin_middleware(viewer).count("admin-only"))
+        # HTTPS への写しは admin の経路にも効く
+        tls = list(yaml.safe_load_all(render.tls_ingressroutes(render.admin_only_manifest(e))))
+        self.assertEqual([(d["metadata"]["name"], d["spec"]["entryPoints"]) for d in tls], [("litellm-admin-tls", ["websecure"])])
+        pols = list(yaml.safe_load_all((Path(__file__).resolve().parents[2] / "k8s" / "network-policies.yaml").read_text()))
+        self.assertEqual({p["metadata"]["name"] for p in pols}, {"postgres-ingress", "pooler-ingress", "valkey-ingress"})
+        for p in pols:
+            self.assertEqual(p["spec"]["policyTypes"], ["Ingress"])
+            self.assertEqual(p["metadata"]["namespace"], "litellm-lab")
+
+    def test_zabbix_api_and_setup_is_idempotent(self):
+        """Zabbix（変更設計書 2026-10-31 7 章）: 偽の JSON-RPC サーバーで、トークンの発行、ホストの作成 → 2 回目は何もしない、
+        自動登録のアクションの形、HTTP のアイテムとトリガー、Helm の値。"""
+        import http.server
+        import threading
+        from labtool import zabbix
+        calls: list[tuple[str, dict]] = []
+        state = {"hosts": {}, "groups": {}, "actions": {}, "items": {}, "triggers": {}, "proxies": {}, "tokens": {}, "admin_pw": "zabbix"}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):  # noqa: D401
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                method, params = body["method"], body.get("params")
+                calls.append((method, params))
+                auth = self.headers.get("Authorization", "")
+                result = None
+                if method == "apiinfo.version":
+                    result = "7.0.17"
+                elif method == "user.login":
+                    if params["password"] != state["admin_pw"]:
+                        return self._err(body, "Login name or password is incorrect.")
+                    result = "session-1"
+                elif method == "user.get":
+                    result = [{"userid": "1", "username": "Admin"}]
+                elif method == "user.update":
+                    state["admin_pw"] = params["passwd"]
+                    result = {"userids": ["1"]}
+                elif method == "token.get":
+                    result = []
+                elif method == "token.create":
+                    result = {"tokenids": ["7"]}
+                elif method == "token.generate":
+                    result = [{"tokenid": "7", "token": "api-token-xyz"}]
+                elif method == "user.logout":
+                    result = True
+                elif auth != "Bearer api-token-xyz":
+                    return self._err(body, "Not authorized.")
+                elif method == "hostgroup.get":
+                    name = params["filter"]["name"]
+                    result = [{"groupid": state["groups"][name], "name": name}] if name in state["groups"] else []
+                elif method == "hostgroup.create":
+                    gid = str(10 + len(state["groups"]))
+                    state["groups"][params["name"]] = gid
+                    result = {"groupids": [gid]}
+                elif method == "template.get":
+                    result = [{"templateid": {"Linux by Zabbix agent active": "100", "Kubernetes cluster state by HTTP": "200"}[params["filter"]["host"]]}]
+                elif method == "action.get":
+                    a = state["actions"].get(params["filter"]["name"])
+                    result = [a] if a else []
+                elif method == "action.create":
+                    state["actions"][params["name"]] = {**params, "actionid": str(len(state["actions"]) + 1), "status": "0"}
+                    result = {"actionids": ["1"]}
+                elif method == "proxy.get":
+                    p = state["proxies"].get(params["filter"]["name"])
+                    result = [p] if p else []
+                elif method == "proxy.create":
+                    state["proxies"][params["name"]] = {"proxyid": "5", "name": params["name"]}
+                    result = {"proxyids": ["5"]}
+                elif method == "host.get":
+                    if "filter" in params:
+                        h = state["hosts"].get(params["filter"]["host"])
+                        result = [h] if h else []
+                    else:
+                        result = list(state["hosts"].values())
+                elif method == "host.create":
+                    hid = str(len(state["hosts"]) + 1)
+                    state["hosts"][params["host"]] = {
+                        "hostid": hid, "host": params["host"], "status": "0",
+                        "parentTemplates": [{"templateid": x["templateid"]} for x in params["templates"]],
+                        "hostgroups": [{"groupid": x["groupid"]} for x in params["groups"]],
+                        "macros": [{"macro": m["macro"], "value": m["value"]} for m in params["macros"]] + [{"macro": "{$OTHER}", "value": "keep"}],
+                        "tags": params.get("tags", []), "monitored_by": str(params.get("monitored_by", 0)), "proxyid": params.get("proxyid", "0")}
+                    result = {"hostids": [hid]}
+                elif method == "host.update":
+                    result = {"hostids": [params["hostid"]]}
+                elif method == "item.get":
+                    key = params["filter"]["key_"]
+                    i = state["items"].get(key)
+                    result = [i] if i else []
+                elif method == "item.create":
+                    state["items"][params["key_"]] = {**params, "itemid": "9", "status": "0"}
+                    result = {"itemids": ["9"]}
+                elif method == "trigger.get":
+                    tr = state["triggers"].get(params["filter"]["description"])
+                    result = [tr] if tr else []
+                elif method == "trigger.create":
+                    state["triggers"][params["description"]] = {**params, "triggerid": "3"}
+                    result = {"triggerids": ["3"]}
+                else:
+                    return self._err(body, f"unknown {method}")
+                self._send({"jsonrpc": "2.0", "result": result, "id": body["id"]})
+
+            def _err(self, body, message):
+                self._send({"jsonrpc": "2.0", "error": {"code": -32602, "message": "Invalid params.", "data": message}, "id": body["id"]})
+
+            def _send(self, doc):
+                data = json.dumps(doc).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{server.server_address[1]}/api_jsonrpc.php"
+        try:
+            e = VmTargetTest().vm("gcp-vm", LAB_ZABBIX_SERVER="10.60.0.20:10051", LAB_ZABBIX_API_URL=url)
+            written = {}
+            e.set = lambda k, v: written.__setitem__(k, v) or e.values.__setitem__(k, v)   # .env に書かずに記録
+            client = zabbix._bootstrap_token(e, url)
+            self.assertEqual(client.token, "api-token-xyz")
+            self.assertEqual(written["LAB_ZABBIX_API_TOKEN"], "api-token-xyz")
+            self.assertNotEqual(state["admin_pw"], "zabbix")   # 初期パスワードは変わる
+            self.assertEqual(written["LAB_ZABBIX_ADMIN_PASSWORD"], state["admin_pw"])
+            groups = zabbix.ensure_groups(client)
+            self.assertEqual(set(groups), {"vm", "k8s", "service"})
+            zabbix.ensure_autoregistration(client, "act", "litellm-lab-node", groups["vm"], "100")
+            act = state["actions"]["act"]
+            self.assertEqual((act["eventsource"], act["filter"]["conditions"][0]), (2, {"conditiontype": 24, "operator": 2, "value": "litellm-lab-node"}))
+            self.assertEqual([o["operationtype"] for o in act["operations"]], [4, 6])
+            pid = zabbix.ensure_proxy(client, "p")
+            hid = zabbix.ensure_host(client, "k8s", [groups["k8s"]], ["200"], {"{$KUBE.API.URL}": "https://k", "{$KUBE.API.TOKEN}": "t"}, pid,
+                                     tags={"lab": "k8s"})
+            self.assertEqual(hid, "1")
+            self.assertEqual(state["hosts"]["k8s"]["monitored_by"], "1")
+            calls.clear()
+            zabbix.ensure_groups(client)
+            zabbix.ensure_autoregistration(client, "act", "litellm-lab-node", groups["vm"], "100")
+            zabbix.ensure_proxy(client, "p")
+            zabbix.ensure_host(client, "k8s", [groups["k8s"]], ["200"], {"{$KUBE.API.URL}": "https://k", "{$KUBE.API.TOKEN}": "t"}, pid,
+                               tags={"lab": "k8s"})
+            self.assertFalse(any(m.endswith((".create", ".update")) for m, _ in calls), [m for m, _ in calls])   # 2 回目は作らない・直さない
+            calls.clear()
+            zabbix.ensure_host(client, "k8s", [groups["k8s"]], ["200"], {"{$KUBE.API.URL}": "https://k2", "{$KUBE.API.TOKEN}": "t"}, pid,
+                               tags={"lab": "k8s"})
+            upd = next(p for m, p in calls if m == "host.update")
+            self.assertIn({"macro": "{$OTHER}", "value": "keep"}, upd["macros"])   # 管理していないマクロは残す
+            self.assertIn({"macro": "{$KUBE.API.URL}", "value": "https://k2"}, upd["macros"])
+            zabbix.ensure_http_check(client, hid, "k8s", "liveliness", "https://lab.example.test/health/liveliness")
+            item = state["items"]["lab.http[liveliness]"]
+            self.assertEqual((item["type"], item["status_codes"], item["url"]), (19, "200", "https://lab.example.test/health/liveliness"))
+            self.assertEqual(next(iter(state["triggers"].values()))["expression"], "nodata(/k8s/lab.http[liveliness],180s)=1")
+            calls.clear()
+            zabbix.ensure_http_check(client, hid, "k8s", "liveliness", "https://lab.example.test/health/liveliness")
+            self.assertFalse(any(m.endswith((".create", ".update")) for m, _ in calls))
+        finally:
+            server.shutdown()
+        values = zabbix.chart_values(e, "10.60.0.20:10051")
+        self.assertFalse(values["zabbixAgent"]["enabled"])   # VM の agent 2 と 10050 とノード名が重なるので入れない
+        self.assertTrue(values["kubeStateMetrics"]["enabled"])
+        envs = {x["name"]: x["value"] for x in values["zabbixProxy"]["env"]}
+        self.assertEqual((envs["ZBX_SERVER_HOST"], envs["ZBX_HOSTNAME"], envs["ZBX_PROXYMODE"]), ("10.60.0.20:10051", zabbix.PROXY_HOSTNAME, 0))
+        self.assertEqual(zabbix.KSM_ENDPOINT, "zabbix-kube-state-metrics")
+
     def test_infra_helpers(self):
         from labtool import clouds
         infra = self.infra("aws-ec2")

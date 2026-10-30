@@ -1,9 +1,9 @@
 #!/bin/bash
 # VM ノードの初期化（LAB_TARGET=aws-ec2 / gcp-vm。labtool/vm.py が SSH で `sudo bash -s` に流す。
-# 変更設計書 .history/2026-10-30-既存資源からの構築と出口プロキシ/ 5 章）。Ubuntu 24.04 LTS（arm64 / amd64）。
-# labtool/vm.py が @@名前@@ を置き換え、クラウド固有の手順（vm/hooks-aws.sh / hooks-gcp.sh）を HOOKS の印に差し込む。
+# 変更設計書 .history/2026-10-31-内部LBとVM側の防御とZabbix/ 4 章）。Ubuntu 24.04 LTS（arm64 / amd64）。
+# labtool/vm.py が @@名前@@ を置き換える。クラウド固有の手順は無い（VM はクラウドの API を呼ばない。入口は内部ロードバランサ）。
 # 3 台で同じ内容で、台ごとの値だけが違う。k3s の参加トークンと版は SSH で渡す（VM にバケットの権限は要らない）。
-# 2 回目以降（/var/lib/lab/ready がある）は、CA と中継の設定だけ直して抜ける。
+# 2 回目以降（/var/lib/lab/ready がある）は、CA・中継・nftables・Zabbix agent の設定だけ直して抜ける。
 set -euo pipefail
 exec > >(tee -a /var/log/lab-node-init.log) 2>&1
 
@@ -11,23 +11,33 @@ NODE_INDEX="@@NODE_INDEX@@"            # 1〜3
 SELF_IP="@@SELF_IP@@"                  # 自分のプライベート IP（固定）
 FIRST_IP="@@FIRST_IP@@"                # 1 番の台のプライベート IP
 PEER_IPS="@@PEER_IPS@@"                # 他の 2 台のプライベート IP（空白区切り）
-PRIORITY="@@PRIORITY@@"                # keepalived の優先度（1 番が高い）
+NODE_IPS="@@NODE_IPS@@"                # 3 台のプライベート IP（カンマ区切り。nftables の集合）
 REGISTRY_HOST="@@REGISTRY_HOST@@"      # クラスタの中のイメージ置き場の名前（例 lab-registry:5000）
 REGISTRY_NODEPORT="@@REGISTRY_NODEPORT@@"
 SSH_PUBKEY="@@SSH_PUBKEY@@"            # 構築ツールの SSH の公開鍵（空なら触らない）
+SSH_USER="@@SSH_USER@@"
 K3S_VERSION="@@K3S_VERSION@@"          # 例 v1.35.5+k3s1
 K3S_TOKEN="@@K3S_TOKEN@@"              # 参加トークン（初回だけ使う。ディスクには k3s 自身の保存先だけ）
-EGRESS_PROXY="@@EGRESS_PROXY@@"        # 出口プロキシの URL（空なら中継なし）
+EGRESS_PROXY="@@EGRESS_PROXY@@"        # 出口プロキシの URL（空なら中継なし。外向きの遮断もしない）
 EGRESS_NO_PROXY="@@EGRESS_NO_PROXY@@"  # 中継を通さない宛先
 EGRESS_CA_B64="@@EGRESS_CA_B64@@"      # 中継の CA（PEM の base64。空なら無し）
-SSH_USER="@@SSH_USER@@"
-
-# ---- クラウド固有の手順（関数: lab_install_tools、lab_self_id、lab_take_entry_ip、lab_ensure_egress、lab_hook_values） ----
-@@HOOKS@@
-# ---- ここからクラウドを知らない ----
+# ---- nftables（変更設計書 4.1 節）。CIDR はカンマ区切り。空なら「無し」 ----
+VPC_CIDR="@@VPC_CIDR@@"                # 利用者と内部ロードバランサがいる範囲（80/443 を通す）
+LB_IP="@@LB_IP@@"                      # 内部ロードバランサの IP（外向きの許可。Pod が自分の入口を呼ぶ）
+HC_RANGES="@@HC_RANGES@@"              # ロードバランサのヘルスチェックの送信元
+ADMIN_CIDRS="@@ADMIN_CIDRS@@"          # 22 を通す送信元（踏み台。managed では操作者の IP も）
+EGRESS_CIDRS="@@EGRESS_CIDRS@@"        # 中継を通さずに直接届いてよい宛先（中継、踏み台、メタデータ・DNS・NTP）
+POD_CIDR="@@POD_CIDR@@"                # k3s の Pod 網（10.42.0.0/16）
+SVC_CIDR="@@SVC_CIDR@@"                # k3s の Service 網（10.43.0.0/16）
+# ---- Zabbix agent 2（変更設計書 4.2 節） ----
+ZABBIX_SERVER="@@ZABBIX_SERVER@@"      # サーバーの宛先 host:port（空なら agent を入れない）
+ZABBIX_HOSTNAME="@@ZABBIX_HOSTNAME@@"  # このホストの名前（VM の名前）
+ZABBIX_METADATA="@@ZABBIX_METADATA@@"  # 自動登録の目印（litellm-lab-node）
+ZABBIX_RELEASE_URL="@@ZABBIX_RELEASE_URL@@"
 
 CA_PATH=/usr/local/share/ca-certificates/lab-egress.crt
-mkdir -p /var/lib/lab /etc/rancher/k3s /etc/keepalived /usr/local/bin
+mkdir -p /var/lib/lab /etc/rancher/k3s /usr/local/bin
+export DEBIAN_FRONTEND=noninteractive
 
 # 構築ツールの SSH の鍵（provision が置いた鍵と同じ行があっても害は無い）
 if [ -n "$SSH_PUBKEY" ]; then
@@ -75,20 +85,125 @@ else
   rm -f /etc/apt/apt.conf.d/90lab-proxy /etc/systemd/system/docker.service.d/http-proxy.conf
 fi
 
+# ---- nftables: クラウドのファイアウォールに頼らず、この台で守る（変更設計書 4.1 節） ----
+# kube-proxy と flannel は iptables（nf_tables 後端）に自分の規則を書く。この表は別なので共存する。
+# こちらの drop は最終なので、Kubernetes が通したいもの（Pod 網、ServiceLB の DNAT、ClusterIP）は上の accept で拾う。
+# 入りの絞り込みは prerouting（DNAT の前）で行う。ServiceLB（80/443）と NodePort は DNAT されて forward を通るため。
+set_elems() {  # カンマ区切り → nftables の集合の要素（空なら誰にも当たらないダミー）
+  local v="${1//,/, }"
+  [ -n "$v" ] && echo "$v" || echo "127.0.0.255/32"
+}
+IFACE="$(ip -o -4 route show to default | awk '{print $5}' | head -1)"
+if [ -n "$EGRESS_PROXY" ]; then
+  EGRESS_ELEMS="$(set_elems "${EGRESS_CIDRS}${LB_IP:+,$LB_IP}")"
+else
+  EGRESS_ELEMS="0.0.0.0/0"    # 中継が無い環境（透過の Zscaler など）は外向きを遮断しない
+fi
+HC_ELEMS="$(set_elems "$HC_RANGES")"
+ADMIN_ELEMS="$(set_elems "$ADMIN_CIDRS")"
+NODE_ELEMS="$(set_elems "$NODE_IPS")"
+INTERNAL_ELEMS="$(set_elems "${VPC_CIDR},${POD_CIDR},${SVC_CIDR}")"
+ZABBIX_SERVER_IP="${ZABBIX_SERVER%%:*}"
+ZABBIX_ELEMS="$(set_elems "${ZABBIX_SERVER_IP:+$ZABBIX_SERVER_IP/32,}${POD_CIDR}")"
+apt-get install -y -q nftables >/dev/null 2>&1 || { apt-get update -q && apt-get install -y -q nftables; }
+cat > /etc/nftables.conf <<EOT
+#!/usr/sbin/nft -f
+# litellm-lab（vm/node-init.sh が書く。手で編集しない）。この表だけを作り直す（flush ruleset は kube-proxy と flannel の
+# iptables の規則まで消してしまう）
+add table inet lab
+delete table inet lab
+table inet lab {
+  set nodes     { type ipv4_addr; flags interval; elements = { ${NODE_ELEMS} } }
+  set hc        { type ipv4_addr; flags interval; elements = { ${HC_ELEMS} } }
+  set admins    { type ipv4_addr; flags interval; elements = { ${ADMIN_ELEMS} } }
+  set internal  { type ipv4_addr; flags interval; elements = { ${INTERNAL_ELEMS} } }
+  set egress_ok { type ipv4_addr; flags interval; elements = { ${EGRESS_ELEMS} } }
+  set zabbix    { type ipv4_addr; flags interval; elements = { ${ZABBIX_ELEMS} } }
+
+  chain ingress_filter {
+    # DNAT の前（priority -150）。入りの許可はここだけで決める
+    type filter hook prerouting priority -150; policy accept;
+    iif lo accept
+    iifname { "cni0", "flannel.1" } accept
+    ct state established,related accept
+    ct state invalid drop
+    ip protocol icmp accept
+    udp sport 67 udp dport 68 accept
+    tcp dport 22 ip saddr @admins accept
+    tcp dport { 80, 443 } ip saddr @internal accept
+    tcp dport { 80, 443 } ip saddr @hc accept
+    tcp dport { 6443, 2379, 2380, 10250, ${REGISTRY_NODEPORT} } ip saddr @nodes accept
+    udp dport 8472 ip saddr @nodes accept
+    tcp dport 10250 ip saddr ${POD_CIDR} accept
+    tcp dport 10050 ip saddr @zabbix accept
+    counter drop
+  }
+  chain forward {
+    # Pod の外向き（中継と内側だけ）と、DNAT された入り
+    type filter hook forward priority 0; policy drop;
+    ct state established,related accept
+    oifname { "cni0", "flannel.1" } accept
+    iifname { "cni0", "flannel.1" } ip daddr @internal accept
+    iifname { "cni0", "flannel.1" } ip daddr @egress_ok accept
+    iifname { "cni0", "flannel.1" } ip daddr @nodes accept
+    counter drop
+  }
+  chain output {
+    # この台の外向き（中継と内側だけ）
+    type filter hook output priority 0; policy drop;
+    oif lo accept
+    oifname { "cni0", "flannel.1" } accept
+    ct state established,related accept
+    ip protocol icmp accept
+    udp dport 67 accept
+    ip daddr @internal accept
+    ip daddr @nodes accept
+    ip daddr @egress_ok accept
+    counter drop
+  }
+}
+EOT
+nft -c -f /etc/nftables.conf
+systemctl enable nftables >/dev/null 2>&1 || true
+nft -f /etc/nftables.conf
+echo "nftables applied (egress: ${EGRESS_ELEMS})"
+
+# ---- Zabbix agent 2（能動で送る。サーバーが無ければ入れない） ----
+if [ -n "$ZABBIX_SERVER" ]; then
+  if ! command -v zabbix_agent2 >/dev/null 2>&1; then
+    if ! dpkg -s zabbix-release >/dev/null 2>&1; then
+      curl -sfL -o /tmp/zabbix-release.deb "$ZABBIX_RELEASE_URL"
+      dpkg -i /tmp/zabbix-release.deb >/dev/null
+      rm -f /tmp/zabbix-release.deb
+    fi
+    apt-get update -q
+    apt-get install -y -q zabbix-agent2
+  fi
+  sed -i -e "s/^Server=.*/Server=${ZABBIX_SERVER_IP}${POD_CIDR:+,$POD_CIDR}/" \
+         -e "s/^ServerActive=.*/ServerActive=${ZABBIX_SERVER}/" \
+         -e "s/^Hostname=.*/Hostname=${ZABBIX_HOSTNAME}/" \
+         -e "s/^# HostMetadata=.*/HostMetadata=${ZABBIX_METADATA}/" \
+         -e "s/^HostMetadata=.*/HostMetadata=${ZABBIX_METADATA}/" /etc/zabbix/zabbix_agent2.conf
+  grep -q "^HostMetadata=" /etc/zabbix/zabbix_agent2.conf || echo "HostMetadata=${ZABBIX_METADATA}" >> /etc/zabbix/zabbix_agent2.conf
+  systemctl enable zabbix-agent2 >/dev/null 2>&1 || true
+  systemctl restart zabbix-agent2
+  echo "zabbix agent 2 -> ${ZABBIX_SERVER} as ${ZABBIX_HOSTNAME}"
+else
+  systemctl disable --now zabbix-agent2 >/dev/null 2>&1 || true
+fi
+
 if [ -f /var/lib/lab/ready ]; then
   systemctl daemon-reload || true
   if systemctl is-active --quiet docker; then systemctl restart docker || true; fi
-  echo "already initialized (proxy and ca settings refreshed)"; exit 0
+  echo "already initialized (proxy, ca, nftables and zabbix settings refreshed)"; exit 0
 fi
 
 # ---- 道具 ----
-export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
-apt-get install -y -q keepalived curl ca-certificates docker.io
+apt-get install -y -q curl ca-certificates docker.io
 systemctl daemon-reload
 systemctl enable --now docker
 usermod -aG docker "$SSH_USER" || true
-lab_install_tools   # hooks: クラウドの API を呼ぶ道具（AWS は aws-cli の snap。GCP は curl で足りる）
 
 # ---- イメージ置き場（クラスタの中の registry）を、各ノードが自分の NodePort 経由で引く ----
 cat > /etc/rancher/k3s/registries.yaml <<EOT
@@ -151,98 +266,6 @@ for _ in $(seq 1 120); do
   if /usr/local/bin/k3s kubectl get --raw /readyz >/dev/null 2>&1; then break; fi
   sleep 5
 done
-
-# ---- keepalived: 浮動 IP の持ち主を 3 台の多数決で決める（ユニキャスト VRRP） ----
-IFACE="$(ip -o -4 route show to default | awk '{print $5}' | head -1)"
-
-cat > /usr/local/bin/lab-health.sh <<'EOT'
-#!/bin/bash
-# この台が入口として健全か: k3s が動き、Traefik（80）が応答する
-systemctl is-active --quiet k3s || exit 1
-curl -s --noproxy '*' -o /dev/null --max-time 2 http://127.0.0.1:80/ || exit 1
-exit 0
-EOT
-
-# 主系になったとき（notify_master）と、主系を降りたとき（notify_backup）に呼ぶ。中身はクラウド固有の関数
-cat > /usr/local/bin/lab-take-entry-ip.sh <<EOT
-#!/bin/bash
-source /var/lib/lab/hooks.sh
-lab_take_entry_ip
-EOT
-cat > /usr/local/bin/lab-release-entry-ip.sh <<EOT
-#!/bin/bash
-source /var/lib/lab/hooks.sh
-lab_ensure_egress
-EOT
-# hooks の関数（補助の関数も含めて全部）と値を、keepalived の通知スクリプトと起動時のサービスが読む形で残す。
-# 中継の環境変数と CA も書く（通知スクリプトは環境変数を継がない）
-{
-  declare -f
-  lab_hook_values
-  if [ -n "$EGRESS_PROXY" ]; then
-    echo "export HTTP_PROXY='${EGRESS_PROXY}' HTTPS_PROXY='${EGRESS_PROXY}' NO_PROXY='${EGRESS_NO_PROXY}'"
-    echo "export http_proxy='${EGRESS_PROXY}' https_proxy='${EGRESS_PROXY}' no_proxy='${EGRESS_NO_PROXY}'"
-    echo "export AWS_CA_BUNDLE='/etc/ssl/certs/ca-certificates.crt' CURL_CA_BUNDLE='/etc/ssl/certs/ca-certificates.crt'"
-  fi
-} > /var/lib/lab/hooks.sh
-chmod 755 /usr/local/bin/lab-health.sh /usr/local/bin/lab-take-entry-ip.sh /usr/local/bin/lab-release-entry-ip.sh
-chmod 600 /var/lib/lab/hooks.sh
-
-PEER_BLOCK=""
-for ip in $PEER_IPS; do PEER_BLOCK="${PEER_BLOCK}    ${ip}
-"; done
-cat > /etc/keepalived/keepalived.conf <<EOT
-global_defs {
-  enable_script_security
-  script_user root
-}
-vrrp_script chk_lab {
-  script "/usr/local/bin/lab-health.sh"
-  interval 2
-  fall 3
-  rise 2
-  weight -100
-}
-vrrp_instance LAB {
-  # 3 台とも BACKUP で始め、nopreempt で「戻った台が奪い返さない」。優先度は最初の持ち主を決めるためだけ
-  state BACKUP
-  nopreempt
-  interface ${IFACE}
-  virtual_router_id 60
-  priority ${PRIORITY}
-  advert_int 1
-  unicast_src_ip ${SELF_IP}
-  unicast_peer {
-${PEER_BLOCK}  }
-  # 仮想 IP は使わないリンクローカルのダミー。実際の経路は浮動 IP の付け替えで切り替わる
-  virtual_ipaddress {
-    169.254.60.1/32 dev ${IFACE}
-  }
-  track_script {
-    chk_lab
-  }
-  notify_master "/usr/local/bin/lab-take-entry-ip.sh"
-  notify_backup "/usr/local/bin/lab-release-entry-ip.sh"
-}
-EOT
-systemctl enable --now keepalived
-
-# ---- 起動時に外向きの IP を戻す（GCP: 主系を降りた台や止めて起こした台。AWS は何もしない）。startup-script の代わり ----
-cat > /etc/systemd/system/lab-egress.service <<EOT
-[Unit]
-Description=litellm-lab: restore the egress IP after boot
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/bin/bash -c 'source /var/lib/lab/hooks.sh && lab_ensure_egress'
-
-[Install]
-WantedBy=multi-user.target
-EOT
-systemctl daemon-reload
-systemctl enable lab-egress.service
 
 touch /var/lib/lab/ready
 echo "node $NODE_INDEX ready"

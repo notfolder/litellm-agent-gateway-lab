@@ -110,11 +110,22 @@ def _preflight_vm(env: Env) -> None:
     ok(f"{env.target} の資格情報: {ident['account']}、{ident['principal']}（{ident['region']}）、LAB_INFRA={env.infra_mode}")
     if env.is_provided:
         vm.require_provided_env(env)
-        ok("既存資源の項目（VM 3 台、バケット、浮動 IP、静的キー）がそろっています")
+        ok("既存資源の項目（VM 3 台、バケット、内部ロードバランサ、踏み台、静的キー）がそろっています")
     elif env.egress_proxy and not env.egress_proxy_vm and (env.egress_ca_file is None or not env.egress_ca_file.exists()):
         raise LabError("LAB_EGRESS_PROXY には LAB_EGRESS_CA_FILE（中継の CA の PEM）が要ります")
     if env.egress_proxy:
         ok(f"出口プロキシ: {env.egress_proxy}（Mac: {env.egress_proxy_mac or '通さない'}）")
+    # 入口は内部ロードバランサなので、操作者の Mac は踏み台経由の転送口に別名で届く（変更設計書 2026-10-31 6 章）
+    if not env.local_hostname:
+        warn("LAB_LOCAL_HOSTNAME（Mac 用の別名）が空です。入口はプライベートなので、Mac からの試験とクライアントは別名の"
+             "A レコード（127.0.0.1）と証明書の SAN が要ります。VPC の内側から流すときだけ空でよい")
+    if env.zabbix_vm and not env.egress_proxy_vm:
+        raise LabError("LAB_ZABBIX_VM=true は LAB_EGRESS_PROXY_VM=true（Zabbix サーバーを載せる踏み台の VM）が要ります")
+    if not env.is_provided and not env.egress_proxy_vm and not env.vm_bastion_cidr:
+        warn("踏み台（LAB_EGRESS_PROXY_VM=true の中継の VM か LAB_VM_BASTION_HOST/CIDR）が無いので、管理系の経路（/ui、検索アプリ）と"
+             "Mac からの HTTPS の転送は使えません")
+    if env.zabbix_enabled:
+        ok(f"Zabbix: {'踏み台の VM にサーバーを立てる' if env.zabbix_vm else env.zabbix_server}")
     for script in (vm.NODE_INIT_SCRIPT, vm.PROXY_INIT_SCRIPT):
         if not script.exists():
             raise LabError(f"{script.relative_to(ROOT)} がありません")
@@ -224,10 +235,13 @@ def _provision_vm(env: Env, pubkey: str) -> None:
     """managed: クラウド固有層で資源を作り（無ければ）、識別子と静的キーを .env に書く。中継の VM があれば初期化して CA を取る。"""
     cloud = clouds.for_env(env)
     cloud.ensure_apis(env)
-    result = cloud.provision(env, pubkey, vm.operator_cidr(env), vm.web_cidr(env))
+    result = cloud.provision(env, pubkey, vm.operator_cidr(env))
     env.set("LAB_VM_NODES", ",".join(result["nodes"]))
     env.set("LAB_VM_BUCKET", result["bucket"])
     env.set("LAB_VM_ENTRY_IP_ID", result["entry_ip_id"])
+    for key in ("bastion_host", "bastion_cidr", "zabbix_server"):
+        if result.get(key):
+            env.set(f"LAB_VM_{key.upper()}" if key != "zabbix_server" else "LAB_ZABBIX_SERVER", result[key])
     for user, (key, secret) in result["keys"].items():
         if key == "json":   # GCP の registry はサービスアカウントの JSON キー（GCS ドライバ）
             env.set(render.GCS_REGISTRY_KEY_ENV, secret)
@@ -239,9 +253,11 @@ def _provision_vm(env: Env, pubkey: str) -> None:
         env.set("LAB_VM_PROXY_NODE", result["proxy"].id)
         vm.init_proxy(env, vm.load_infra(env))
     elif env.get("LAB_VM_PROXY_NODE") or env.get("LAB_EGRESS_PROXY_MAC"):
-        for key in ("LAB_VM_PROXY_NODE", "LAB_EGRESS_PROXY", "LAB_EGRESS_PROXY_MAC", "LAB_EGRESS_CA_FILE"):
+        for key in ("LAB_VM_PROXY_NODE", "LAB_EGRESS_PROXY", "LAB_EGRESS_PROXY_MAC", "LAB_EGRESS_CA_FILE",
+                    "LAB_VM_BASTION_HOST", "LAB_VM_BASTION_CIDR", "LAB_ZABBIX_SERVER"):
             env.set(key, "")
-    ok(f"基盤を .env に書きました（VM {len(result['nodes'])} 台、バケット {result['bucket']}、浮動 IP {result['entry_ip']}）")
+    ok(f"基盤を .env に書きました（VM {len(result['nodes'])} 台、バケット {result['bucket']}、入口（内部ロードバランサ）{result['entry_ip']}"
+       + (f"、踏み台 {result['bastion_host']}" if result.get("bastion_host") else "") + "）")
 
 
 def _cluster_vm(env: Env) -> None:
@@ -259,7 +275,9 @@ def _cluster_vm(env: Env) -> None:
     wait_until(300, "全ノードの Ready", kc("wait", "--for=condition=Ready", "nodes", "--all", "--timeout=5s"))
     kapply(files=[K8S / "traefik-config-vm.yaml"], namespaced=False)
     wait_until(300, "Traefik の起動", kc("-n", "kube-system", "rollout", "status", "deploy/traefik", "--timeout=5s"))
+    vm.ensure_https_forward(env, infra)   # 踏み台経由で入口（内部ロードバランサの 443）へ
     kapply(files=[K8S / "namespace.yaml"], namespaced=False)
+    kapply(files=[K8S / "network-policies.yaml"])   # DB と Valkey への接続元を絞る（変更設計書 2026-10-31 5.2 節）
     kapply(manifest=render.service_accounts_manifest())
     _egress_ca(env)
     _vm_registry(env)
@@ -268,7 +286,8 @@ def _cluster_vm(env: Env) -> None:
     kapply(manifest=secret_manifest("cloudflare-api-token", {"api-token": env.get("LAB_CLOUDFLARE_API_TOKEN")},
                                     namespace="cert-manager"), namespaced=False)
     kapply(manifest=render.vm_issuer_manifest(env), namespaced=False)
-    ok(f"クラスタの準備ができました（{env.target} の k3s 3 台、{env.vm_region}、入口の IP {infra.entry_ip}、LAB_INFRA={env.infra_mode}）")
+    ok(f"クラスタの準備ができました（{env.target} の k3s 3 台、{env.vm_region}、入口（内部ロードバランサ）{infra.entry_ip}、"
+       f"LAB_INFRA={env.infra_mode}）")
 
 
 def _egress_ca(env: Env) -> None:
@@ -709,16 +728,24 @@ def litellm(env: Env) -> None:
 
 
 def _ingress_vm(env: Env) -> None:
-    """HTTPS の入口: Let's Encrypt の証明書（退避があれば先に戻す）と、Traefik の経路を websecure に TLS 付きで写す。
-    ホスト名 → 浮動 IP の A レコードを Cloudflare に作り、引けるまで待つ（変更設計書 2026-10-30-VM環境の共通化とGCP追加 16 章）。"""
+    """HTTPS の入口: Let's Encrypt の証明書（本番のホスト名 ＋ Mac 用の別名。退避があれば先に戻す）、管理系の経路の送信元制限
+    （admin-only: 踏み台だけ）、Traefik の経路を websecure に TLS 付きで写す。A レコードは 2 本（ホスト名 → 内部ロードバランサの IP、
+    別名 → 127.0.0.1）を Cloudflare に作り、引けるまで待つ（変更設計書 2026-10-31 5.1 節・6 章）。"""
     infra = vm.load_infra(env)
     vm.restore_tls_secret()
     kapply(manifest=render.vm_certificate_manifest(env))
-    kapply(manifest=render.tls_ingressroutes((K8S / "ingress.yaml").read_text()))
+    admin = render.admin_only_manifest(env)
+    kapply(manifest=admin)
+    kapply(manifest=render.tls_ingressroutes((K8S / "ingress.yaml").read_text() + "\n---\n" + admin))
     vm.ensure_a_record(env, infra.entry_ip)
+    if env.local_hostname:
+        vm.ensure_a_record(env, "127.0.0.1", env.local_hostname)
     vm.wait_for_a_record(env, infra.entry_ip)
-    wait_until(900, f"Let's Encrypt の証明書（{env.hostname}）の発行",
+    if env.local_hostname:
+        vm.wait_for_a_record(env, "127.0.0.1", env.local_hostname)
+    wait_until(900, f"Let's Encrypt の証明書（{', '.join(render.vm_certificate_names(env))}）の発行",
                kn("wait", f"certificate/{render.VM_TLS_SECRET}", "--for=condition=Ready", "--timeout=5s"))
+    vm.ensure_https_forward(env, infra)
 
 
 def _ingress_aws(env: Env, out: dict, viewer: bool) -> None:
@@ -766,6 +793,8 @@ def audit(env: Env) -> None:
         values["CONFIG_HASH"] = short_hash(json.dumps(values, sort_keys=True) + json.dumps(
             render.audit_oidc_client(env)) + env.get("AUDIT_SESSION_SECRET"))
         viewer_manifest = render.add_egress_text(render_template(K8S / "audit-viewer.yaml", values), env)
+        if env.is_vm:
+            viewer_manifest = render.add_admin_middleware(viewer_manifest)   # 検索アプリは踏み台からだけ（変更設計書 2026-10-31 5.1 節）
         kapply(manifest=viewer_manifest)
         if env.is_vm:
             kapply(manifest=render.tls_ingressroutes(viewer_manifest))   # HTTPS の経路（web は 443 へ転送される）
@@ -778,6 +807,16 @@ def audit(env: Env) -> None:
                 run(kn("delete", "ingressroute/audit-viewer", "ingressroute/audit-viewer-tls", "--ignore-not-found"))
         warn("サインインの設定（Google の OAuth クライアントか LAB_AUDIT_OIDC_*）が無いので、検索アプリは入れません")
     ok("監査ログの段階が終わりました")
+
+
+def zabbix(env: Env) -> None:
+    """Zabbix による監視（VM の環境だけ。変更設計書 2026-10-31 7 章）。Mac と EKS では何もしない。"""
+    step("zabbix 監視（Zabbix）")
+    if not env.is_vm:
+        ok("Zabbix は VM の環境（aws-ec2 / gcp-vm）だけです")
+        return
+    from . import zabbix as zbx
+    zbx.setup(env)
 
 
 def migrate_db(image: dict, db_id: str | None = None) -> None:

@@ -29,6 +29,7 @@ def up() -> None:
     stages.datastores(env)
     stages.mcp(env)
     stages.litellm(env)
+    stages.zabbix(env)
     stages.bootstrap(env)
     stages.audit(env)
     stages.clients(env)
@@ -88,11 +89,14 @@ COMMANDS: dict[str, tuple[str, object]] = {
     "datastores": ("[段階] PostgreSQL と Redis（aws: Aurora と ElastiCache の確認）", stage(stages.datastores)),
     "mcp": ("[段階] 試験用の偽 LLM と google_workspace_mcp", stage(stages.mcp)),
     "litellm": ("[段階] プロキシ設定、LiteLLM（Helm）、入口", stage(stages.litellm)),
+    "zabbix": ("[段階] aws-ec2 / gcp-vm: Zabbix による監視（検証はサーバーも踏み台の VM に。ホストとテンプレートを API で登録）",
+               stage(stages.zabbix)),
     "bootstrap": ("[段階] 検証ユーザーと固定値のキー", stage(stages.bootstrap)),
     "audit": ("[段階] 監査ログの整形（CronJob）と検索アプリ", stage(stages.audit)),
     "clients": ("[段階] Claude Code と Codex の設定", stage(stages.clients)),
     # 手作業・保守
     "chatgpt-login": ("ChatGPT Plus にデバイスコードでログインする（手作業。初回だけ）", stage(stages.chatgpt_login)),
+    "forward": ("aws-ec2 / gcp-vm: SSH のポート転送（k3s の 6443、入口の 443、Zabbix の web）を確かめて張る", loaded),
     "upgrade": ("LiteLLM を別の版でローリング更新する（例: ./lab upgrade v1.104.3）", None),
     "upgrade-k8s": ("aws-ec2 / gcp-vm: k3s（Kubernetes）を 1 台ずつ上げる（例: ./lab upgrade-k8s v1.36.1+k3s1。マイナー版は 1 つずつ）", None),
     "clean-all": ("クラスタ、生成したクライアント設定、ビルドしたイメージを消す（.env とトークンは残す）", None),

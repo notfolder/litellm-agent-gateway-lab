@@ -25,19 +25,20 @@ PG_CLUSTER = "litellm-pg"
 SCENARIOS = ["pg-switchover", "pg-pod", "pg-node", "valkey-pod", "valkey-node"]
 # AWS（EKS 版）の場面（変更仕様書 2026-10-24-AWS構成 7.2 節）: LiteLLM のノードの drain、Aurora と ElastiCache のフェイルオーバー
 SCENARIOS_AWS = ["litellm-drain", "aurora-failover", "valkey-failover"]
-# EC2 3 台の場面（変更仕様書 2026-10-25-EC2三台構成 7.2 節）: Mac と同じ場面（ノードの停止は EC2 の停止）＋ Elastic IP を持つ台の停止
+# VM 3 台の場面: Mac と同じ場面（ノードの停止は VM の停止）＋ 入口（Traefik の Pod が載る台）の停止。内部ロードバランサが
+# その台を外し、Traefik が別の台に移るまで（変更仕様書 2026-10-31 R22。前は浮動 IP を持つ台の停止）
 SCENARIOS_VM = [*SCENARIOS, "entry-node"]
 SCENARIO_ALIASES = {"eip-node": "entry-node"}   # EC2 版の名前
 # 回復までの時間の合格の目安（秒）。ノードを止める場面は長め（変更仕様書 9.3 節）
 LIMITS = {"pg-switchover": 60, "pg-pod": 60, "pg-node": 120, "valkey-pod": 60, "valkey-node": 120,
-          "litellm-drain": 60, "aurora-failover": 90, "valkey-failover": 90, "entry-node": 30}
+          "litellm-drain": 60, "aurora-failover": 90, "valkey-failover": 90, "entry-node": 60}
 # 直結（比較用）のときだけ、PostgreSQL の primary の切り替えと Pod の削除は 90 秒にする。Pooler は切り替えの間の要求を
 # 待たせて吸収する（2026-10-12 の実測で、どちらも失敗 0 件）が、直結では新しい primary が立つまでの 15〜50 秒が
 # そのまま失敗になり、最後の失敗まで 54〜77 秒だった（変更仕様書 9.3 節の目安を、1 回目の結果を見て見直した）
 DIRECT_LIMITS = {"pg-switchover": 90, "pg-pod": 90}
-# GCP の VM 3 台: 浮動 IP の付け替えが Compute Engine のアクセス設定の削除と追加（2 往復、各 10〜30 秒）なので、入口の台を
-# 止める場面は 80〜150 秒かかる（2026-10-30 の実測）。目安を GCP だけ広げる（ユーザーの判断 2026-10-30: 2A）
-GCP_LIMITS = {"pg-node": 180, "valkey-node": 180, "entry-node": 120}
+# GCP の VM 3 台: 台を止める場面の目安を広げる（ユーザーの判断 2026-10-30: 2A）。入口の台は内部ロードバランサになり
+# 浮動 IP の付け替え（80〜150 秒）が無くなったので、entry-node は共通の目安（2026-10-31）
+GCP_LIMITS = {"pg-node": 180, "valkey-node": 180}
 NODE_DOWN_SECONDS = 120
 
 
@@ -72,7 +73,7 @@ class Load:
     env: Env
     rate: int = 20
     cleanup: object = None     # 場面の後片付け（AWS の drain の uncordon など）
-    eip_moved: bool = False    # entry-node の場面: 別の台が浮動 IP を持ったか
+    eip_moved: bool = False    # entry-node の場面: ロードバランサが止めた台を外し、戻った後に 3 台とも健全になったか
     samples: list[Sample] = field(default_factory=list)
     _stop: threading.Event = field(default_factory=threading.Event)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -282,18 +283,20 @@ def trigger(env: Env, scenario: str, load: Load) -> str:
         _stop_node(node, load, env)
         return f"Valkey の primary（{primary}）が載ったノード {node} を停止"
     if scenario == "entry-node":
-        # 入口（浮動 IP を持つ台）を止める。keepalived が別の台に付け替え、戻った台は奪い返さない（nopreempt）
+        # 入口（Traefik の Pod が載る台）を止める。内部ロードバランサがヘルスチェックでその台を外し、Traefik は別の台に移る
         from . import clouds, vm
         cloud = clouds.for_env(env)
         infra = vm.load_infra(env)
-        holder = cloud.entry_ip_holder(env, infra)
-        if not holder:
-            raise LabError("浮動 IP がどの VM にも付いていません（keepalived を確かめてください）")
-        node = vm.k8s_name_for_node(infra.node(holder))
+        traefik = vm.traefik_nodes()
+        if not traefik:
+            raise LabError("Traefik の Pod が見つかりません")
+        node = traefik[0]
+        target = vm.node_for_k8s_name(infra, node)
         _stop_node(node, load, env)
-        after = cloud.entry_ip_holder(env, infra)
-        load.eip_moved = after not in (None, holder)
-        return f"浮動 IP を持つノード {node}（{holder}）を停止（戻った後の持ち主: {after}）"
+        health = cloud.lb_targets_healthy(env, infra)
+        load.eip_moved = bool(health) and all(health.values())
+        return (f"Traefik の載ったノード {node}（{target.id}）を停止（戻った後のロードバランサの健全性: "
+                f"{sum(health.values())}/{len(health)} 台）")
     raise LabError(f"知らない場面です: {scenario}")
 
 
@@ -350,7 +353,7 @@ def run_scenario(env: Env, scenario: str) -> dict:
     result["passed"] = (recovery <= limit and not repeated and result["valkey_masters"] == 1
                         and baseline_fail == 0)
     if scenario == "entry-node":
-        # 別の台が浮動 IP を持ち、戻った台が奪い返していないこと（trigger が確かめた値）
+        # 止めた台が戻ったあと、ロードバランサが 3 台とも健全と見ていること（trigger が確かめた値）
         result["eip_moved"] = bool(getattr(load, "eip_moved", False))
         result["passed"] = result["passed"] and result["eip_moved"]
     (ok if result["passed"] else warn)(
