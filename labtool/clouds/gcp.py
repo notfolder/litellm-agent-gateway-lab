@@ -54,13 +54,30 @@ def _sa_email(env: Env, account_id: str) -> str:
     return f"{account_id}@{env.gcp_project}.iam.gserviceaccount.com"
 
 
+def assign_zones(available: list[str], count: int = NODE_COUNT) -> list[str]:
+    """台 1〜count をゾーンに割り振る。使えるゾーンが台数より少なければ順に繰り返す（東京の C4A は b と c の 2 つ。配備で判明）。"""
+    if not available:
+        raise LabError("使えるゾーンがありません")
+    return [available[i % len(available)] for i in range(count)]
+
+
 def _zones(env: Env) -> list[str]:
+    """リージョンの UP なゾーンのうち、LAB_GCP_MACHINE_TYPE が置けるゾーンを名前順に拾い、台に割り振る。"""
     compute = _compute()
+    from google.api_core import exceptions as gexc
     zones = sorted(z.name for z in compute.ZonesClient().list(project=env.gcp_project)
                    if z.region.rsplit("/", 1)[-1] == env.gcp_region and z.status == "UP")
-    if len(zones) < NODE_COUNT:
-        raise LabError(f"{env.gcp_region} に使えるゾーンが {len(zones)} つしかありません（{NODE_COUNT} つ要ります）")
-    return zones[:NODE_COUNT]
+    mt = compute.MachineTypesClient()
+    usable = []
+    for zone in zones:
+        with contextlib.suppress(gexc.NotFound):
+            mt.get(project=env.gcp_project, zone=zone, machine_type=env.gcp_machine_type)
+            usable.append(zone)
+    if not usable:
+        raise LabError(f"{env.gcp_region} に {env.gcp_machine_type} を置けるゾーンがありません（ゾーン: {', '.join(zones) or '無し'}）")
+    if len(usable) < NODE_COUNT:
+        warn(f"{env.gcp_machine_type} が使えるゾーンは {', '.join(usable)} の {len(usable)} つなので、{NODE_COUNT} 台を繰り返して割り振ります")
+    return assign_zones(usable)
 
 
 # ---- 操作者、名前 ----

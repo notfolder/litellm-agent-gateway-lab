@@ -731,6 +731,17 @@ class CloudLayerTest(unittest.TestCase):
     """クラウド固有層（labtool/clouds/）: 2 つの実装が同じ関数の組を持つこと、ネットワークの計画、VM の初期化の描画
     （変更設計書 3 章〜6 章）。クラウドの API は呼ばない。"""
 
+    def test_gcp_zone_assignment(self):
+        """GCP のゾーンの割り振り: 3 つあれば 1 台ずつ、2 つしかなければ繰り返す（東京の C4A は b と c だけ。2026-10-30 に判明）、無ければ止まる。"""
+        from labtool.clouds import gcp
+        from labtool.core import LabError
+        self.assertEqual(gcp.assign_zones(["asia-northeast1-a", "asia-northeast1-b", "asia-northeast1-c"]),
+                         ["asia-northeast1-a", "asia-northeast1-b", "asia-northeast1-c"])
+        self.assertEqual(gcp.assign_zones(["asia-northeast1-b", "asia-northeast1-c"]),
+                         ["asia-northeast1-b", "asia-northeast1-c", "asia-northeast1-b"])
+        with self.assertRaises(LabError):
+            gcp.assign_zones([])
+
     def infra(self, target):
         from labtool import clouds
         plan = clouds.network_plan("10.60.0.0/16", subnets_per_node=(target == "aws-ec2"))
