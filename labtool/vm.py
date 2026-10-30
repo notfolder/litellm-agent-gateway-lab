@@ -555,7 +555,9 @@ def uninstall(env: Env, infra: Infra) -> None:
     script = ("set +e; /usr/local/bin/k3s-uninstall.sh >/dev/null 2>&1; systemctl disable --now keepalived lab-egress >/dev/null 2>&1; "
               "rm -f /var/lib/lab/ready /var/lib/lab/hooks.sh /etc/keepalived/keepalived.conf; echo uninstalled")
     for node in infra.nodes:
-        if node.public_ip and _port_open(node.public_ip, 22):
+        # 前の台の k3s を外すと keepalived が浮動 IP を次の台に移し、その台の公開 IP が入れ替わる（GCP）。台ごとに引き直す
+        refresh_public_ips(env, infra)
+        if node.public_ip and _port_open(node.public_ip, 22) and _ssh_ok(env, node):
             run_on(env, node, script, timeout=600)
             info(f"{node.id} の k3s を外しました")
         else:

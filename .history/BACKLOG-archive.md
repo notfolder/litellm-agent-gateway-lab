@@ -38,4 +38,4 @@
 - [x] (2026-10-30) 変更仕様書（EC2 版）の「13. 前提」の 2 つ（浮動 IP は `./lab down` で消すのが既定、保持と SSO は EKS 版と同じ）は、VM 共通化の仕様書の 4 回目の回答（1A）で確定し決定事項に移した
 - [-] (2026-10-30) EC2 版の配備と試験の項目（2026-10-25） — 基盤が CloudFormation から API の直接呼び出しに変わったので、「`aws-ec2` の配備と試験（EC2 の vCPU 上限の解除後）」の項目に統合
 - [-] (2026-10-30) EC2 版の文書の反映の項目（2026-10-25） — 「配備と試験の後の文書の反映（VM 2 クラウド）」の項目に統合（k3s 版上げの `docs/maintenance.md` も含める）
-
+- [x] (2026-10-31) 配備と試験の後の文書の反映: `docs/spec.md`・`docs/design.md`・`docs/maintenance.md` に VM 2 クラウドの構成（入口の送信元の制限、A レコードの自動化、整形のメモリ、GCS の違い）と k3s の版上げ（`.history/2026-10-26-k3s版上げ/`）を反映し、`docs/ec2_architecture.md` を VM 2 クラウドの構成図に書き直す（変更設計書 15 章）（追加 2026-10-30、重要 中） → docs/spec.md 12 章、docs/design.md 21 章、docs/maintenance.md 5 章、docs/vm_architecture.md

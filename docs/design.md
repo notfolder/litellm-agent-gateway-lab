@@ -1492,6 +1492,18 @@ hooks の関数: `lab_install_tools`、`lab_self_id`、`lab_take_entry_ip`、`la
 
 spec 12.2 節。静的キーの権限は 21.5 節の表。GCS は「均一なバケットレベルのアクセス」を有効にする（IAM の条件に必須）。registry 3.0 の S3 ドライバは ACL を付けて均一のバケットに書けないので、GCP の registry はサービスアカウントの JSON キーで GCS ドライバを使う（`LAB_VM_GCS_REGISTRY_KEY_JSON`）。
 
-### 21.10 配備と試験の結果
+### 21.10 配備と試験の結果（GCP、2026-10-31）
 
-（GCP での配備と試験の後に書く。AWS は EC2 の vCPU 上限で配備できていない）
+`LAB_TARGET=gcp-vm`、managed で中継の VM を作り（`LAB_EGRESS_PROXY_VM=true`）、3 台の直接の外向きを遮断し、Mac も中継経由。AWS は EC2 の vCPU 上限で未配備。詳細と手戻りは `.history/2026-10-30-既存資源からの構築と出口プロキシ/変更設計書.md` 14 章。
+
+| 試験 | 結果 |
+|---|---|
+| `./lab up`（managed） | 14 回目で全段階を通過（手戻り 13 件: GCS の均一アクセスと IAM の条件、SA 直後の 404、削除済みロール、SSH の banner、mitmproxy 10 の証明書、Mac の CA、公開 IP の問い合わせ、ホスト鍵、転送の順、tar の形式、registry の OOM、ビルドへの中継、GCS の保持ヘッダ、操作者の IAM）。最後の 1 回は約 15 分 |
+| 外向きの遮断 | 台からの直接の HTTPS はタイムアウト、中継経由は通る。中継の記録に、バケット・Google の API・イメージの置き場・apt・pip・Let's Encrypt・Cloudflare・k3s・Helm のチャートの全部が現れた |
+| `./lab up`（provided に切り替え） | 何も作らず全段階を 89 秒で通過 |
+| `test-smoke` | 75 件すべて OK |
+| `test-idempotency` | 62 項目を比較して 2 回目で変化なし（142 秒） |
+| `test-audit` | 32 件中 31 件 OK（NG は Gmail 未サインインの「MCP の記録」）。原本と閲覧記録はどの資格情報でも消せない（オブジェクト単位の保持） |
+| `test-failover` | pg-switchover 0 / pg-pod 0 / pg-node 111.9 秒 / valkey-pod 0 / valkey-node 0 は目安の中。**entry-node は 227.2 秒と 139.7 秒で目安（120 秒）を超えた**（中継なしの前回は 76.8 / 87.5 秒）。監査ログの欠けは 0〜27 件（上限 240） |
+| VM 上のビルド | LiteLLM と監査アプリのイメージを node1（arm64）の Docker でビルドして push（Mac の Docker 無し） |
+| 片付け | provided の `./lab down`: 3 台の k3s を外し、保持の無いディレクトリの 468 版を消した（VM・バケット・浮動 IP は残る）。managed の `./lab down`: バケット（保持を外して 804 版）、サービスアカウント、VM 4 台、カスタムロール、ファイアウォール、ネットワーク、静的 IP がすべて消え、API での確認で有料の物は残っていない |

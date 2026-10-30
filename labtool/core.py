@@ -364,6 +364,13 @@ class Env:
         """managed で 4 台目の VM に中継（mitmproxy、独自 CA）を作り、3 台の直接の外向き通信を遮断するか。"""
         return self.get("LAB_EGRESS_PROXY_VM", "false").lower() == "true"
 
+    def drop_mac_proxy(self) -> None:
+        """このプロセスの中継の設定を外す（managed の down で中継の VM を消す前に呼ぶ。消した後のクラウドの API が届かなくなるため）。"""
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy", "REQUESTS_CA_BUNDLE",
+                     "SSL_CERT_FILE", "AWS_CA_BUNDLE", "CURL_CA_BUNDLE", "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "NODE_EXTRA_CA_CERTS"):
+            os.environ.pop(name, None)
+        HELM_EXTRA.clear()
+
     def apply_mac_proxy(self) -> None:
         """LAB_EGRESS_PROXY_MAC があれば、このプロセスと子プロセス（helm、kubectl）の環境変数に中継と CA を入れる。
         kubectl（127.0.0.1 の転送）と ssh は中継を通らない。Go の道具（helm）は macOS で SSL_CERT_FILE を読まないので、
@@ -395,10 +402,7 @@ class Env:
                                "LAB_EGRESS_PROXY_MAC と LAB_EGRESS_CA_FILE を確かめてください") from e
             warn(f"Mac から中継 {proxy} を通せないので、この実行は中継を使いません（中継の VM を作り直すと CA を取り直すまで合わない。"
                  f"{type(e).__name__}）")
-            for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy", "REQUESTS_CA_BUNDLE",
-                         "SSL_CERT_FILE", "AWS_CA_BUNDLE", "CURL_CA_BUNDLE", "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "NODE_EXTRA_CA_CERTS"):
-                os.environ.pop(name, None)
-            HELM_EXTRA.clear()
+            self.drop_mac_proxy()
 
     @property
     def litellm_version(self) -> str:

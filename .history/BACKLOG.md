@@ -45,13 +45,16 @@
 - [ ] 配備の後、AWS の試験の結果と費用の実測を変更設計書に書き足し、変更仕様書 12 章・変更設計書 12 章の表に従って `docs/spec.md` と `docs/design.md` に反映する（追加 2026-10-24、重要 中）
 
 ## VM 3 台構成（`LAB_TARGET=aws-ec2` / `gcp-vm`）
-概要: .history/2026-10-30-2220-GCP配備と試験/summary.md（ブランチ `feature/aws-ec2-pair`。ワークツリー `~/orca/workspaces/litellm-agent-gateway-lab/feature-aws-target-2`）
+概要: .history/2026-10-30-既存資源からの構築と出口プロキシ/変更設計書.md 14 章（ブランチ `feature/aws-ec2-pair`。ワークツリー `~/orca/workspaces/litellm-agent-gateway-lab/feature-aws-target-2`）
 
 - [ ] k3s の版上げの試験（`.history/2026-10-26-k3s版上げ/変更仕様書.md` 4 章）: 配備と障害の試験の後に `./lab upgrade-k8s <次のマイナー版> --measure`、パッチの更新、飛ばす・下げる指示、途中で止めて再実行、上げた後の `./lab up`（`K3S_IMAGE` の案内）、1 台の作り直し、AMI の固定の確認（nodes スタックに差分が出ない）。配備で確かめることは変更設計書 6 章（`config.yaml` の `server:` が再起動で無視されるか、drain の時間、`K3S_TOKEN` が消えても server が起きるか、Traefik の値の形、Elastic IP の移動）（追加 2026-10-26、重要 高）
-- [ ] AMI を新しくする手順（1 台ずつ作り直す）。`resolve_ami` が配備済みの AMI を固定で返すので、放っておくと AMI が古くなる。案: `./lab upgrade-ami` で nodes スタックの `AmiId` を更新しつつ、台ごとに drain → インスタンスの作り直し（CloudFormation の 3 台を別々の論理 ID にしてあるので、1 台ずつ `Replace` する手立てが要る）（追加 2026-10-26、重要 低）
+- [ ] AMI を新しくする手順（1 台ずつ作り直す）。`resolve_ami` が配備済みの AMI を固定で返すので、放っておくと AMI が古くなる。案: `./lab upgrade-ami` で台ごとに drain → `recreate_node`（managed）→ SSH で初期化（CloudFormation の 3 台を別々の論理 ID にしてあるので、1 台ずつ `Replace` する手立てが要る）（追加 2026-10-26、重要 低）
 - [ ] 審査官を Claude Haiku 4.5 にしたときの事例試験の不一致 14 事例（社内宛てを止める、設定ファイルを求めない）を見て、審査官の指示文を詰めるか期待値を見直す（`tests/review-scenarios/`。`./lab test-judge` の記録）（追加 2026-10-30、重要 低）
-- [ ] `aws-ec2` の配備と試験（EC2 の vCPU 上限の解除後）。GCP で直した共通部分（公開 IP の引き直し、known_hosts の識別子、冪等性、監査の試験の入口）は AWS でも効くが、AWS 固有（awscli の snap、netplan の 2 つ目の IP、Elastic IP）は未確認（追加 2026-10-30、重要 高）
-- [ ] 配備と試験の後の文書の反映: `docs/spec.md`・`docs/design.md`・`docs/maintenance.md` に VM 2 クラウドの構成（入口の送信元の制限、A レコードの自動化、整形のメモリ、GCS の違い）と k3s の版上げ（`.history/2026-10-26-k3s版上げ/`）を反映し、`docs/ec2_architecture.md` を VM 2 クラウドの構成図に書き直す（変更設計書 15 章）（追加 2026-10-30、重要 中）
+- [ ] `aws-ec2` の配備と試験（EC2 の vCPU 上限の解除後）。2026-10-31 の変更（provision/setup の分離、1 バケットの Object Lock と IAM の接頭辞のポリシー、キーペアの取り込み、中継の VM とセキュリティグループの egress、S3 ドライバの registry）も AWS では未確認。GCP で直した共通部分（公開 IP の引き直し、known_hosts の識別子、冪等性、監査の試験の入口）は AWS でも効くが、AWS 固有（awscli の snap、netplan の 2 つ目の IP、Elastic IP）は未確認（追加 2026-10-30、重要 高）
+- [ ] 既存資源（`LAB_INFRA=provided`）を本物の「用意する側が作った物」で試す（今回は managed が作った物を provided として読み直しただけ。用意する側への前提 spec 12.2 の文書どおりに人が作って `./lab up` が通るか。GCP の registry の JSON キーの受け渡しも）（追加 2026-10-31、重要 中）
+- [ ] `./lab down --all`（provided の全削除）の実機確認（今回は managed の `./lab down` で全部消した。保持（Unlocked）を外してバケットを消す経路は未確認）（追加 2026-10-31、重要 中）
+- [ ] Zscaler の実物での確認: 明示プロキシの URL と CA を `.env` に入れて `./lab up` が通るか（検証は mitmproxy。Zscaler 固有の挙動（SNI の検査、特定の宛先の除外、認証付きのプロキシ）は未確認）（追加 2026-10-31、重要 中）
+- [ ] 検証を amd64 の VM でも流す（今回は arm64 だけ。ビルドは VM 上なのでアーキテクチャの違いは `uname -m` の判別だけだが、`google_workspace_mcp` の amd64 のイメージの有無は未確認）（追加 2026-10-31、重要 低）
 
 ## 冗長化と監査ログ
 概要: .history/2026-10-12-0741-検証環境の構築と冗長化・監査ログ/summary.md

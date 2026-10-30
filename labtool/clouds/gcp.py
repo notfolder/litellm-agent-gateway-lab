@@ -113,8 +113,22 @@ def identity(env: Env) -> dict:
     except gauth_exc.DefaultCredentialsError as e:
         raise LabError("GCP の資格情報（ADC）がありません。gcloud auth application-default login を実行してください"
                        "（gcloud が Python の版で起動しないなら CLOUDSDK_PYTHON=/opt/homebrew/bin/python3 を前に付ける）") from e
-    principal = getattr(creds, "service_account_email", None) or getattr(creds, "_account", None) or "(ADC)"
-    return {"account": env.gcp_project, "principal": principal, "region": env.gcp_region,
+    principal = getattr(creds, "service_account_email", None) or getattr(creds, "_account", None) or ""
+    if not principal:
+        # 利用者の ADC は主体のメールを持たないので、tokeninfo で引く（バケットの IAM に操作者を足すため。2026-10-31。
+        # userinfo は serviceusage の権限を求めて 403 になることがある）
+        try:
+            import urllib.parse
+            import urllib.request
+            from google.auth.transport.requests import Request
+            if not creds.valid:
+                creds.refresh(Request())
+            url = "https://oauth2.googleapis.com/tokeninfo?" + urllib.parse.urlencode({"access_token": creds.token})
+            with urllib.request.urlopen(url, timeout=15) as r:
+                principal = json.load(r).get("email", "")
+        except Exception:  # noqa: BLE001 分からなければ空のまま
+            principal = ""
+    return {"account": env.gcp_project, "principal": principal or "(ADC)", "region": env.gcp_region,
             "adc_project": project or ""}
 
 
@@ -435,10 +449,8 @@ def _set_bucket_iam(env: Env, bucket_name: str, entries: list[dict]) -> None:
     managed = {f"serviceAccount:{_sa_email(env, f'{env.vm_prefix}-{u}')}" for u in [*STATIC_KEY_USERS, OPERATOR_USER]}
     # 操作者の ADC の主体（./lab が Cloud Storage のクライアントで消す・読むため。均一アクセスのバケットでは project の
     # legacy の権限ではオブジェクトに触れない。配備で判明 2026-10-31）
-    principal = identity(env)["principal"]
-    adc_member = None
-    if "@" in principal:
-        adc_member = ("serviceAccount:" if principal.endswith("gserviceaccount.com") else "user:") + principal
+    adc_member = _adc_member(env)
+    if adc_member:
         managed.add(adc_member)
     keep = [b for b in policy.bindings if not (set(b["members"]) & managed)]
     # 同じロール・同じ条件の利用者は 1 つのバインディングにまとめる（GCS は保存時にまとめるので、分けたままだと毎回「違う」になる）
@@ -757,11 +769,34 @@ def _delete_chunk(bucket, blobs: list, remove_retention: bool) -> int:
     return len(blobs)
 
 
+def _adc_member(env: Env) -> str | None:
+    principal = identity(env)["principal"]
+    if "@" not in principal:
+        return None
+    return ("serviceAccount:" if principal.endswith("gserviceaccount.com") else "user:") + principal
+
+
+def _grant_operator(env: Env, bucket) -> None:
+    """操作者の ADC の主体にバケットの objectAdmin を付ける（消すときに保持を外す・版を消すため。provision の IAM と同じ）。"""
+    member = _adc_member(env)
+    if member is None:
+        return
+    policy = bucket.get_iam_policy(requested_policy_version=3)
+    policy.version = 3
+    if any(b["role"] == "roles/storage.objectAdmin" and not b.get("condition") and member in b["members"] for b in policy.bindings):
+        return
+    policy.bindings.append({"role": "roles/storage.objectAdmin", "members": {member}})
+    bucket.set_iam_policy(policy)
+    info(f"バケット {bucket.name} に操作者 {member} の objectAdmin を付けました")
+    time.sleep(10)   # IAM の反映待ち
+
+
 def _delete_bucket(env: Env, name: str) -> None:
     client = _storage(env)
     bucket = client.lookup_bucket(name)
     if bucket is None:
         return
+    _grant_operator(env, bucket)
     n = empty_bucket(env, name, remove_retention=True)
     try:
         bucket.delete()

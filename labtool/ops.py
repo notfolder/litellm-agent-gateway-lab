@@ -59,6 +59,8 @@ def down(everything: bool = False) -> None:
                 ok(f"{env.target} の k3s を外し、バケットの保持の無いディレクトリを空にしました（VM、バケット、浮動 IP、静的キーは残る。"
                    "全部消すなら ./lab down --all）")
         else:
+            if env.egress_proxy_vm:
+                env.drop_mac_proxy()   # 中継の VM も消すので、消した後の API が中継越しだと届かない（2026-10-31）
             cloud.destroy(env, keep_entry_ip=env.vm_keep_entry_ip)
             for key in vm.PROVISIONED_ENV_KEYS:
                 if env.get(key):
