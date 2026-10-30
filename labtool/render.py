@@ -877,6 +877,10 @@ def vm_registry_manifest(env: Env, bucket: str, node_port: int) -> str:
         {"name": "REGISTRY_STORAGE_DELETE_ENABLED", "value": "true"},
         {"name": "REGISTRY_HTTP_ADDR", "value": ":5000"},
     ]
+    if env.is_gcp_vm:
+        # GCS の XML API は UploadPartCopy を実装していない（配備で判明 2026-10-30、設計書 16 章）。registry は 32 MB を超える
+        # 層を blobs/ へ移すときにマルチパートのコピーを使うので、しきい値を上限（5 GiB）にして 1 回の CopyObject にする
+        env_vars.append({"name": "REGISTRY_STORAGE_S3_MULTIPARTCOPYTHRESHOLDSIZE", "value": str(5 * 1024 ** 3)})
     secret_ref = [{"secretRef": {"name": VM_REGISTRY_NAME}}]
     docs = [
         {"apiVersion": "v1", "kind": "Service",
