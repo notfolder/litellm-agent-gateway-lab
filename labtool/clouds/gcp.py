@@ -85,6 +85,12 @@ def _zones(env: Env) -> list[str]:
     return assign_zones(usable)
 
 
+def _NotFound():
+    """存在確認で捕まえる例外（google.api_core の NotFound）。他の例外（呼び方の誤り、権限）は隠さず止める。"""
+    from google.api_core import exceptions as gexc
+    return gexc.NotFound
+
+
 # ---- 操作者、名前 ----
 def identity(env: Env) -> dict:
     import google.auth
@@ -149,7 +155,7 @@ def ensure_network(env: Env) -> dict:
     nets = compute.NetworksClient()
     try:
         network = nets.get(project=project, network=names["network"])
-    except Exception:  # noqa: BLE001 無いネットワーク
+    except _NotFound():
         nets.insert(project=project, network_resource=compute.Network(
             name=names["network"], auto_create_subnetworks=False)).result()
         network = nets.get(project=project, network=names["network"])
@@ -157,7 +163,7 @@ def ensure_network(env: Env) -> dict:
     subnets = compute.SubnetworksClient()
     try:
         subnet = subnets.get(project=project, region=env.gcp_region, subnetwork=names["subnet"])
-    except Exception:  # noqa: BLE001
+    except _NotFound():
         subnets.insert(project=project, region=env.gcp_region, subnetwork_resource=compute.Subnetwork(
             name=names["subnet"], network=network.self_link, ip_cidr_range=plan["subnets"][0],
             private_ip_google_access=True)).result()
@@ -194,7 +200,7 @@ def allow_ssh_from(env: Env, cidr: str) -> None:
     name = _names(env)["fw_ssh"]
     try:
         fw = fws.get(project=env.gcp_project, firewall=name)
-    except Exception:  # noqa: BLE001 まだ無い
+    except _NotFound():
         return
     if list(fw.source_ranges) == [cidr]:
         return
@@ -209,7 +215,7 @@ def ensure_entry_ip(env: Env) -> tuple[str, str]:
     name = _names(env)["address"]
     try:
         addr = addrs.get(project=env.gcp_project, region=env.gcp_region, address=name)
-    except Exception:  # noqa: BLE001
+    except _NotFound():
         addrs.insert(project=env.gcp_project, region=env.gcp_region, address_resource=compute.Address(
             name=name, address_type="EXTERNAL", network_tier="PREMIUM",
             labels={LABEL_KEY: env.vm_prefix})).result()
@@ -345,7 +351,7 @@ def _ensure_service_account(env: Env, account_id: str, display: str) -> str:
     email = _sa_email(env, account_id)
     try:
         client.get_service_account(name=f"projects/{env.gcp_project}/serviceAccounts/{email}")
-    except Exception:  # noqa: BLE001 無い
+    except _NotFound():
         client.create_service_account(request={"name": f"projects/{env.gcp_project}", "account_id": account_id,
                                                "service_account": {"display_name": display}})
         info(f"サービスアカウント {email} を作りました")
@@ -420,12 +426,12 @@ def _ensure_node_identity(env: Env, prefix: str) -> str:
     iam = iam_admin_v1.IAMClient()
     role_name = f"projects/{env.gcp_project}/roles/{names['node_role']}"
     try:
-        role = iam.get_role(name=role_name)
+        role = iam.get_role(request={"name": role_name})
         if sorted(role.included_permissions) != sorted(NODE_PERMISSIONS):
             role.included_permissions = NODE_PERMISSIONS
             iam.update_role(request={"name": role_name, "role": role})
             info(f"カスタムロール {names['node_role']} を更新しました")
-    except Exception:  # noqa: BLE001 無い
+    except _NotFound():
         iam.create_role(request={"parent": f"projects/{env.gcp_project}", "role_id": names["node_role"],
                                  "role": {"title": "litellm-lab node", "included_permissions": NODE_PERMISSIONS,
                                           "stage": "GA"}})
@@ -546,9 +552,9 @@ def discover(env: Env) -> Infra | None:
     names = _names(env)
     project = env.gcp_project
     network = subnet = addr = None
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(_NotFound()):
         network = compute.NetworksClient().get(project=project, network=names["network"])
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(_NotFound()):
         addr = compute.AddressesClient().get(project=project, region=env.gcp_region, address=names["address"])
     if network is None and addr is None:
         return None
@@ -558,7 +564,7 @@ def discover(env: Env) -> Infra | None:
                   buckets={logical: prefix + logical for logical in bucket_specs(env)})
     if network is not None:
         infra.network_id = network.self_link
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(_NotFound()):
             subnet = compute.SubnetworksClient().get(project=project, region=env.gcp_region, subnetwork=names["subnet"])
         infra.extra["network"] = {"network": network.self_link, "subnet": subnet.self_link if subnet else "",
                                   "plan": network_plan(env.vm_cidr, subnets_per_node=False), "zones": _zones(env),
@@ -624,13 +630,13 @@ def destroy(env: Env, keep_entry_ip: bool) -> None:
     iam = iam_admin_v1.IAMClient()
     for user in [*STATIC_KEY_USERS, OPERATOR_USER, "node"]:
         email = _sa_email(env, f"{env.vm_prefix}-{user}")
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(_NotFound()):
             for meta in client.list_hmac_keys(service_account_email=email):
                 if meta.state == "ACTIVE":
                     meta.state = "INACTIVE"
                     meta.update()
                 meta.delete()
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(_NotFound()):
             iam.delete_service_account(name=f"projects/{project}/serviceAccounts/{email}")
             info(f"サービスアカウント {email} を消しました")
     instances = compute.InstancesClient()
@@ -642,15 +648,15 @@ def destroy(env: Env, keep_entry_ip: bool) -> None:
         op.result()
     if ops:
         info(f"Compute Engine {len(ops)} 台を消しました")
-    with contextlib.suppress(Exception):
-        iam.delete_role(name=f"projects/{project}/roles/{names['node_role']}")
+    with contextlib.suppress(_NotFound()):
+        iam.delete_role(request={"name": f"projects/{project}/roles/{names['node_role']}"})
     fws = compute.FirewallsClient()
     for fw in (names["fw_web"], names["fw_internal"], names["fw_ssh"]):
-        with contextlib.suppress(Exception):
+        with contextlib.suppress(_NotFound()):
             fws.delete(project=project, firewall=fw).result()
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(_NotFound()):
         compute.SubnetworksClient().delete(project=project, region=env.gcp_region, subnetwork=names["subnet"]).result()
-    with contextlib.suppress(Exception):
+    with contextlib.suppress(_NotFound()):
         compute.NetworksClient().delete(project=project, network=names["network"]).result()
         info(f"VPC ネットワーク {names['network']} を消しました")
     if infra.entry_ip_id:
