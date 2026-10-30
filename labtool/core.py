@@ -127,6 +127,13 @@ class Env:
             raise LabError(f"LAB_TARGET は {' / '.join(TARGETS)} のどれかです（{env.target}）")
         # kubectl / helm が向くクラスタを環境に合わせる（変更仕様書 2026-10-24-AWS構成 2.3 節）
         set_kube_context({"aws": AWS_KUBE_CONTEXT, **VM_KUBE_CONTEXTS}.get(env.target, f"k3d-{CLUSTER}"))
+        if env.is_vm:
+            from . import vm   # 循環参照を避けて関数の中で読む
+            vm.drop_env_static_keys(env)   # .env の静的キー（Mac の RustFS 用）は VM の環境では読まない
+            try:
+                vm.ensure_bucket_prefix(env)   # バケット名の接頭辞。試験など preflight を通らない入口でも要る（2026-10-30）
+            except Exception:  # noqa: BLE001 資格情報が無いときは preflight が知らせる
+                pass
         # 設定は .env だけから読む。コマンドの前に付けた値は効かないので、食い違えば知らせる
         shell = os.environ.get("LAB_NOREVIEW_KEYS", "").strip()
         if shell and shell.lower() != env.get("LAB_NOREVIEW_KEYS", "false").lower():
