@@ -682,6 +682,12 @@ class VmTargetTest(unittest.TestCase):
         self.assertEqual(failover.scenarios_for(env()), failover.SCENARIOS)
         self.assertEqual(failover.scenarios_for(env(LAB_TARGET="aws", LAB_AWS_HOSTNAME="x")), failover.SCENARIOS_AWS)
         self.assertEqual(failover.LIMITS["entry-node"], 30)
+        # GCP だけ、台を止める場面の目安を広げる（浮動 IP の付け替えが遅い。2026-10-30 の判断 2A）
+        gcp = VmTargetTest().vm("gcp-vm")
+        self.assertEqual((failover.limit_for(gcp, "entry-node"), failover.limit_for(gcp, "pg-node"), failover.limit_for(gcp, "pg-pod")),
+                         (120, 180, 60))
+        ec2 = VmTargetTest().vm("aws-ec2")
+        self.assertEqual((failover.limit_for(ec2, "entry-node"), failover.limit_for(ec2, "pg-node")), (30, 120))
         self.assertEqual(failover.SCENARIO_ALIASES["eip-node"], "entry-node")   # EC2 版の名前も受ける
 
     def test_k3s_version_rules(self):

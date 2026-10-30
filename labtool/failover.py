@@ -35,7 +35,20 @@ LIMITS = {"pg-switchover": 60, "pg-pod": 60, "pg-node": 120, "valkey-pod": 60, "
 # 待たせて吸収する（2026-10-12 の実測で、どちらも失敗 0 件）が、直結では新しい primary が立つまでの 15〜50 秒が
 # そのまま失敗になり、最後の失敗まで 54〜77 秒だった（変更仕様書 9.3 節の目安を、1 回目の結果を見て見直した）
 DIRECT_LIMITS = {"pg-switchover": 90, "pg-pod": 90}
+# GCP の VM 3 台: 浮動 IP の付け替えが Compute Engine のアクセス設定の削除と追加（2 往復、各 10〜30 秒）なので、入口の台を
+# 止める場面は 80〜150 秒かかる（2026-10-30 の実測）。目安を GCP だけ広げる（ユーザーの判断 2026-10-30: 2A）
+GCP_LIMITS = {"pg-node": 180, "valkey-node": 180, "entry-node": 120}
 NODE_DOWN_SECONDS = 120
+
+
+def limit_for(env: Env, scenario: str) -> int:
+    """場面ごとの回復までの目安（秒）。直結（比較用）は PostgreSQL の 2 場面を 90 秒に、GCP の VM は台を止める場面を広げる。"""
+    limit = LIMITS[scenario]
+    if env.get("LAB_DB_POOLER", "pooler") == "direct" and not env.is_aws:
+        limit = DIRECT_LIMITS.get(scenario, limit)
+    if env.is_gcp_vm:
+        limit = GCP_LIMITS.get(scenario, limit)
+    return limit
 
 
 def cnpg(*args: str) -> list[str]:
@@ -332,8 +345,7 @@ def run_scenario(env: Env, scenario: str) -> dict:
         "call_ids": [s.call_id for s in samples if s.status == 200 and s.call_id],
         "t0": t0,
     }
-    limit = (DIRECT_LIMITS.get(scenario, LIMITS[scenario]) if env.get("LAB_DB_POOLER", "pooler") == "direct"
-             and not env.is_aws else LIMITS[scenario])
+    limit = limit_for(env, scenario)
     result["limit_seconds"] = limit
     result["passed"] = (recovery <= limit and not repeated and result["valkey_masters"] == 1
                         and baseline_fail == 0)
