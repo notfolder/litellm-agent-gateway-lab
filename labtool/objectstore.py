@@ -243,11 +243,11 @@ def self_check(env: Env, admin_client, user_client) -> None:
     （Mac は RustFS、aws-ec2 は IAM ユーザー。両環境で同じ検査）。"""
     from botocore.exceptions import ClientError
 
-    def denied(fn) -> bool:
+    def denied(fn, codes=("AccessDenied",)) -> bool:
         try:
             fn()
         except ClientError as e:
-            return e.response.get("Error", {}).get("Code") == "AccessDenied"
+            return e.response.get("Error", {}).get("Code") in codes
         return False
 
     raw = render.bucket_name(env, render.AUDIT_RAW)
@@ -261,8 +261,10 @@ def self_check(env: Env, admin_client, user_client) -> None:
             lambda: writer.delete_object(Bucket=raw, Key=key, VersionId=version)),
         "書き込み用の利用者は raw/ の外に書けない": denied(
             lambda: writer.put_object(Bucket=raw, Key="_selfcheck.txt", Body=b"x")),
+        # S3 と RustFS はオブジェクトロックの拒否を AccessDenied で、GCS は保持ポリシーの拒否を RetentionPolicyNotMet で返す
         "管理者でも保持の回避なしには原本を消せない": denied(
-            lambda: admin_client.delete_object(Bucket=raw, Key=key, VersionId=version)),
+            lambda: admin_client.delete_object(Bucket=raw, Key=key, VersionId=version),
+            codes=("AccessDenied", "RetentionPolicyNotMet")),
         "検索アプリは原本に書けない": denied(
             lambda: viewer.put_object(Bucket=raw, Key="raw/_selfcheck/viewer.txt", Body=b"x")),
         "検索アプリは原本を読める": not denied(lambda: viewer.get_object(Bucket=raw, Key=key)),
