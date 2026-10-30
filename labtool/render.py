@@ -308,6 +308,10 @@ def helm_overrides(env: Env, image_repo: str, image_tag: str, config_hash: str, 
                 "AUDIT_S3_ENDPOINT": vm_s3_endpoint(env),
                 "AUDIT_S3_REGION": env.vm_region,
                 "AUDIT_S3_BUCKET": bucket_name(env, AUDIT_RAW),
+                # boto3 1.36 以降の既定（送信時のチェックサム、aws-chunked）を GCS の XML API が署名不一致で拒む。
+                # S3 互換のストレージ向けの公式の回避策（AWS S3 には害が無い。配備で判明 2026-10-30）
+                "AWS_REQUEST_CHECKSUM_CALCULATION": "when_required",
+                "AWS_RESPONSE_CHECKSUM_VALIDATION": "when_required",
             })
             # イメージはクラスタの中の置き場（registry）から。chatgpt/ のトークンは置かない（共有ファイルシステムが無い。
             # 変更仕様書 2026-10-25-EC2三台構成 4.2 節）ので hostPath を外し、退避先だけにする

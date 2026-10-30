@@ -51,6 +51,11 @@ spec:
               value: "${S3_ENDPOINT}"
             - name: AUDIT_S3_REGION
               value: "${S3_REGION}"
+            # boto3 1.36 以降の既定（送信時のチェックサム）を S3 互換のストレージが拒むことがある（GCS）。公式の回避策（害は無い）
+            - name: AWS_REQUEST_CHECKSUM_CALCULATION
+              value: when_required
+            - name: AWS_RESPONSE_CHECKSUM_VALIDATION
+              value: when_required
             - name: AUDIT_S3_BUCKET_PREFIX
               value: "${S3_BUCKET_PREFIX}"
             - name: AUDIT_BASE_URL

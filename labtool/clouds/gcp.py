@@ -15,7 +15,7 @@ import time
 from .. import objectstore as objstore
 from ..core import ROOT, Env, LabError, info, ok, warn
 from . import (
-    CLUSTER_BUCKET, LOCKED_BUCKETS, NODE_COUNT, STATIC_KEY_USERS, Infra, Node, bucket_specs, network_plan,
+    CLUSTER_BUCKET, IMAGES_BUCKET, LOCKED_BUCKETS, NODE_COUNT, STATIC_KEY_USERS, Infra, Node, bucket_specs, network_plan,
     static_key_policies,
 )
 
@@ -266,15 +266,21 @@ def ensure_buckets(env: Env, prefix: str) -> dict[str, str]:
     for logical, spec in bucket_specs(env).items():
         name = prefix + logical
         names[logical] = name
+        # images だけは「均一なバケットレベルのアクセス」を切る（registry 3.0 の S3 ドライバは毎回 ACL を付け、均一のバケットは
+        # どの ACL も InvalidArgument で拒む。配備で判明 2026-10-30、設計書 16 章）。権限は IAM のバインディングで同じに保つ
+        uniform = logical != IMAGES_BUCKET
         bucket = client.lookup_bucket(name)
         if bucket is None:
             bucket = storage.Bucket(client, name=name)
-            bucket.iam_configuration.uniform_bucket_level_access_enabled = True
+            bucket.iam_configuration.uniform_bucket_level_access_enabled = uniform
             bucket.iam_configuration.public_access_prevention = "enforced"
             bucket.labels = {LABEL_KEY: env.vm_prefix}
             bucket = client.create_bucket(bucket, location=env.gcp_region)
             info(f"バケット {name} を作りました")
         changed = False
+        if bool(bucket.iam_configuration.uniform_bucket_level_access_enabled) != uniform:
+            bucket.iam_configuration.uniform_bucket_level_access_enabled = uniform
+            changed = True
         if bucket.iam_configuration.public_access_prevention != "enforced":
             bucket.iam_configuration.public_access_prevention = "enforced"
             changed = True
