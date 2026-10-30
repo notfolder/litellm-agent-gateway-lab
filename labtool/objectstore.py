@@ -27,17 +27,8 @@ LOCK_DENIED_CODES = ("AccessDenied", "RetentionPolicyNotMet", "ObjectLockedError
 
 
 def gcs_object_lock_headers(client) -> None:
-    """GCS の XML API は保持を x-goog-object-lock-* のヘッダーで受ける。boto3 が付ける x-amz-object-lock-* を写す
-    （Pod 側の実装 litellm/guardrails/audit_log.py、apps/audit/audit/common.py と同じ）。"""
-    def convert(params, **_):
-        headers = params.get("headers", {})
-        for name in ("mode", "retain-until-date"):
-            v = headers.pop(f"x-amz-object-lock-{name}", None)
-            if v is not None:
-                headers[f"x-goog-object-lock-{name}"] = v
-    client.meta.events.register("before-call.s3.PutObject", convert, unique_id="lab-gcs-object-lock")
-
-
+    """GCS の XML API は boto3 が付ける x-amz-object-lock-* をそのまま受ける（x-goog-* に写すと ExcessHeaderValues。配備で確認 2026-10-31）。
+    互換のために残す空の関数。"""
 def s3_client(endpoint: str, access_key: str, secret_key: str):
     import boto3
     from botocore.config import Config

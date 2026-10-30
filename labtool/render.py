@@ -970,8 +970,9 @@ def vm_registry_manifest(env: Env, bucket: str, node_port: int) -> str:
                                       "envFrom": secret_ref, "volumeMounts": mounts,
                                       "ports": [{"containerPort": 5000}],
                                       "readinessProbe": {"httpGet": {"path": "/v2/", "port": 5000}, "periodSeconds": 5},
-                                      "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
-                                                    "limits": {"memory": "256Mi"}}}]}}}},
+                                      # push の間、層の数だけ並列に書き込みを溜めるので 256Mi では OOMKilled になった（GCS ドライバ。2026-10-31）
+                                      "resources": {"requests": {"cpu": "50m", "memory": "128Mi"},
+                                                    "limits": {"memory": "1Gi"}}}]}}}},
     ]
     return yaml.safe_dump_all(add_egress(docs, env), sort_keys=False)
 

@@ -433,6 +433,13 @@ def _set_bucket_iam(env: Env, bucket_name: str, entries: list[dict]) -> None:
     policy = bucket.get_iam_policy(requested_policy_version=3)
     policy.version = 3
     managed = {f"serviceAccount:{_sa_email(env, f'{env.vm_prefix}-{u}')}" for u in [*STATIC_KEY_USERS, OPERATOR_USER]}
+    # 操作者の ADC の主体（./lab が Cloud Storage のクライアントで消す・読むため。均一アクセスのバケットでは project の
+    # legacy の権限ではオブジェクトに触れない。配備で判明 2026-10-31）
+    principal = identity(env)["principal"]
+    adc_member = None
+    if "@" in principal:
+        adc_member = ("serviceAccount:" if principal.endswith("gserviceaccount.com") else "user:") + principal
+        managed.add(adc_member)
     keep = [b for b in policy.bindings if not (set(b["members"]) & managed)]
     # 同じロール・同じ条件の利用者は 1 つのバインディングにまとめる（GCS は保存時にまとめるので、分けたままだと毎回「違う」になる）
     merged: dict[str, dict] = {}
@@ -446,6 +453,9 @@ def _set_bucket_iam(env: Env, bucket_name: str, entries: list[dict]) -> None:
         key = json.dumps([role, condition], sort_keys=True)
         binding = merged.setdefault(key, {"role": role, "members": set(), **({"condition": condition} if condition else {})})
         binding["members"].add(member)
+    if adc_member:
+        key = json.dumps(["roles/storage.objectAdmin", None], sort_keys=True)
+        merged.setdefault(key, {"role": "roles/storage.objectAdmin", "members": set()})["members"].add(adc_member)
     new = list(merged.values())
     current = sorted(json.dumps({**b, "members": sorted(b["members"])}, sort_keys=True) for b in policy.bindings)
     wanted = sorted(json.dumps({**b, "members": sorted(b["members"])}, sort_keys=True) for b in keep + new)

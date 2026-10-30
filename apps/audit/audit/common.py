@@ -61,19 +61,7 @@ def retention_args(days_env: str) -> dict:
 
 
 def gcs_object_lock_headers(client, endpoint: str) -> None:
-    """GCS の XML API は保持を x-goog-object-lock-* のヘッダーで受ける。boto3 が付ける x-amz-object-lock-* を写す。"""
-    if "googleapis.com" not in (endpoint or ""):
-        return
-
-    def convert(params, **_):
-        headers = params.get("headers", {})
-        for name in ("mode", "retain-until-date"):
-            v = headers.pop(f"x-amz-object-lock-{name}", None)
-            if v is not None:
-                headers[f"x-goog-object-lock-{name}"] = v
-    client.meta.events.register("before-call.s3.PutObject", convert, unique_id="lab-gcs-object-lock")
-
-
+    """GCS の XML API は boto3 の x-amz-object-lock-* をそのまま受ける（x-goog-* に写すと ExcessHeaderValues。2026-10-31）。何もしない。"""
 # ---- 設定 ----
 @dataclass
 class Config:

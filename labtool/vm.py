@@ -502,7 +502,11 @@ def build_and_push_on_node(env: Env, infra: Infra, name: str, tag: str, context_
     pushed = f"127.0.0.1:{REGISTRY_NODEPORT}/{name}:{tag}"
     args = " ".join(f"'{a}'" for a in build_args)
     info(f"{node.id}（{arch}）でイメージ {local} をビルドします")
-    script = (f"set -e; docker build --platform linux/{arch} {args} -t '{local}' - >/tmp/lab-build-{name}.log 2>&1 "
+    # 中継の環境変数（/etc/environment）をビルドの中（pip など）にも渡す。Docker は systemd の Environment を build には継がない
+    proxy_args = ("--build-arg HTTP_PROXY=\"$HTTP_PROXY\" --build-arg HTTPS_PROXY=\"$HTTPS_PROXY\" --build-arg NO_PROXY=\"$NO_PROXY\" "
+                  if env.egress_proxy else "")
+    script = (f"set -e; set -a; . /etc/environment; set +a; "
+              f"docker build --platform linux/{arch} {proxy_args}{args} -t '{local}' - >/tmp/lab-build-{name}.log 2>&1 "
               f"|| {{ tail -n 60 /tmp/lab-build-{name}.log; exit 1; }}; "
               f"docker tag '{local}' '{pushed}' && docker push -q '{pushed}' && docker rmi '{pushed}' >/dev/null")
     run_on(env, node, script, timeout=1800, input_bytes=_context_tar(context_dir, render.egress_ca_text(env)))

@@ -309,15 +309,7 @@ class AuditLogger(CustomLogger):
             if self.static_keys:
                 kwargs.update(aws_access_key_id=self.access_key, aws_secret_access_key=self.secret_key)
             self._client = boto3.client("s3", **kwargs)
-            if "googleapis.com" in (self.endpoint or ""):
-                # GCS の XML API は保持を x-goog-object-lock-* のヘッダーで受ける。boto3 が付ける x-amz-object-lock-* を写す
-                def convert(params, **_):
-                    headers = params.get("headers", {})
-                    for name in ("mode", "retain-until-date"):
-                        v = headers.pop(f"x-amz-object-lock-{name}", None)
-                        if v is not None:
-                            headers[f"x-goog-object-lock-{name}"] = v
-                self._client.meta.events.register("before-call.s3.PutObject", convert, unique_id="lab-gcs-object-lock")
+            # GCS の XML API も boto3 の x-amz-object-lock-* をそのまま受ける（x-goog-* に写すと ExcessHeaderValues。2026-10-31）
         return self._client
 
     def _put_args(self) -> dict:
