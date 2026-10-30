@@ -43,28 +43,15 @@
 - [ ] Pod Identity のロールごとの権限（許した操作ができ、許していない操作が拒否される）を、クラスタの中で各 ServiceAccount の Pod から試す試験を `./lab test-audit` に足す（Mac からは IAM ロールを借りられないので今は省いている。変更設計書 10 章）（追加 2026-10-24、重要 中）
 - [ ] Codex 用のモデル（Bedrock Mantle の gpt-oss か GPT-5.x、Bedrock の Claude の変換経由、Azure OpenAI）を決める。決まるまで AWS でも `chatgpt/` を使う（トークンは EFS の PVC で共有）（追加 2026-10-24、重要 中）
 - [ ] 配備の後、AWS の試験の結果と費用の実測を変更設計書に書き足し、変更仕様書 12 章・変更設計書 12 章の表に従って `docs/spec.md` と `docs/design.md` に反映する（追加 2026-10-24、重要 中）
-- [x] (2026-10-24) ElastiCache の `durability: sync` は `cache.t4g.micro` で使えなかった（Graviton `.large` 以上とクラスターモード有効が必須）。`min-replicas-to-write 1` に変更（ユーザー回答 1A）
-- [x] (2026-10-24) 変更設計書 `.history/2026-10-24-AWS構成/変更設計書.md` を書く
-- [x] (2026-10-24) 実装: `LAB_TARGET` の切り替え、`labtool/aws.py`、`cdk/`、S3 の資格情報チェーンとバケット名の接頭辞、ESO、ALB の Ingress、Bedrock のモデル登録、障害試験の AWS の場面。単体テスト（labtool 52、監査 19、監査ログ 12）と CDK の synth が通り、Mac の `./lab up` を流し直して確認
 
-## AWS の EC2 3 台構成（`LAB_TARGET=aws-ec2`）
-概要: .history/2026-10-25-EC2三台構成/変更仕様書.md（ブランチ `feature/aws-ec2-pair`。ワークツリー `~/orca/workspaces/litellm-agent-gateway-lab/feature-aws-target-2`）
+## VM 3 台構成（`LAB_TARGET=aws-ec2` / `gcp-vm`）
+概要: .history/2026-10-30-2220-GCP配備と試験/summary.md（ブランチ `feature/aws-ec2-pair`。ワークツリー `~/orca/workspaces/litellm-agent-gateway-lab/feature-aws-target-2`）
 
-- [ ] 変更仕様書の「13. 前提」に残る 2 つ（Elastic IP は `./lab down` で消すのが既定、リージョン・Object Lock・SSO は EKS 版と同じ）をユーザーに確認し、確定したら 0.2 の決定事項に移す（追加 2026-10-25、重要 中）
-- [ ] 配備と試験（変更設計書 9 章。**2026-10-30 に基盤が CloudFormation から API の直接呼び出しに変わり、Session Manager と Bedrock は使わない。手順は `.history/2026-10-30-VM環境の共通化とGCP追加/変更設計書.md` 12 章を優先**）: EC2 の vCPU 上限の解除後に、`.env` の `LAB_TARGET=aws-ec2`、`LAB_CLOUDFLARE_API_TOKEN`、`LAB_ACME_EMAIL`、`LAB_JUDGE_ANTHROPIC_API_KEY` を入れ、`./lab up` → Cloudflare に A レコード → `test-smoke` → `test-idempotency` → `test-audit` → `test-failover`（`pg-*`、`valkey-*`、`eip-node`）→ `test-judge` → 1 台を止めたまま `up` → `down` → `up`。費用の実測を記録。配備で確かめること 5 点は変更設計書 10 章（別 AZ 間のユニキャスト VRRP、Traefik チャートの redirections の形、cert-manager の replicaCount の名前、6443 の /ping、Session Manager の転送の寿命）（追加 2026-10-25、重要 高）（2026-10-30: GCP 側は配備と試験まで完了。AWS 側はこの項目の下の新しい項目に統合）
-- [x] (2026-10-25) 4 回目のヒアリング（1A 無料の IAM・CloudFormation・Session Manager と従量の Bedrock は使ってよい、2 クラスタの中に registry を立てて保存先を S3 に、3A `chatgpt/` を置かない、4A `t4g.large` × 3）で前提を確定し 0.2 に移した
-- [x] (2026-10-25) 実装: `labtool/cfn.py`（4 スタックのテンプレートを JSON で組む）、`cfn/node-init.sh`（k3s の分裂しない起こし方、keepalived、registry のミラー）、`labtool/ec2.py`（配備、SSM の Run Command とポート転送、kubeconfig、静的キーの受け渡し、EC2 の停止、削除）、`stages.py` の `aws-ec2` 分岐（registry、オペレーター replica 2、Let's Encrypt の入口）、`render.py`（Bedrock の静的キー、TLS の経路の写し、registry、`pg_backup_values`）、`objectstore.py`（利用者ごとの検査を両環境で共通に）、`failover.py`（`eip-node`、EC2 の停止）、`ops.py`、`lab`、`k8s/postgres-cnpg.yaml`、`k8s/traefik-config-ec2.yaml`、`.env.example`、README。単体試験 65 本（12 本追加）、cfn-lint と `validate-template` が通る。配備は未実施（ユーザー指示: 実装だけ）
-- [ ] 試験の後、変更仕様書 12 章・変更設計書 12 章の表に従って `docs/spec.md` と `docs/design.md` に反映する。`.history/2026-10-26-k3s版上げ/` の変更仕様書 6 章・変更設計書 7 章（`docs/maintenance.md` を含む）も一緒に（追加 2026-10-25、2026-10-26 に追記、重要 中）
 - [ ] k3s の版上げの試験（`.history/2026-10-26-k3s版上げ/変更仕様書.md` 4 章）: 配備と障害の試験の後に `./lab upgrade-k8s <次のマイナー版> --measure`、パッチの更新、飛ばす・下げる指示、途中で止めて再実行、上げた後の `./lab up`（`K3S_IMAGE` の案内）、1 台の作り直し、AMI の固定の確認（nodes スタックに差分が出ない）。配備で確かめることは変更設計書 6 章（`config.yaml` の `server:` が再起動で無視されるか、drain の時間、`K3S_TOKEN` が消えても server が起きるか、Traefik の値の形、Elastic IP の移動）（追加 2026-10-26、重要 高）
 - [ ] AMI を新しくする手順（1 台ずつ作り直す）。`resolve_ami` が配備済みの AMI を固定で返すので、放っておくと AMI が古くなる。案: `./lab upgrade-ami` で nodes スタックの `AmiId` を更新しつつ、台ごとに drain → インスタンスの作り直し（CloudFormation の 3 台を別々の論理 ID にしてあるので、1 台ずつ `Replace` する手立てが要る）（追加 2026-10-26、重要 低）
-- [x] (2026-10-26) k3s のマイナー版の無停止の版上げを調査（構成は耐えられるが手順が無く、user data の版変更で 3 台が同時再起動する。AMI の「最新」参照で配備後の `./lab up` が 3 台を置き換える不具合も発見）。ユーザー回答 1A（AMI の固定を今直す）・2C（手順を全部今書く）で実装: `AmiId` を固定 ID で受ける `resolve_ami`、k3s の版を SSM のパラメータに、`node-init.sh` の引数を `config.yaml` に、`./lab upgrade-k8s <版> [--measure]`（1 台ずつ、Elastic IP の台は最後、転送の張り直し、etcd のスナップショット、マイナー版 1 つずつ）、`./lab cluster` の版の食い違いの検知。LiteLLM の PDB は親ブランチ `feature/aws-target` の Helm チャートの値（`maxUnavailable: 1`）に寄せた（2 つ付くと drain が止まる）。単体試験 67 本、cfn-lint、`validate-template` が通る。変更仕様書・変更設計書は `.history/2026-10-26-k3s版上げ/`
-- [x] (2026-10-30) GCP（`LAB_TARGET=gcp-vm`）に配備して試験した: `up` は 8 回目で全段階を通過（手戻り 7 件: 主系の公開 IP の入れ替わり、存在確認の except、`.env` の静的キーの混入、HMAC の反映遅れ、GCS の ACL と `UploadPartCopy`、boto3 のチェックサム、保持の拒否コード）。smoke 75/75、冪等性 OK（65 項目）、監査 31/32（残りは Gmail 未サインイン）、障害の試験 6 場面（監査ログの欠けは上限内。台を止める 3 場面は GCP の浮動 IP の付け替えで 80〜150 秒）、審査官 255/288。結果は変更設計書 16 章・16.1 節
-- [ ] GCP の環境は動いたまま（1 時間 約 $0.4、1 日 約 $10）。確認が済んだら `./lab down`（浮動 IP も消える。A レコードは次の `up` が直す）（追加 2026-10-30、重要 高）
-- [x] (2026-10-30) 障害の試験の目安を GCP だけ広げた（entry-node 120 秒、台の停止 180 秒。`failover.limit_for`。ユーザーの回答 2A）
 - [ ] 審査官を Claude Haiku 4.5 にしたときの事例試験の不一致 14 事例（社内宛てを止める、設定ファイルを求めない）を見て、審査官の指示文を詰めるか期待値を見直す（`tests/review-scenarios/`。`./lab test-judge` の記録）（追加 2026-10-30、重要 低）
 - [ ] `aws-ec2` の配備と試験（EC2 の vCPU 上限の解除後）。GCP で直した共通部分（公開 IP の引き直し、known_hosts の識別子、冪等性、監査の試験の入口）は AWS でも効くが、AWS 固有（awscli の snap、netplan の 2 つ目の IP、Elastic IP）は未確認（追加 2026-10-30、重要 高）
-- [ ] 配備と試験の後の文書の反映: `docs/spec.md`・`docs/design.md`・`docs/maintenance.md` に VM 2 クラウドの構成（入口の送信元の制限、A レコードの自動化、整形のメモリ、GCS の違い）を反映し、`docs/ec2_architecture.md` を VM 2 クラウドの構成図に書き直す（変更設計書 15 章）（追加 2026-10-30、重要 中）
-- [x] (2026-10-25) 2 台案 → 3 台案 → CloudFormation のみ、の 3 回のヒアリングで決定（1A 3 台、2B Elastic IP ＋ keepalived ＋ Let's Encrypt、3B 静的キー、4A `.env`、5A 3 つ目の環境、6A 文書を一度に、基盤は素の CloudFormation）。変更仕様書と変更設計書を書いた
+- [ ] 配備と試験の後の文書の反映: `docs/spec.md`・`docs/design.md`・`docs/maintenance.md` に VM 2 クラウドの構成（入口の送信元の制限、A レコードの自動化、整形のメモリ、GCS の違い）と k3s の版上げ（`.history/2026-10-26-k3s版上げ/`）を反映し、`docs/ec2_architecture.md` を VM 2 クラウドの構成図に書き直す（変更設計書 15 章）（追加 2026-10-30、重要 中）
 
 ## 冗長化と監査ログ
 概要: .history/2026-10-12-0741-検証環境の構築と冗長化・監査ログ/summary.md

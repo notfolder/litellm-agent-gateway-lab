@@ -653,20 +653,38 @@ def empty_buckets(env: Env, infra: Infra) -> None:
             if bucket.retention_policy_locked:
                 warn(f"バケット {name} は保持ポリシーがロックされているので消せません（保持が切れるまで残ります）")
                 continue
-            # 解除できる保持ポリシー（GOVERNANCE 相当）は外してから消す
+            # 解除できる保持ポリシー（GOVERNANCE 相当）は外してから消す。外した直後は削除が 403 になることがあるので反映を待つ
             bucket.retention_period = None
             bucket.patch()
+            for _ in range(30):
+                bucket.reload()
+                if not bucket.retention_period:
+                    break
+                time.sleep(2)
+            time.sleep(5)
         # 版も含めて 100 件ずつまとめて消す（Blob.delete は版を受けない。総当たりの記録で 10 万件を超えることがある）
         n = 0
         chunk: list = []
+        from google.api_core import exceptions as gexc
+
+        def delete_chunk(blobs: list) -> None:
+            for attempt in range(6):   # 保持の解除の反映待ち（403）は 10 秒おきに試す
+                try:
+                    bucket.delete_blobs(blobs, preserve_generation=True, on_error=lambda b: None)
+                    return
+                except gexc.Forbidden:
+                    if attempt == 5:
+                        raise
+                    time.sleep(10)
+
         for blob in client.list_blobs(name, versions=True):
             chunk.append(blob)
             if len(chunk) == 100:
-                bucket.delete_blobs(chunk, preserve_generation=True, on_error=lambda b: None)
+                delete_chunk(chunk)
                 n += len(chunk)
                 chunk = []
         if chunk:
-            bucket.delete_blobs(chunk, preserve_generation=True, on_error=lambda b: None)
+            delete_chunk(chunk)
             n += len(chunk)
         bucket.delete()
         info(f"バケット {name} を空にして消しました（{n} 版）")
