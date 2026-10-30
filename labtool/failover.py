@@ -175,6 +175,7 @@ def _stop_vm_node(env: Env, node: str, load: Load) -> None:
     cloud = clouds.for_env(env)
     infra = vm.load_infra(env)
     target = vm.node_for_k8s_name(infra, node)
+    vm.ensure_forward(env, infra, avoid=target.id)   # SSH の転送がその台に張ってあれば別の台へ（止めると kubectl が届かなくなる）
     info(f"ノード {node}（{target.id}）を {NODE_DOWN_SECONDS} 秒止めます")
     cloud.stop_node(env, target)
     try:
