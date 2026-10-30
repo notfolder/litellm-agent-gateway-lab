@@ -183,6 +183,9 @@ def _stop_vm_node(env: Env, node: str, load: Load) -> None:
     finally:
         cloud.start_node(env, target)
         info(f"ノード {node}（{target.id}）を起動しました")
+    # 止めている間に浮動 IP が転送先の台へ移ると、その台の公開 IP が入れ替わって SSH の転送が切れる（GCP。配備で判明 2026-10-30）。
+    # 公開 IP を引き直し、切れていれば張り直してから kubectl を使う
+    vm.ensure_forward(env, infra)
     wait_until(600, f"{node} の Ready", kc("wait", "--for=condition=Ready", f"node/{node}", "--timeout=5s"))
 
 
