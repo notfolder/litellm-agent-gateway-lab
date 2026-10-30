@@ -416,14 +416,21 @@ def audit_test(env: Env) -> None:
         with objstore.admin_s3(env) as s3:
             mine_rows = [r for r in raw_records(s3, since) if r.get("type") == "request"
                          and r.get("user_email") == TEST_USER]
-        expect = (len(mine_rows), sum(r["tokens_in"] for r in mine_rows), sum(r["tokens_out"] for r in mine_rows))
+        # LiteLLM は Pod の終了時に未送信の集計（spend log）を失うことがある（GCP の配備で判明 2026-10-30: ローリング更新中の
+        # 98 件のうち 22 件が日次の集計に無かった。監査ログには全件ある）。照合は「中断の無かった要求はすべて LiteLLM の
+        # 集計に入り、余分は無い」とする: 下限 = ローリング更新中を除いた分、上限 = 全部
+        rolled = set(roll_ids)
+        steady = [r for r in mine_rows if r["call_id"] not in rolled]
+        totals = lambda rows: (len(rows), sum(r["tokens_in"] for r in rows), sum(r["tokens_out"] for r in rows))
+        low, high = totals(steady), totals(mine_rows)
+        within = lambda got: all(lo <= g <= hi for lo, g, hi in zip(low, got, high))
         try:
-            wait_until(180, "LiteLLM の日次の集計への反映", lambda: litellm_daily() == expect)
+            wait_until(180, "LiteLLM の日次の集計への反映", lambda: within(litellm_daily()))
             matched = True
         except LabError:
             matched = False
-        c.check(f"監査ログの集計（件数・入力・出力 {expect}）が LiteLLM の日次の集計（{litellm_daily()}）と一致する",
-                matched)
+        c.check(f"LiteLLM の日次の集計（件数・入力・出力 {litellm_daily()}）が監査ログの集計の範囲（中断の無かった分 {low} 以上、"
+                f"全部 {high} 以下）にある", matched)
     finally:
         _cleanup_test_user(env, key)
 
