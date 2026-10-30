@@ -36,7 +36,7 @@ FUNCTIONS = [
     "identity", "ensure_apis", "bucket_prefix", "s3_endpoint", "ensure_network", "allow_ssh_from", "ensure_entry_ip",
     "ensure_buckets", "check_buckets", "ensure_static_keys", "put_object", "get_object", "ensure_nodes",
     "recreate_node", "discover", "entry_ip_holder", "stop_node", "start_node", "node_init_hooks", "destroy",
-    "empty_buckets",
+    "empty_buckets", "snapshot",
 ]
 
 

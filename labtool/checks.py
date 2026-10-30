@@ -244,6 +244,8 @@ def snapshot() -> list[str]:
     - ConfigMap / Secret の resourceVersion（CloudNativePG が自分で更新する Secret と、Helm の記録は除く）
     - Deployment / StatefulSet / CronJob と、CloudNativePG・Traefik のリソースの generation
     - オブジェクトストレージのバケットの設定と、利用者と権限"""
+    from .core import Env
+    env = Env.load()   # kube の context を環境に向ける（VM の環境は SSH の転送先）
     lines: list[str] = []
     for ns in (NS, "cert-manager", "cnpg-system"):
         for r in json_output(helm("-n", ns, "list", "-o", "json"), default=[]) or []:
@@ -271,12 +273,14 @@ def snapshot() -> list[str]:
             lines.append(f"{o['kind']} {m['name']} {field}")
     try:
         from . import objectstore
-        from .core import Env
-        env = Env.load()
-        with objectstore.admin_s3(env) as s3:
-            lines += objectstore.snapshot(env, s3)
+        if env.is_vm:
+            from . import clouds, vm
+            lines += clouds.for_env(env).snapshot(env, vm.ensure_bucket_prefix(env))
+        else:
+            with objectstore.admin_s3(env) as s3:
+                lines += objectstore.snapshot(env, s3)
     except Exception as e:  # noqa: BLE001 オブジェクトストレージがまだ無い
-        lines.append(f"objectstore unavailable: {type(e).__name__}")
+        lines.append(f"objectstore unavailable: {type(e).__name__}: {str(e)[:120]}")
     return sorted(lines)
 
 

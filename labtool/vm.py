@@ -284,6 +284,14 @@ def save_infra(infra: Infra) -> None:
     write_if_changed(INFRA_FILE, json.dumps(asdict(infra), indent=2, ensure_ascii=False, sort_keys=True) + "\n", mode=0o600)
 
 
+def ensure_bucket_prefix(env: Env) -> str:
+    """バケット名の接頭辞（LAB_BUCKET_PREFIX）を Env に載せる（preflight と同じ。試験など preflight を通らない入口から使う）。"""
+    if not env.get("LAB_BUCKET_PREFIX"):
+        cloud = clouds.for_env(env)
+        env.values["LAB_BUCKET_PREFIX"] = cloud.bucket_prefix(env, cloud.identity(env))
+    return env.get("LAB_BUCKET_PREFIX")
+
+
 def load_infra(env: Env) -> Infra:
     """基盤を API で探す（.build の記録は目安にしか使わない）。無ければエラー。"""
     infra = clouds.for_env(env).discover(env)

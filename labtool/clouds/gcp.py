@@ -137,6 +137,22 @@ def ensure_apis(env: Env) -> None:
     info(f"GCP の API を有効にしました: {', '.join(missing)}")
 
 
+def snapshot(env: Env, prefix: str) -> list[str]:
+    """冪等性の試験用: バケットの設定（均一アクセス、バージョニング、保持、ライフサイクル）と IAM のバインディングを文字列の一覧に
+    （Cloud Storage のクライアントで読む。S3 互換の API では保持と IAM が見えない）。"""
+    client = _storage(env)
+    lines = []
+    for logical in sorted(bucket_specs(env)):
+        name = prefix + logical
+        bucket = client.get_bucket(name)
+        policy = bucket.get_iam_policy(requested_policy_version=3)
+        bindings = sorted(json.dumps({**b, "members": sorted(b["members"])}, sort_keys=True) for b in policy.bindings)
+        lines.append(f"bucket {name} uniform={bool(bucket.iam_configuration.uniform_bucket_level_access_enabled)} "
+                     f"versioning={bool(bucket.versioning_enabled)} retention={bucket.retention_period} "
+                     f"lifecycle={json.dumps([dict(r) for r in bucket.lifecycle_rules], sort_keys=True)} iam={bindings}")
+    return lines
+
+
 def bucket_prefix(env: Env, ident: dict) -> str:
     return f"{env.gcp_prefix}-{ident['account']}-"
 
@@ -370,14 +386,18 @@ def _set_bucket_iam(env: Env, bucket_name: str, entries: list[dict]) -> None:
     policy = bucket.get_iam_policy(requested_policy_version=3)
     policy.version = 3
     keep = [b for b in policy.bindings if not any(m.startswith(f"serviceAccount:{env.vm_prefix}-") for m in b["members"])]
-    new = []
+    # 同じロール・同じ条件の利用者は 1 つのバインディングにまとめる（GCS は保存時にまとめるので、分けたままだと毎回「違う」になる）
+    merged: dict[str, dict] = {}
     for e in entries:
         member = f"serviceAccount:{_sa_email(env, f'{env.vm_prefix}-{e['user']}')}"
-        binding: dict = {"role": e["role"], "members": {member}}
+        condition = None
         if e["prefix"]:
-            binding["condition"] = {"title": f"{e['user']}-{e['prefix'].strip('/').replace('/', '-')}",
-                                    "expression": f'resource.name.startsWith("projects/_/buckets/{bucket_name}/objects/{e["prefix"]}")'}
-        new.append(binding)
+            condition = {"title": f"{e['user']}-{e['prefix'].strip('/').replace('/', '-')}",
+                         "expression": f'resource.name.startsWith("projects/_/buckets/{bucket_name}/objects/{e["prefix"]}")'}
+        key = json.dumps([e["role"], condition], sort_keys=True)
+        binding = merged.setdefault(key, {"role": e["role"], "members": set(), **({"condition": condition} if condition else {})})
+        binding["members"].add(member)
+    new = list(merged.values())
     current = sorted(json.dumps({**b, "members": sorted(b["members"])}, sort_keys=True) for b in policy.bindings)
     wanted = sorted(json.dumps({**b, "members": sorted(b["members"])}, sort_keys=True) for b in keep + new)
     if current != wanted:

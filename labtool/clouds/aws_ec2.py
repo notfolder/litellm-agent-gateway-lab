@@ -53,6 +53,12 @@ def ensure_apis(env: Env) -> None:
     """AWS はサービスの有効化が要らない。"""
 
 
+def snapshot(env: Env, prefix: str) -> list[str]:
+    """冪等性の試験用: バケットの設定を文字列の一覧に（S3 の API で読む）。"""
+    with objstore.admin_s3(env) as s3:
+        return objstore.snapshot(env, s3)
+
+
 def bucket_prefix(env: Env, ident: dict) -> str:
     return f"{env.aws_prefix}-{ident['account']}-"
 

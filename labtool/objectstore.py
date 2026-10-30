@@ -286,7 +286,7 @@ def snapshot(env: Env, s3) -> list[str]:
         lock = _lock_rule(s3, name)
         lines.append(f"bucket {name} versioning={s3.get_bucket_versioning(Bucket=name).get('Status')} "
                      f"lock={_canon(lock)} lifecycle={_canon(_lifecycle_rules(s3, name))}")
-    if env.on_aws:
+    if env.on_cloud:   # クラウドでは利用者はクラウドの IAM（RustFS の管理 API は無い）
         return lines
     endpoint = s3.meta.endpoint_url
     admin = Admin(endpoint, *admin_credentials(env))
