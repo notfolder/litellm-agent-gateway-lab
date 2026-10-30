@@ -58,6 +58,12 @@ spec:
               value: when_required
             - name: AUDIT_S3_BUCKET_PREFIX
               value: "${S3_BUCKET_PREFIX}"
+            - name: AUDIT_S3_BUCKET
+              value: "${S3_BUCKET}"
+            - name: AUDIT_ACCESS_RETENTION_DAYS
+              value: "${ACCESS_RETENTION_DAYS}"
+            - name: AUDIT_RETENTION_MODE
+              value: "${RETENTION_MODE}"
             - name: AUDIT_BASE_URL
               value: "${BASE_URL}"
             - name: AUDIT_OIDC_ISSUER

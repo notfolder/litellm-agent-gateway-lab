@@ -302,12 +302,17 @@ def helm_overrides(env: Env, image_repo: str, image_tag: str, config_hash: str, 
         # チャートは db.useExisting のとき、DATABASE_URL を Pod の env に直接書く（接続先はここで切り替える）
         overrides["db"] = {"endpoint": "litellm-pg-pooler-rw" if pooler else "litellm-pg-rw"}
         if env.is_vm:
+            raw_bucket, raw_prefix = store_location(env, AUDIT_RAW)
+            retention = retention_settings(env)
             env_vars.update({
                 # 監査ログはクラウドのバケット（接続先はクラウド固有層の s3_endpoint。AWS は空＝既定、GCP は storage.googleapis.com。
-                # 資格情報は静的キー。接頭辞付きの名前）
+                # 資格情報は静的キー。1 つのバケットの audit-raw/ ディレクトリ。原本にはオブジェクト単位の保持を付ける）
                 "AUDIT_S3_ENDPOINT": vm_s3_endpoint(env),
                 "AUDIT_S3_REGION": env.vm_region,
-                "AUDIT_S3_BUCKET": bucket_name(env, AUDIT_RAW),
+                "AUDIT_S3_BUCKET": raw_bucket,
+                "AUDIT_S3_KEY_PREFIX": raw_prefix,
+                "AUDIT_S3_RETENTION_DAYS": retention["RAW_RETENTION_DAYS"],
+                "AUDIT_S3_RETENTION_MODE": retention["RETENTION_MODE"],
                 # boto3 1.36 以降の既定（送信時のチェックサム、aws-chunked）を GCS の XML API が署名不一致で拒む。
                 # S3 互換のストレージ向けの公式の回避策（AWS S3 には害が無い。配備で判明 2026-10-30）
                 "AWS_REQUEST_CHECKSUM_CALCULATION": "when_required",
@@ -317,6 +322,13 @@ def helm_overrides(env: Env, image_repo: str, image_tag: str, config_hash: str, 
             # 変更仕様書 2026-10-25-EC2三台構成 4.2 節）ので hostPath を外し、退避先だけにする
             overrides["volumes"] = [{"name": "audit-spool", "emptyDir": {"sizeLimit": "1Gi"}}]
             overrides["volumeMounts"] = [{"name": "audit-spool", "mountPath": "/var/lib/audit-spool"}]
+            if env.egress_proxy:
+                # 出口プロキシ（Zscaler 相当）: 中継と CA を環境変数で渡す。aiohttp の経路は環境変数の中継を読まないことがあるので
+                # httpx に固定する（変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 7.2 節）
+                env_vars.update({e["name"]: e["value"] for e in egress_env(env)})
+                env_vars["DISABLE_AIOHTTP_TRANSPORT"] = "True"
+                overrides["volumes"].append(egress_volume())
+                overrides["volumeMounts"].append(egress_mount())
         return overrides
 
     out = aws_out or {}
@@ -372,8 +384,8 @@ def secrets_for_litellm(env: Env) -> dict[str, str]:
         "LITELLM_SALT_KEY": env.get("LITELLM_SALT_KEY"),
         "REDIS_PASSWORD": env.get("REDIS_PASSWORD"),
         "REDIS_SENTINEL_PASSWORD": env.get("SENTINEL_PASSWORD"),
-        "AUDIT_S3_ACCESS_KEY": env.get(s3_env_names("litellm-writer")[0]),
-        "AUDIT_S3_SECRET_KEY": env.get(s3_env_names("litellm-writer")[1]),
+        "AUDIT_S3_ACCESS_KEY": env.get(s3_env_names("litellm-writer", env)[0]),
+        "AUDIT_S3_SECRET_KEY": env.get(s3_env_names("litellm-writer", env)[1]),
     }
     if env.has_google():
         # 管理画面の Google SSO（GOOGLE_*）と Gmail の MCP（GOOGLE_OAUTH_*）で同じクライアントを使う
@@ -486,11 +498,16 @@ def client_files(env: Env, claude_key: str, codex_key: str, codex_home: Path,
 # ---- オブジェクトストレージ（変更設計書 2 章） ----
 AUDIT_RAW, AUDIT_ACCESS, AUDIT_DERIVED, PG_BACKUP = "audit-raw", "audit-access", "audit-derived", "pg-backup"
 S3_USERS = ["litellm-writer", "audit-compactor", "audit-viewer", "pg-backup"]
+# VM の環境の 1 バケットのディレクトリ（Mac の 4 つ ＋ イメージ置き場 ＋ k3s のトークンと版）と、保持を付けるもの
+VM_STORES = [AUDIT_RAW, AUDIT_ACCESS, AUDIT_DERIVED, PG_BACKUP, "images", "cluster"]
+RETAINED_STORES = (AUDIT_RAW, AUDIT_ACCESS)
 
 
-def s3_env_names(user: str) -> tuple[str, str]:
-    """利用者のアクセスキーとシークレットを置く .env の名前（例 S3_LITELLM_WRITER_KEY / _SECRET）。"""
-    base = "S3_" + user.upper().replace("-", "_")
+def s3_env_names(user: str, env: Env | None = None) -> tuple[str, str]:
+    """利用者のアクセスキーとシークレットを置く .env の名前。Mac は S3_LITELLM_WRITER_KEY / _SECRET、
+    VM の環境（aws-ec2 / gcp-vm）は LAB_VM_S3_LITELLM_WRITER_KEY / _SECRET（用意する側が発行したキー、または provision が書いたキー。
+    Mac の RustFS の値と名前が違うので、同じ .env で両方を切り替えても混ざらない。変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 2 章）。"""
+    base = ("LAB_VM_S3_" if env is not None and env.is_vm else "S3_") + user.upper().replace("-", "_")
     return base + "_KEY", base + "_SECRET"
 
 
@@ -638,12 +655,33 @@ def bucket_prefix(env: Env, account: str) -> str:
     return f"{env.aws_prefix}-{account}-" if env.is_aws else ""
 
 
+def store_location(env: Env, logical: str) -> tuple[str, str]:
+    """論理名（audit-raw など）の置き場: (バケット名, 鍵の接頭辞)。
+    Mac の RustFS は論理名のバケット、EKS 版は接頭辞付きのバケット、VM の環境は 1 つのバケット（LAB_VM_BUCKET）の
+    ディレクトリ <論理名>/（変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 4.1 節）。"""
+    if env.is_vm:
+        return env.vm_bucket, logical + "/"
+    if env.is_aws:
+        return env.get("LAB_AWS_BUCKET_PREFIX", "") + logical, ""
+    return logical, ""
+
+
 def bucket_name(env: Env, logical: str) -> str:
-    """論理名（audit-raw など）から実際のバケット名。クラウドでは接頭辞（preflight が Env の LAB_BUCKET_PREFIX に載せる。
-    EKS 版の LAB_AWS_BUCKET_PREFIX も読む）を付ける。"""
-    if not env.on_cloud:
-        return logical
-    return (env.get("LAB_BUCKET_PREFIX") or env.get("LAB_AWS_BUCKET_PREFIX", "")) + logical
+    return store_location(env, logical)[0]
+
+
+def store_prefix(env: Env, logical: str) -> str:
+    return store_location(env, logical)[1]
+
+
+def retention_settings(env: Env) -> dict[str, str]:
+    """VM の環境で、書く側（LiteLLM の監査コールバック、検索アプリ）がオブジェクト単位の保持を付けるための値。
+    Mac はバケットの既定の保持（RustFS）なので空、EKS 版も CDK のバケットの既定の保持なので空。"""
+    if not env.is_vm:
+        return {"RAW_RETENTION_DAYS": "", "ACCESS_RETENTION_DAYS": "", "RETENTION_MODE": ""}
+    return {"RAW_RETENTION_DAYS": env.get("LAB_AUDIT_RETENTION_DAYS", "90"),
+            "ACCESS_RETENTION_DAYS": env.get("LAB_AUDIT_ACCESS_RETENTION_DAYS", "400"),
+            "RETENTION_MODE": env.get("LAB_AUDIT_LOCK_MODE", "GOVERNANCE")}
 
 
 def bedrock_params(env: Env, model_id: str) -> dict:
@@ -663,12 +701,16 @@ def vm_judge_model(env: Env) -> str:
 def audit_s3_settings(env: Env) -> dict[str, str]:
     """監査の Pod（整形の CronJob、検索アプリ、試験の Job）に渡す S3 互換の設定（接続先、リージョン、バケット名の接頭辞）。
     Mac は RustFS、EKS 版は AWS S3（Pod Identity）、VM の環境はクラウドのバケット（静的キー）。"""
+    base = retention_settings(env)
     if env.is_aws:
-        return {"S3_ENDPOINT": "", "S3_REGION": env.aws_region, "S3_BUCKET_PREFIX": env.get("LAB_AWS_BUCKET_PREFIX", "")}
+        return base | {"S3_ENDPOINT": "", "S3_REGION": env.aws_region, "S3_BUCKET_PREFIX": env.get("LAB_AWS_BUCKET_PREFIX", ""),
+                       "S3_BUCKET": ""}
     if env.is_vm:
-        return {"S3_ENDPOINT": vm_s3_endpoint(env), "S3_REGION": env.vm_region, "S3_BUCKET_PREFIX": env.get("LAB_BUCKET_PREFIX", "")}
-    return {"S3_ENDPOINT": env.get("LAB_S3_ENDPOINT", DEFAULT_S3_ENDPOINT), "S3_REGION": env.get("LAB_S3_REGION", "us-east-1"),
-            "S3_BUCKET_PREFIX": ""}
+        # 1 つのバケット（S3_BUCKET）のディレクトリ。接頭辞の方式（S3_BUCKET_PREFIX）は使わない
+        return base | {"S3_ENDPOINT": vm_s3_endpoint(env), "S3_REGION": env.vm_region, "S3_BUCKET_PREFIX": "",
+                       "S3_BUCKET": env.vm_bucket}
+    return base | {"S3_ENDPOINT": env.get("LAB_S3_ENDPOINT", DEFAULT_S3_ENDPOINT), "S3_REGION": env.get("LAB_S3_REGION", "us-east-1"),
+                   "S3_BUCKET_PREFIX": "", "S3_BUCKET": ""}
 
 
 def vm_s3_endpoint(env: Env) -> str:
@@ -884,7 +926,7 @@ def vm_registry_manifest(env: Env, bucket: str, node_port: int) -> str:
         {"name": "REGISTRY_STORAGE_S3_REGION", "value": env.vm_region},
         {"name": "REGISTRY_STORAGE_S3_REGIONENDPOINT", "value": vm_s3_endpoint(env)},
         {"name": "REGISTRY_STORAGE_S3_BUCKET", "value": bucket},
-        {"name": "REGISTRY_STORAGE_S3_ROOTDIRECTORY", "value": "/registry"},
+        {"name": "REGISTRY_STORAGE_S3_ROOTDIRECTORY", "value": "/" + store_prefix(env, "images") + "registry"},
         {"name": "REGISTRY_STORAGE_DELETE_ENABLED", "value": "true"},
         {"name": "REGISTRY_HTTP_ADDR", "value": ":5000"},
     ]
@@ -917,12 +959,12 @@ def vm_registry_manifest(env: Env, bucket: str, node_port: int) -> str:
                                       "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
                                                     "limits": {"memory": "256Mi"}}}]}}}},
     ]
-    return yaml.safe_dump_all(docs, sort_keys=False)
+    return yaml.safe_dump_all(add_egress(docs, env), sort_keys=False)
 
 
 def vm_registry_secret(env: Env) -> dict[str, str]:
     """registry の Pod に渡す秘密: S3 の静的キー（IAM ユーザー registry）と、2 Pod で共通の HTTP の秘密。"""
-    key_name, secret_name = s3_env_names("registry")
+    key_name, secret_name = s3_env_names("registry", env)
     return {"REGISTRY_STORAGE_S3_ACCESSKEY": env.get(key_name), "REGISTRY_STORAGE_S3_SECRETKEY": env.get(secret_name),
             "REGISTRY_HTTP_SECRET": env.get("LAB_REGISTRY_HTTP_SECRET")}
 
@@ -974,9 +1016,129 @@ def tls_ingressroutes(manifest_text: str, secret_name: str = VM_TLS_SECRET) -> s
 def pg_backup_values(env: Env) -> dict[str, str]:
     """k8s/postgres-cnpg.yaml に渡す値。Mac は RustFS（endpointURL あり、接頭辞なし）、VM の環境はクラウドのバケット
     （接頭辞付き、リージョンはクラウド。endpointURL は AWS は省き、GCP は storage.googleapis.com）。"""
+    bucket, prefix = store_location(env, PG_BACKUP)
+    dest = f"s3://{bucket}/{prefix}litellm-pg"
     if env.is_vm:
         endpoint = vm_s3_endpoint(env)
-        return {"S3_BUCKET_PREFIX": bucket_name(env, ""), "S3_ENDPOINT_LINE": f"endpointURL: {endpoint}" if endpoint else "",
+        return {"S3_DEST": dest, "S3_ENDPOINT_LINE": f"endpointURL: {endpoint}" if endpoint else "",
                 "S3_REGION": env.vm_region}
-    return {"S3_BUCKET_PREFIX": "", "S3_ENDPOINT_LINE": f"endpointURL: {env.get('LAB_S3_ENDPOINT', DEFAULT_S3_ENDPOINT)}",
+    return {"S3_DEST": dest, "S3_ENDPOINT_LINE": f"endpointURL: {env.get('LAB_S3_ENDPOINT', DEFAULT_S3_ENDPOINT)}",
             "S3_REGION": env.get("LAB_S3_REGION", "us-east-1")}
+
+
+# ---- 出口プロキシ（Zscaler 相当。変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 7 章） ----
+EGRESS_CA_NAME = "lab-egress-ca"             # ConfigMap と Secret の名前（Barman の endpointCA は Secret を参照する）
+EGRESS_CA_DIR = "/etc/lab-egress"
+EGRESS_CA_PATH = f"{EGRESS_CA_DIR}/ca.crt"
+# Pod が中継を通さない宛先。Python の requests は接尾辞の一致なので、クラスタの中の名前を列挙する（Go は CIDR も読む）
+POD_NO_PROXY = ",".join([
+    "127.0.0.1", "localhost", "10.42.0.0/16", "10.43.0.0/16", ".svc", ".svc.cluster.local", ".cluster.local",
+    "fake-llm", "workspace-mcp", "lab-registry", "litellm-pg-rw", "litellm-pg-ro", "litellm-pg-pooler-rw", "litellm-pg-r",
+    "valkey", "valkey-sentinel", "litellm", "audit-viewer", "kubernetes.default.svc",
+])
+# 中継を通る VM（ホスト）側の除外。k3s のインストールスクリプトが k3s.service.env に写す
+NODE_NO_PROXY_BASE = "127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,169.254.169.254,metadata.google.internal,metadata"
+
+
+def egress_env(env: Env) -> list[dict]:
+    """外へ出る Pod に渡す環境変数（中継と CA）。中継が無ければ空。"""
+    proxy = env.egress_proxy
+    if not proxy:
+        return []
+    out = []
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        out.append({"name": name, "value": proxy})
+    for name in ("NO_PROXY", "no_proxy"):
+        out.append({"name": name, "value": POD_NO_PROXY})
+    for name in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "AWS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        out.append({"name": name, "value": EGRESS_CA_PATH})
+    return out
+
+
+def egress_volume() -> dict:
+    return {"name": EGRESS_CA_NAME, "configMap": {"name": EGRESS_CA_NAME}}
+
+
+def egress_mount() -> dict:
+    return {"name": EGRESS_CA_NAME, "mountPath": EGRESS_CA_DIR, "readOnly": True}
+
+
+def egress_ca_text(env: Env) -> str:
+    ca = env.egress_ca_file
+    if not env.egress_proxy:
+        return ""
+    if ca is None or not ca.exists():
+        raise ValueError("LAB_EGRESS_PROXY には LAB_EGRESS_CA_FILE（中継の CA の PEM）が要ります")
+    return ca.read_text()
+
+
+def egress_ca_manifests(env: Env, namespaces: list[str]) -> str:
+    """CA を置く ConfigMap（Pod のマウント用）と Secret（Barman の endpointCA 用）。中継が無ければ空。"""
+    text = egress_ca_text(env)
+    if not text:
+        return ""
+    docs = []
+    for ns in namespaces:
+        docs.append({"apiVersion": "v1", "kind": "ConfigMap", "metadata": {"name": EGRESS_CA_NAME, "namespace": ns},
+                     "data": {"ca.crt": text}})
+        docs.append({"apiVersion": "v1", "kind": "Secret", "metadata": {"name": EGRESS_CA_NAME, "namespace": ns},
+                     "type": "Opaque", "stringData": {"ca.crt": text}})
+    return yaml.safe_dump_all(docs, sort_keys=False)
+
+
+def _pod_spec_of(doc: dict) -> dict | None:
+    kind = doc.get("kind")
+    spec = doc.get("spec") or {}
+    if kind in ("Deployment", "StatefulSet", "DaemonSet", "Job"):
+        return spec.get("template", {}).get("spec")
+    if kind == "CronJob":
+        return spec.get("jobTemplate", {}).get("spec", {}).get("template", {}).get("spec")
+    return None
+
+
+def add_egress(docs, env: Env):
+    """マニフェスト（辞書の列）に、中継と CA の環境変数・マウントを足す。中継が無ければそのまま返す。
+    Deployment / StatefulSet / DaemonSet / Job / CronJob の全コンテナと、Barman の ObjectStore
+    （sidecar の env と endpointCA）が対象。"""
+    docs = list(docs)
+    if not env.egress_proxy:
+        return docs
+    envs = egress_env(env)
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        if doc.get("kind") == "ObjectStore":
+            spec = doc.setdefault("spec", {})
+            side = spec.setdefault("instanceSidecarConfiguration", {})
+            current = {e["name"] for e in side.get("env", [])}
+            side.setdefault("env", []).extend(e for e in envs if e["name"] not in current
+                                              and not e["name"].endswith(("CA_FILE", "CA_BUNDLE")))
+            spec.setdefault("configuration", {})["endpointCA"] = {"name": EGRESS_CA_NAME, "key": "ca.crt"}
+            continue
+        pod = _pod_spec_of(doc)
+        if pod is None:
+            continue
+        for c in pod.get("containers", []) + pod.get("initContainers", []):
+            current = {e["name"] for e in c.get("env", [])}
+            c.setdefault("env", []).extend(e for e in envs if e["name"] not in current)
+            if not any(m.get("name") == EGRESS_CA_NAME for m in c.get("volumeMounts", [])):
+                c.setdefault("volumeMounts", []).append(egress_mount())
+        if not any(v.get("name") == EGRESS_CA_NAME for v in pod.get("volumes", [])):
+            pod.setdefault("volumes", []).append(egress_volume())
+    return docs
+
+
+def add_egress_text(manifest: str, env: Env) -> str:
+    """文字列のマニフェストに add_egress を通す（中継が無ければそのまま）。"""
+    if not env.egress_proxy:
+        return manifest
+    return yaml.safe_dump_all(add_egress(yaml.safe_load_all(manifest), env), sort_keys=False)
+
+
+def cert_manager_egress_values(env: Env) -> dict:
+    """cert-manager の Helm の値に重ねる、中継と CA（ACME と Cloudflare の API が中継を通る）。"""
+    if not env.egress_proxy:
+        return {}
+    return {"http_proxy": env.egress_proxy, "https_proxy": env.egress_proxy, "no_proxy": POD_NO_PROXY,
+            "extraEnv": [{"name": "SSL_CERT_FILE", "value": EGRESS_CA_PATH}],
+            "volumes": [egress_volume()], "volumeMounts": [egress_mount()]}

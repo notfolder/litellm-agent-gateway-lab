@@ -1,7 +1,8 @@
-"""VM 共通層（LAB_TARGET=aws-ec2 / gcp-vm。変更設計書 .history/2026-10-30-VM環境の共通化とGCP追加/ 6 章）。
+"""VM 共通層（LAB_TARGET=aws-ec2 / gcp-vm。変更設計書 .history/2026-10-30-既存資源からの構築と出口プロキシ/ 3 章・5 章・6 章）。
 
-クラウドを知らない部分: SSH（鍵、22 の許可の更新、コマンドの実行、kubeconfig、6443 のポート転送）、VM の初期化スクリプトの
-描画、k3s のトークンと版（バケットの鍵）、静的キーの Secret との同期、k3s の版上げの部品、証明書の退避、A レコードの待ち。
+クラウドを知らない部分: .env の識別子から基盤を組む（load_infra）、SSH（鍵、コマンドの実行、kubeconfig、6443 のポート転送）、
+VM の初期化スクリプトの描画と SSH での実行、k3s のトークンと版（バケットの cluster/ ディレクトリ）、VM 上でのイメージのビルド、
+中継（出口プロキシ）の VM の初期化、k3s の版上げの部品、証明書の退避、A レコード、アンインストール。
 クラウドの API は labtool/clouds/ のモジュール（clouds.for_env(env)）を通してだけ呼ぶ。
 """
 
@@ -9,12 +10,14 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import io
 import json
 import os
 import re
 import signal
 import socket
 import subprocess
+import tarfile
 import tempfile
 import time
 import urllib.error
@@ -25,40 +28,36 @@ from pathlib import Path
 import yaml
 
 from . import clouds, render
-from .clouds import CLUSTER_BUCKET, PRIORITIES, REGISTRY_HOST, REGISTRY_NODEPORT, TOKEN_KEY, VERSION_KEY, Infra, Node
+from . import objectstore as objstore
+from .clouds import PRIORITIES, PROXY_PORT, REGISTRY_HOST, REGISTRY_NODEPORT, TOKEN_KEY, VERSION_KEY, Infra, Node
 from .core import (
     BUILD_DIR, K3S_IMAGE, NS, ROOT, VM_KUBE_CONTEXTS, Env, LabError, gen_secret, info, kc, kn, ok, output, run,
-    succeeds, wait_until, write_if_changed,
+    succeeds, wait_until, warn, write_if_changed,
 )
 
-SSH_KEY = BUILD_DIR / "vm-ssh-key"
 KNOWN_HOSTS = BUILD_DIR / "vm-known-hosts"
 FORWARD_PID_FILE = BUILD_DIR / "vm-forward.pid"
 FORWARD_TARGET_FILE = BUILD_DIR / "vm-forward.target"   # 転送先の Node.id（版上げでその台を避けるため）
 FORWARD_LOG = BUILD_DIR / "vm-forward.log"
-INFRA_FILE = BUILD_DIR / "vm-infra.json"                 # 最後に探した基盤（無くても API で探し直せる）
+INFRA_FILE = BUILD_DIR / "vm-infra.json"                 # 最後に組んだ基盤（目安。正は .env と API）
 TLS_BACKUP = BUILD_DIR / "vm-tls-secret.json"
+EGRESS_CA_FILE = BUILD_DIR / "egress-ca.pem"             # 中継の VM から取った CA（managed）
 TLS_SECRET = "litellm-tls"
 NODE_INIT_SCRIPT = ROOT / "vm" / "node-init.sh"
+PROXY_INIT_SCRIPT = ROOT / "vm" / "proxy-init.sh"
 K3S_INSTALL_URL = "https://get.k3s.io"
-SSH_USER = "ubuntu"
 IP_LOOKUPS = ["https://checkip.amazonaws.com", "https://api.ipify.org"]
-# 静的キーを置く Kubernetes の Secret（利用者 → Secret の名前、アクセスキーの項目、シークレットの項目）
-KEY_SECRETS = {
-    "litellm-writer": ("litellm-secrets", "AUDIT_S3_ACCESS_KEY", "AUDIT_S3_SECRET_KEY"),
-    "audit-compactor": ("audit-compactor-s3", "AUDIT_S3_ACCESS_KEY", "AUDIT_S3_SECRET_KEY"),
-    "audit-viewer": ("audit-viewer-s3", "AUDIT_S3_ACCESS_KEY", "AUDIT_S3_SECRET_KEY"),
-    "pg-backup": ("pg-backup-s3", "ACCESS_KEY_ID", "ACCESS_SECRET_KEY"),
-    "registry": (render.VM_REGISTRY_NAME, "REGISTRY_STORAGE_S3_ACCESSKEY", "REGISTRY_STORAGE_S3_SECRETKEY"),
-    "operator": ("lab-operator-s3", "ACCESS_KEY", "SECRET_KEY"),
-}
+UNRETAINED_PREFIXES = [f"{s}/" for s in render.VM_STORES if s not in render.RETAINED_STORES]
+# .env に provision が書く項目（managed の down で消す）
+PROVISIONED_ENV_KEYS = ["LAB_VM_NODES", "LAB_VM_BUCKET", "LAB_VM_ENTRY_IP_ID", "LAB_VM_PROXY_NODE", "LAB_EGRESS_PROXY",
+                        "LAB_EGRESS_PROXY_MAC", "LAB_EGRESS_CA_FILE"]
 
 
 def kube_context(env: Env) -> str:
     return VM_KUBE_CONTEXTS[env.target]
 
 
-# ---- k3s の版（純粋な関数。単体テストの対象。EC2 版の labtool/ec2.py から） ----
+# ---- k3s の版（純粋な関数。単体テストの対象） ----
 def k3s_install_version(image: str = K3S_IMAGE) -> str:
     """Mac の k3s のイメージのタグ（v1.35.5-k3s1）を、インストールスクリプトの版の形（v1.35.5+k3s1）にする。"""
     return image.rsplit(":", 1)[1].replace("-k3s", "+k3s")
@@ -95,7 +94,8 @@ def upgrade_order(node_ids: list[str], entry_holder: str | None, forward_target:
 
 # ---- 操作者の IP と SSH ----
 def operator_cidr(env: Env, lookup=None) -> str:
-    """22 を開ける送信元。.env の LAB_SSH_ALLOW_CIDR があればそれ、無ければパブリック IPv4 を外部に問い合わせて /32。"""
+    """22 を開ける送信元。.env の LAB_SSH_ALLOW_CIDR があればそれ、無ければパブリック IPv4 を外部に問い合わせて /32
+    （中継を通さずに問い合わせる。通すと中継の IP が返る）。"""
     fixed = env.get("LAB_SSH_ALLOW_CIDR", "").strip()
     if fixed:
         return fixed if "/" in fixed else f"{fixed}/32"
@@ -116,31 +116,38 @@ def web_cidr(env: Env) -> str:
 
 
 def _lookup_public_ip() -> str:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # 中継を通さない
     for url in IP_LOOKUPS:
         try:
-            with urllib.request.urlopen(url, timeout=5) as res:
+            with opener.open(url, timeout=5) as res:
                 return res.read().decode().strip()
         except Exception:  # noqa: BLE001 次の問い合わせ先へ
             continue
     return ""
 
 
-def ensure_ssh_key() -> str:
-    """SSH の鍵（.build/vm-ssh-key。無ければ作る）。公開鍵の文字列を返す。"""
-    if not SSH_KEY.exists():
-        BUILD_DIR.mkdir(parents=True, exist_ok=True)
-        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "litellm-lab", "-f", str(SSH_KEY)], quiet=True)
-        info(f"SSH の鍵を {SSH_KEY.relative_to(ROOT)} に作りました")
-    return SSH_KEY.with_suffix(".pub").read_text().strip()
+def ensure_ssh_key(env: Env) -> str:
+    """SSH の鍵（LAB_VM_SSH_KEY。既定 .build/vm-ssh-key。managed で無ければ作る）。公開鍵の文字列を返す。"""
+    key = env.vm_ssh_key
+    if not key.exists():
+        if env.is_provided:
+            raise LabError(f"SSH の秘密鍵 {key}（LAB_VM_SSH_KEY）がありません。用意する側から受け取った鍵のパスを書いてください")
+        key.parent.mkdir(parents=True, exist_ok=True)
+        run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "litellm-lab", "-f", str(key)], quiet=True)
+        info(f"SSH の鍵を {key} に作りました")
+    pub = key.with_suffix(".pub")
+    if pub.exists():
+        return pub.read_text().strip()
+    return output(["ssh-keygen", "-y", "-f", str(key)]).strip()
 
 
-def ssh_base(node: Node, *extra: str) -> list[str]:
+def ssh_base(env: Env, node: Node, *extra: str) -> list[str]:
     if not node.public_ip:
         raise LabError(f"ノード {node.id} に公開 IP がありません（起動を待つか、外向きの IP を確かめてください）")
     # known_hosts は IP でなく台の識別子で引く（GCP は浮動 IP を取った台の公開 IP が静的 IP に入れ替わり、障害で別の台に移る）
-    return ["ssh", "-i", str(SSH_KEY), "-o", f"UserKnownHostsFile={KNOWN_HOSTS}", "-o", "StrictHostKeyChecking=accept-new",
+    return ["ssh", "-i", str(env.vm_ssh_key), "-o", f"UserKnownHostsFile={KNOWN_HOSTS}", "-o", "StrictHostKeyChecking=accept-new",
             "-o", f"HostKeyAlias={host_alias(node)}", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
-            *extra, f"{SSH_USER}@{node.public_ip}"]
+            *extra, f"{env.vm_ssh_user}@{node.public_ip}"]
 
 
 def host_alias(node: Node) -> str:
@@ -148,11 +155,17 @@ def host_alias(node: Node) -> str:
     return node.id.replace("/", "_")
 
 
-def run_on(node: Node, script: str, timeout: int = 120) -> str:
-    """VM の中でシェルのスクリプトを root で流し、標準出力を返す（EC2 版の Run Command の置き換え）。"""
-    proc = run([*ssh_base(node), "sudo", "bash", "-s"], input=script, capture=True, check=False, timeout=timeout + 30)
+def run_on(env: Env, node: Node, script: str, timeout: int = 120, input_bytes: bytes | None = None) -> str:
+    """VM の中でシェルのスクリプトを root で流し、標準出力を返す。input_bytes があれば、スクリプトでなくそれを標準入力にして
+    script をコマンドとして流す（イメージのビルドの文脈の tar など）。"""
+    if input_bytes is None:
+        proc = run([*ssh_base(env, node), "sudo", "bash", "-s"], input=script, capture=True, check=False, timeout=timeout + 30)
+    else:
+        proc = subprocess.run([*ssh_base(env, node), "sudo", "bash", "-c", script], input=input_bytes,
+                              capture_output=True, timeout=timeout + 30)
+        proc.stdout, proc.stderr = proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
     if proc.returncode != 0:
-        raise LabError(f"{node.id} でのコマンドが失敗しました（終了コード {proc.returncode}）: {(proc.stderr or proc.stdout or '')[-800:]}")
+        raise LabError(f"{node.id} でのコマンドが失敗しました（終了コード {proc.returncode}）: {(proc.stderr or proc.stdout or '')[-1500:]}")
     return proc.stdout
 
 
@@ -163,60 +176,107 @@ def forget_host(node: Node) -> None:
         KNOWN_HOSTS.write_text("\n".join(lines) + ("\n" if lines else ""))
 
 
-def refresh_public_ips(env: Env, infra: Infra) -> bool:
-    """台の公開 IP をクラウドから引き直す（GCP は浮動 IP を取った台の公開 IP が静的 IP に変わる。配備で判明 2026-10-30）。
-    変わっていれば .build に保存して True。"""
-    found = clouds.for_env(env).discover(env)
-    if found is None:
-        return False
-    by_index = {n.index: n for n in found.nodes}
-    changed = False
-    for n in infra.nodes:
-        fresh = by_index.get(n.index)
-        if fresh and fresh.public_ip and fresh.public_ip != n.public_ip:
-            info(f"{n.id} の公開 IP が {n.public_ip or '(無し)'} → {fresh.public_ip} に変わりました")
-            n.public_ip = fresh.public_ip
-            changed = True
-    if changed:
-        save_infra(infra)
-    return changed
-
-
 def _port_open(ip: str, port: int) -> bool:
     with socket.socket() as s:
         s.settimeout(3)
         return s.connect_ex((ip, port)) == 0
 
 
-def wait_nodes_ready(env: Env, infra: Infra) -> None:
-    """3 台の 22 が開き、初期化（vm/node-init.sh）が終わる（/var/lib/lab/ready）まで待つ。
-    届かない台があれば公開 IP を引き直す（主系が浮動 IP を取ると GCP では公開 IP が変わる）。"""
-    nodes = infra.nodes
+# ---- 基盤（.env の識別子から組む） ----
+def save_infra(infra: Infra) -> None:
+    write_if_changed(INFRA_FILE, json.dumps(asdict(infra), indent=2, ensure_ascii=False, sort_keys=True) + "\n", mode=0o600)
 
+
+def require_provided_env(env: Env) -> None:
+    """既存資源の .env の項目がそろっているか（provided。managed は provision が書く）。"""
+    missing = []
+    if len(env.vm_nodes) != clouds.NODE_COUNT:
+        missing.append(f"LAB_VM_NODES（VM の識別子 {clouds.NODE_COUNT} つをカンマ区切り。今 {len(env.vm_nodes)} つ）")
+    for key, what in (("LAB_VM_BUCKET", "バケット名"), ("LAB_VM_ENTRY_IP_ID", "浮動 IP の識別子")):
+        if not env.get(key):
+            missing.append(f"{key}（{what}）")
+    users = [*clouds.STATIC_KEY_USERS] + ([clouds.OPERATOR_USER] if env.is_gcp_vm else [])
+    for user in users:
+        key_name, secret_name = render.s3_env_names(user, env)
+        if not (env.get(key_name) and env.get(secret_name)):
+            missing.append(f"{key_name} / {secret_name}（{user} の静的キー）")
+    if env.egress_proxy and (env.egress_ca_file is None or not env.egress_ca_file.exists()):
+        missing.append("LAB_EGRESS_CA_FILE（中継の CA の PEM。LAB_EGRESS_PROXY があるとき必須）")
+    if missing:
+        raise LabError("LAB_INFRA=provided には .env の次の項目が要ります（用意する側から受け取る。変更設計書 2 章）:\n  "
+                       + "\n  ".join(missing))
+
+
+def load_infra(env: Env) -> Infra:
+    """基盤を .env の識別子と API で組む。無ければエラー。"""
+    if len(env.vm_nodes) != clouds.NODE_COUNT or not env.vm_bucket:
+        raise LabError(f"{env.target} の基盤の識別子（LAB_VM_NODES、LAB_VM_BUCKET）が .env にありません。"
+                       "managed なら ./lab cluster が作って書き、provided なら用意する側から受け取って書いてください")
+    cloud = clouds.for_env(env)
+    infra = Infra(region=env.vm_region, bucket=env.vm_bucket, entry_ip_id=env.vm_entry_ip_id)
+    infra.nodes = cloud.describe_nodes(env, env.vm_nodes)
+    if env.vm_entry_ip_id:
+        infra.entry_ip = cloud.describe_entry_ip(env, env.vm_entry_ip_id)
+    proxy_id = env.get("LAB_VM_PROXY_NODE")
+    if proxy_id:
+        infra.proxy = cloud.describe_nodes(env, [proxy_id])[0]
+        infra.proxy.index = 0
+    save_infra(infra)
+    return infra
+
+
+def try_load_infra(env: Env) -> Infra | None:
+    try:
+        return load_infra(env)
+    except LabError:
+        return None
+
+
+def ensure_access(env: Env) -> None:
+    """VM に届く状態にする: managed は 22 と 80/443（と中継）の許可を操作者の今の IP に合わせ、ポート転送を確かめる。
+    provided はネットワークを触らず、転送だけ。基盤が無ければ何もしない。"""
+    infra = try_load_infra(env)
+    if infra is None or not infra.nodes:
+        return
+    if not env.is_provided:
+        cloud = clouds.for_env(env)
+        cidr = operator_cidr(env)
+        cloud.allow_ssh_from(env, cidr)
+        cloud.allow_web_from(env, web_cidr(env))
+        if env.egress_proxy_vm:
+            cloud.allow_proxy_from(env, cidr)
+    ensure_forward(env, infra)
+
+
+def refresh_public_ips(env: Env, infra: Infra) -> bool:
+    """台の公開 IP をクラウドから引き直す（GCP は浮動 IP を取った台の公開 IP が静的 IP に変わる。配備で判明 2026-10-30）。"""
+    fresh = {n.index: n for n in clouds.for_env(env).describe_nodes(env, env.vm_nodes)}
+    changed = False
+    for n in infra.nodes:
+        f = fresh.get(n.index)
+        if f and f.public_ip and f.public_ip != n.public_ip:
+            info(f"{n.id} の公開 IP が {n.public_ip or '(無し)'} → {f.public_ip} に変わりました")
+            n.public_ip = f.public_ip
+            changed = True
+    if changed:
+        save_infra(infra)
+    return changed
+
+
+def wait_ssh(env: Env, nodes: list[Node], infra: Infra | None = None, timeout: int = 600) -> None:
     def reachable() -> bool:
         if all(n.public_ip and _port_open(n.public_ip, 22) for n in nodes):
             return True
-        refresh_public_ips(env, infra)
+        if infra is not None:
+            refresh_public_ips(env, infra)
         return False
-
-    wait_until(600, "3 台の SSH（22）", reachable)
-
-    def initialized() -> bool:
-        for n in nodes:
-            try:
-                if run_on(n, "test -f /var/lib/lab/ready && echo ready", timeout=30).strip() != "ready":
-                    return False
-            except LabError:
-                refresh_public_ips(env, infra)
-                return False
-        return True
-
-    wait_until(900, "3 台の k3s と keepalived の準備（node-init.sh）", initialized)
+    wait_until(timeout, f"{len(nodes)} 台の SSH（22）", reachable)
 
 
+# ---- kubeconfig とポート転送 ----
 def fetch_kubeconfig(env: Env, node: Node) -> None:
     """k3s の kubeconfig を 1 台から読み、ポート転送の宛先（127.0.0.1）に向けたコンテキストを ~/.kube/config に書く。"""
-    cfg = yaml.safe_load(run_on(node, "cat /etc/rancher/k3s/k3s.yaml", timeout=30))
+    cfg = yaml.safe_load(run_on(env, node, "cat /etc/rancher/k3s/k3s.yaml", timeout=30))
     cluster = cfg["clusters"][0]["cluster"]
     user = cfg["users"][0]["user"]
     ctx = kube_context(env)
@@ -260,7 +320,7 @@ def ensure_forward(env: Env, infra: Infra, avoid: str | None = None) -> None:
     FORWARD_LOG.parent.mkdir(parents=True, exist_ok=True)
     log = open(FORWARD_LOG, "ab")
     proc = subprocess.Popen(
-        ssh_base(nodes[0], "-N", "-o", "ServerAliveInterval=30", "-o", "ExitOnForwardFailure=yes",
+        ssh_base(env, nodes[0], "-N", "-o", "ServerAliveInterval=30", "-o", "ExitOnForwardFailure=yes",
                  "-L", f"{port}:127.0.0.1:6443"),
         stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
     FORWARD_PID_FILE.write_text(str(proc.pid))
@@ -288,143 +348,193 @@ def registry_forward():
         yield endpoint
 
 
-# ---- 基盤（クラウド固有層の呼び出しのまとめ） ----
-def save_infra(infra: Infra) -> None:
-    write_if_changed(INFRA_FILE, json.dumps(asdict(infra), indent=2, ensure_ascii=False, sort_keys=True) + "\n", mode=0o600)
+# ---- k3s のトークンと版（バケットの cluster/。操作者が読み書きし、VM には SSH で渡す） ----
+def ensure_cluster_objects(env: Env) -> tuple[str, str]:
+    """cluster/k3s/token（無ければ乱数）と cluster/k3s/version（無ければコードの版）。配備済みの版とコードの版が
+    違えば止める（上げるのは ./lab upgrade-k8s だけ。./lab up では版を変えない）。(トークン, 版) を返す。"""
+    from botocore.exceptions import ClientError
+    bucket = env.vm_bucket
+    with objstore.admin_s3(env) as s3:
+        def get(key: str) -> str | None:
+            try:
+                return s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode().strip()
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") in ("NoSuchKey", "404", "NotFound"):
+                    return None
+                raise
+        token = get(TOKEN_KEY)
+        if token is None:
+            token = gen_secret(32)
+            s3.put_object(Bucket=bucket, Key=TOKEN_KEY, Body=token.encode())
+            info(f"k3s の参加トークンを {bucket}/{TOKEN_KEY} に置きました")
+        version = get(VERSION_KEY)
+        if version is None:
+            version = k3s_install_version()
+            s3.put_object(Bucket=bucket, Key=VERSION_KEY, Body=version.encode())
+            info(f"k3s の版 {version} を {bucket}/{VERSION_KEY} に置きました")
+        elif version != k3s_install_version():
+            raise LabError(f"配備済みの k3s の版（{version}）とコードの版（{k3s_install_version()}）が違います。"
+                           f"上げるなら ./lab upgrade-k8s {k3s_install_version()}、戻すなら core.py の K3S_IMAGE を "
+                           f"{version} に合わせてください（./lab up では版を変えません）")
+    return token, version
 
 
-def ensure_bucket_prefix(env: Env) -> str:
-    """バケット名の接頭辞（LAB_BUCKET_PREFIX）を Env に載せる（preflight と同じ。試験など preflight を通らない入口から使う）。"""
-    if not env.get("LAB_BUCKET_PREFIX"):
-        cloud = clouds.for_env(env)
-        env.values["LAB_BUCKET_PREFIX"] = cloud.bucket_prefix(env, cloud.identity(env))
-    return env.get("LAB_BUCKET_PREFIX")
+def set_version(env: Env, version: str) -> None:
+    with objstore.admin_s3(env) as s3:
+        s3.put_object(Bucket=env.vm_bucket, Key=VERSION_KEY, Body=version.encode())
 
 
-def load_infra(env: Env) -> Infra:
-    """基盤を API で探す（.build の記録は目安にしか使わない）。無ければエラー。"""
-    infra = clouds.for_env(env).discover(env)
-    if infra is None or not infra.nodes:
-        raise LabError(f"{env.target} の基盤がありません。先に ./lab cluster を流してください")
-    save_infra(infra)
-    return infra
+# ---- VM の初期化（SSH） ----
+def egress_values(env: Env, infra: Infra) -> dict[str, str]:
+    """初期化スクリプトに渡す中継の値（URL、除外、CA の base64）。中継が無ければ空。"""
+    if not env.egress_proxy:
+        return {"EGRESS_PROXY": "", "EGRESS_NO_PROXY": "", "EGRESS_CA_B64": ""}
+    no_proxy = render.NODE_NO_PROXY_BASE + "," + env.vm_cidr + "," + ",".join(n.private_ip for n in infra.nodes if n.private_ip)
+    ca = render.egress_ca_text(env)
+    return {"EGRESS_PROXY": env.egress_proxy, "EGRESS_NO_PROXY": no_proxy,
+            "EGRESS_CA_B64": base64.b64encode(ca.encode()).decode() if ca else ""}
 
 
-def ensure_access(env: Env) -> None:
-    """VM に届く状態にする: 22 と 80/443 の許可を操作者の今の IP に合わせ、ポート転送を確かめる。基盤が無ければ何もしない。"""
-    cloud = clouds.for_env(env)
-    infra = cloud.discover(env)
-    if infra is None or not infra.nodes:
-        return
-    cloud.allow_ssh_from(env, operator_cidr(env))
-    cloud.allow_web_from(env, web_cidr(env))
-    save_infra(infra)
-    ensure_forward(env, infra)
-
-
-def ensure_cluster_objects(env: Env, cloud, infra: Infra) -> str:
-    """cluster バケットの k3s/token（無ければ乱数）と k3s/version（無ければコードの版）。配備済みの版とコードの版が
-    違えば止める（上げるのは ./lab upgrade-k8s だけ。./lab up では版を変えない）。今の版を返す。"""
-    bucket = infra.buckets[CLUSTER_BUCKET]
-    if cloud.get_object(env, bucket, TOKEN_KEY) is None:
-        cloud.put_object(env, bucket, TOKEN_KEY, gen_secret(32).encode())
-        info(f"k3s の参加トークンを {bucket}/{TOKEN_KEY} に置きました")
-    version = cloud.get_object(env, bucket, VERSION_KEY)
-    if version is None:
-        cloud.put_object(env, bucket, VERSION_KEY, k3s_install_version().encode())
-        info(f"k3s の版 {k3s_install_version()} を {bucket}/{VERSION_KEY} に置きました")
-        return k3s_install_version()
-    deployed = version.decode().strip()
-    if deployed != k3s_install_version():
-        raise LabError(f"配備済みの k3s の版（{deployed}）とコードの版（{k3s_install_version()}）が違います。"
-                       f"上げるなら ./lab upgrade-k8s {k3s_install_version()}、戻すなら core.py の K3S_IMAGE を "
-                       f"{deployed} に合わせてください（./lab up では版を変えません）")
-    return deployed
-
-
-def set_version(env: Env, cloud, infra: Infra, version: str) -> None:
-    cloud.put_object(env, infra.buckets[CLUSTER_BUCKET], VERSION_KEY, version.encode())
-
-
-def render_node_init(node: Node, all_nodes: list[Node], hooks: str, pubkey: str, script: str | None = None) -> str:
-    """vm/node-init.sh の @@名前@@ をこの台の値で置き換え、クラウド固有の hooks を差し込む。"""
+def render_node_init(node: Node, all_nodes: list[Node], hooks: str, pubkey: str, values: dict[str, str] | None = None,
+                     script: str | None = None) -> str:
+    """vm/node-init.sh の @@名前@@ をこの台の値で置き換え、クラウド固有の hooks を差し込む。
+    values: K3S_VERSION、K3S_TOKEN、EGRESS_PROXY、EGRESS_NO_PROXY、EGRESS_CA_B64、SSH_USER。"""
     text = script if script is not None else NODE_INIT_SCRIPT.read_text()
     ordered = sorted(all_nodes, key=lambda n: n.index)
     peers = [n.private_ip for n in ordered if n.index != node.index]
-    values = {
+    filled = {
         "NODE_INDEX": str(node.index), "SELF_IP": node.private_ip, "FIRST_IP": ordered[0].private_ip,
         "PEER_IPS": " ".join(peers), "PRIORITY": str(PRIORITIES[node.index - 1]), "REGISTRY_HOST": REGISTRY_HOST,
         "REGISTRY_NODEPORT": str(REGISTRY_NODEPORT), "SSH_PUBKEY": pubkey, "HOOKS": hooks,
+        "K3S_VERSION": "", "K3S_TOKEN": "", "EGRESS_PROXY": "", "EGRESS_NO_PROXY": "", "EGRESS_CA_B64": "", "SSH_USER": "ubuntu",
     }
-    for k, v in values.items():
+    filled.update(values or {})
+    for k, v in filled.items():
         text = text.replace(f"@@{k}@@", v)
-    left = re.findall(r"@@[A-Z_]+@@", text)
+    left = re.findall(r"@@[A-Z_0-9]+@@", text)
     if left:
         raise ValueError(f"node-init.sh に置き換えていない名前が残っています: {left}")
     return text
 
 
-def user_data_renderer(env: Env, cloud, infra: Infra, pubkey: str):
-    """clouds.ensure_nodes に渡す描画関数。"""
-    def render_for(node: Node, all_nodes: list[Node]) -> str:
-        return render_node_init(node, all_nodes, cloud.node_init_hooks(env, infra, node), pubkey)
-    return render_for
+def init_nodes(env: Env, infra: Infra, pubkey: str) -> None:
+    """3 台を 1 番から順に SSH で初期化する（1 番がクラスタを起こし、2・3 番が参加する）。2 回目以降は中継と CA の設定だけ直す。
+    中継を通さないか、まだ中継の VM が無い間は、外へ出る手順（apt、k3s）が失敗するので、中継は先に初期化しておく。"""
+    cloud = clouds.for_env(env)
+    token, version = ensure_cluster_objects(env)
+    wait_ssh(env, infra.nodes, infra)
+    common = {"K3S_VERSION": version, "K3S_TOKEN": token, "SSH_USER": env.vm_ssh_user, **egress_values(env, infra)}
+    for node in sorted(infra.nodes, key=lambda n: n.index):
+        script = render_node_init(node, infra.nodes, cloud.node_init_hooks(env, infra, node), pubkey, common)
+        info(f"{node.id}（node{node.index}）を初期化します（SSH）")
+        out = run_on(env, node, script, timeout=1500)
+        tail = out.strip().splitlines()[-1] if out.strip() else ""
+        ok(f"{node.id}: {tail}")
+        refresh_public_ips(env, infra)   # GCP は 1 番が浮動 IP を取ると公開 IP が入れ替わる
 
 
-# ---- 静的キー（Kubernetes の Secret にだけ置く） ----
-def _read_secret(name: str) -> dict[str, str]:
-    text = output(kn("get", "secret", name, "--ignore-not-found", "-o", "json"), check=False)
-    if not text.strip():
-        return {}
-    data = json.loads(text).get("data", {}) or {}
-    return {k: base64.b64decode(v).decode() for k, v in data.items()}
+def node_arch(env: Env, node: Node) -> str:
+    """自作イメージのアーキテクチャ（LAB_VM_ARCH か、その台の uname -m）。"""
+    if env.vm_arch:
+        return env.vm_arch
+    m = run_on(env, node, "uname -m", timeout=30).strip()
+    return {"aarch64": "arm64", "arm64": "arm64", "x86_64": "amd64", "amd64": "amd64"}.get(m, m)
 
 
-def drop_env_static_keys(env: Env) -> list[str]:
-    """VM の環境では .env の静的キー（S3_<利用者>_KEY / _SECRET、RUSTFS_*）を読まない。Mac の RustFS 用の値が同じ名前で
-    .env に残っていて、クラウドの Secret に写してしまうため（配備で判明 2026-10-30）。消した名前を返す。"""
-    dropped = []
-    names = [n for user in KEY_SECRETS for n in render.s3_env_names(user)] + ["RUSTFS_ACCESS_KEY", "RUSTFS_SECRET_KEY"]
-    for name in names:
-        if env.values.pop(name, None):
-            dropped.append(name)
-    return dropped
+def build_node(env: Env, infra: Infra) -> Node:
+    """イメージをビルドする台（SSH の転送先。無ければ 1 番）。"""
+    target = forward_target()
+    for n in infra.nodes:
+        if n.id == target:
+            return n
+    return sorted(infra.nodes, key=lambda n: n.index)[0]
 
 
-def load_static_keys(env: Env) -> set[str]:
-    """Kubernetes の Secret にある静的キーを Env に載せる（S3_<利用者>_KEY / _SECRET。.env には書かない）。見つかった利用者を返す。
-    同じ実行で一度載せた値は使い回す。"""
-    found = set()
-    for user, (secret, key_item, secret_item) in KEY_SECRETS.items():
-        key_name, secret_name = render.s3_env_names(user)
-        if user in _loaded_users and env.get(key_name) and env.get(secret_name):
-            found.add(user)
-            continue
-        data = _read_secret(secret)
-        if data.get(key_item) and data.get(secret_item):
-            env.values[key_name], env.values[secret_name] = data[key_item], data[secret_item]
-            found.add(user)
-            _loaded_users.add(user)
-    return found
+def _context_tar(context_dir: Path, ca_text: str) -> bytes:
+    """ビルドの文脈（__pycache__ と .pyc を除く）に egress-ca.pem（中継の CA。無ければ空）を足した tar。"""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for p in sorted(context_dir.rglob("*")):
+            if not p.is_file() or "__pycache__" in p.parts or p.suffix == ".pyc" or p.name == "egress-ca.pem":
+                continue
+            tar.add(p, arcname=str(p.relative_to(context_dir)))
+        data = ca_text.encode()
+        ti = tarfile.TarInfo("egress-ca.pem")
+        ti.size = len(data)
+        ti.mtime = 0
+        tar.addfile(ti, io.BytesIO(data))
+    return buf.getvalue()
 
 
-_loaded_users: set[str] = set()
+def build_and_push_on_node(env: Env, infra: Infra, name: str, tag: str, context_dir: Path, build_args: list[str]) -> None:
+    """VM 上で docker build し、クラスタの中の置き場（127.0.0.1:<NodePort>。Docker は 127.0.0.0/8 を平文の置き場として扱う）に push する。
+    文脈は tar で標準入力から渡す（変更設計書 6 章）。"""
+    node = build_node(env, infra)
+    arch = node_arch(env, node)
+    local = f"{name}:{tag}"
+    pushed = f"127.0.0.1:{REGISTRY_NODEPORT}/{name}:{tag}"
+    args = " ".join(f"'{a}'" for a in build_args)
+    info(f"{node.id}（{arch}）でイメージ {local} をビルドします")
+    script = (f"set -e; docker build --platform linux/{arch} {args} -t '{local}' - >/tmp/lab-build-{name}.log 2>&1 "
+              f"|| {{ tail -n 60 /tmp/lab-build-{name}.log; exit 1; }}; "
+              f"docker tag '{local}' '{pushed}' && docker push -q '{pushed}' && docker rmi '{pushed}' >/dev/null")
+    run_on(env, node, script, timeout=1800, input_bytes=_context_tar(context_dir, render.egress_ca_text(env)))
+    ok(f"push しました: {REGISTRY_HOST}/{name}:{tag}（{arch}）")
 
 
-def ensure_static_keys(env: Env, cloud, infra: Infra) -> None:
-    """静的キーをそろえる: Secret にある利用者はそのまま、無い利用者だけクラウドで作り直して Env に載せる。
-    操作者の HMAC キー（GCP だけ）は Secret lab-operator-s3 に書く（他の Secret は stages.secrets_ が書く）。"""
-    from .core import kapply, secret_manifest
-    have = load_static_keys(env)
-    new = cloud.ensure_static_keys(env, infra.bucket_prefix, have)
-    for user, (key, secret) in new.items():
-        key_name, secret_name = render.s3_env_names(user)
-        env.values[key_name], env.values[secret_name] = key, secret
-        _loaded_users.add(user)
-    op_key, op_secret = render.s3_env_names("operator")
-    if env.get(op_key) and not _read_secret(KEY_SECRETS["operator"][0]):
-        kapply(manifest=secret_manifest(KEY_SECRETS["operator"][0],
-                                        {"ACCESS_KEY": env.get(op_key), "SECRET_KEY": env.get(op_secret)}))
+# ---- 中継（出口プロキシ）の VM ----
+def init_proxy(env: Env, infra: Infra) -> None:
+    """中継の VM を SSH で初期化し（mitmproxy、独自 CA）、CA を .build/egress-ca.pem に取って .env の中継の項目を埋める。"""
+    proxy = infra.proxy
+    if proxy is None:
+        raise LabError("中継の VM がありません（LAB_VM_PROXY_NODE）")
+    wait_ssh(env, [proxy])
+    script = PROXY_INIT_SCRIPT.read_text().replace("@@PORT@@", str(PROXY_PORT))
+    run_on(env, proxy, script, timeout=600)
+    ca = run_on(env, proxy, "cat /etc/mitmproxy/mitmproxy-ca-cert.pem", timeout=30)
+    if "BEGIN CERTIFICATE" not in ca:
+        raise LabError("中継の CA を読めませんでした")
+    EGRESS_CA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    write_if_changed(EGRESS_CA_FILE, ca, mode=0o644)
+    env.set("LAB_EGRESS_CA_FILE", str(EGRESS_CA_FILE.relative_to(ROOT)))
+    env.set("LAB_EGRESS_PROXY", f"http://{proxy.private_ip}:{PROXY_PORT}")
+    env.set("LAB_EGRESS_PROXY_MAC", f"http://{proxy.public_ip}:{PROXY_PORT}")
+    env.apply_mac_proxy()
+    ok(f"中継の VM {proxy.id} の準備ができました（VM と Pod は http://{proxy.private_ip}:{PROXY_PORT}、Mac は http://{proxy.public_ip}:{PROXY_PORT}）")
+
+
+def proxy_log(env: Env, since: str) -> dict[str, int]:
+    """中継の記録（journal）から宛先ホストごとの件数。"""
+    infra = load_infra(env)
+    if infra.proxy is None:
+        raise LabError("中継の VM がありません（LAB_EGRESS_PROXY_VM=true で ./lab up）")
+    text = run_on(env, infra.proxy, f"journalctl -u lab-proxy --since '{since}' --no-pager -o cat", timeout=120)
+    counts: dict[str, int] = {}
+    for line in text.splitlines():
+        m = re.search(r"\b(?:GET|POST|PUT|HEAD|DELETE|PATCH|OPTIONS|CONNECT)\s+(https?://[^/\s]+|[^/\s:]+)", line)
+        if m:
+            host = re.sub(r"^https?://", "", m.group(1)).split(":")[0]
+            counts[host] = counts.get(host, 0) + 1
+    return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
+
+
+# ---- アンインストール（provided の down） ----
+def uninstall(env: Env, infra: Infra) -> None:
+    """3 台の k3s と keepalived を外し、初期化の印を消す（用意された VM は残す）。"""
+    script = ("set +e; /usr/local/bin/k3s-uninstall.sh >/dev/null 2>&1; systemctl disable --now keepalived lab-egress >/dev/null 2>&1; "
+              "rm -f /var/lib/lab/ready /var/lib/lab/hooks.sh /etc/keepalived/keepalived.conf; echo uninstalled")
+    for node in infra.nodes:
+        if node.public_ip and _port_open(node.public_ip, 22):
+            run_on(env, node, script, timeout=600)
+            info(f"{node.id} の k3s を外しました")
+        else:
+            warn(f"{node.id} に SSH で届かないので飛ばします")
+
+
+def empty_unretained(env: Env) -> None:
+    """バケットの保持の無いディレクトリ（audit-derived/、pg-backup/、images/、cluster/）を空にする（原本と閲覧記録は残す）。"""
+    n = clouds.for_env(env).empty_bucket(env, env.vm_bucket, prefixes=UNRETAINED_PREFIXES)
+    info(f"バケット {env.vm_bucket} の {', '.join(UNRETAINED_PREFIXES)} を空にしました（{n} 版）")
 
 
 # ---- ノードの対応（Kubernetes のノード名 ↔ Node） ----
@@ -451,8 +561,8 @@ def node_versions() -> dict[str, str]:
     return {n["metadata"]["name"]: n["status"]["nodeInfo"]["kubeletVersion"] for n in nodes["items"]}
 
 
-def etcd_snapshot(node: Node, name: str) -> None:
-    run_on(node, f"/usr/local/bin/k3s etcd-snapshot save --name {name}", timeout=300)
+def etcd_snapshot(env: Env, node: Node, name: str) -> None:
+    run_on(env, node, f"/usr/local/bin/k3s etcd-snapshot save --name {name}", timeout=300)
     info(f"etcd のスナップショット {name} を {node.id} に取りました")
 
 
@@ -461,9 +571,11 @@ def drain_node(node_name: str) -> None:
     run(kc("drain", node_name, "--ignore-daemonsets", "--delete-emptydir-data", "--timeout=600s"))
 
 
-def install_k3s(node: Node, version: str) -> None:
-    """その台でインストールスクリプトを再実行する（新しい binary を置き、k3s を再起動する）。引数は config.yaml から。"""
-    run_on(node, f"curl -sfL {K3S_INSTALL_URL} | INSTALL_K3S_VERSION='{version}' sh -s - server", timeout=600)
+def install_k3s(env: Env, node: Node, version: str) -> None:
+    """その台でインストールスクリプトを再実行する（新しい binary を置き、k3s を再起動する）。引数は config.yaml から。
+    中継は /etc/environment の値を使う。"""
+    run_on(env, node, f"set -a; . /etc/environment; set +a; curl -sfL {K3S_INSTALL_URL} | INSTALL_K3S_VERSION='{version}' sh -s - server",
+           timeout=600)
 
 
 def wait_node_version(node_name: str, version: str) -> None:

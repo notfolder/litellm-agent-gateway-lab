@@ -16,3 +16,7 @@ __pycache__/
 cdk/cdk.out/
 cdk/.venv/
 cdk/cdk.context.json
+
+# ./lab images が置く中継の CA（出口プロキシの中でのビルド用。無ければ空ファイル）
+litellm/egress-ca.pem
+apps/audit/egress-ca.pem

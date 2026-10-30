@@ -274,8 +274,8 @@ def snapshot() -> list[str]:
     try:
         from . import objectstore
         if env.is_vm:
-            from . import clouds, vm
-            lines += clouds.for_env(env).snapshot(env, vm.ensure_bucket_prefix(env))
+            from . import clouds
+            lines += clouds.for_env(env).snapshot(env, env.vm_bucket)
         else:
             with objectstore.admin_s3(env) as s3:
                 lines += objectstore.snapshot(env, s3)

@@ -7,13 +7,14 @@ import subprocess
 import sys
 
 from . import stages
+from . import render
 from .core import (
     BUILD_DIR, CLUSTER, NS, ROOT, Env, LabError, cluster_exists, helm, http_ok,
     info, kn, ok, output, run, step, succeeds, warn,
 )
 
 
-def down() -> None:
+def down(everything: bool = False) -> None:
     """Mac: クラスタを削除する。DB（クラスタ内）は消える。
     残すもの: .env、ChatGPT のトークン（LAB_DATA_DIR）、イメージの置き場（自作イメージと Docker Hub のキャッシュ）。
     AWS: 有料のものをすべて消す（compute → data → network のスタックと、残る S3・秘密情報・スナップショット）。
@@ -33,19 +34,42 @@ def down() -> None:
         return
     if env.is_vm:
         from . import clouds, vm
-        # 証明書を退避してから（Let's Encrypt の発行数の上限を避ける）、クラウド固有層が作った順の逆に全部消す。
-        # 残るのは DNS の A レコードと .build/ の退避だけ（変更設計書 2026-10-30-VM環境の共通化とGCP追加 4.5 節、5.5 節）
+        # 証明書を退避してから（Let's Encrypt の発行数の上限を避ける）。
+        # managed: クラウド固有層が作った順の逆に全部消す。残るのは DNS の A レコードと .build/ の退避だけ。
+        # provided: 用意された物は残し、k3s を外して保持の無いディレクトリを空にする。--all なら VM・浮動 IP・バケットも消す
+        # （変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 8 章）
         cloud = clouds.for_env(env)
+        infra = None
         try:
+            infra = vm.load_infra(env)
             vm.ensure_access(env)
             vm.save_tls_secret()
         except LabError as e:
             warn(f"証明書の退避を飛ばします（{e}）")
         vm.stop_forward()
-        cloud.destroy(env, keep_entry_ip=env.vm_keep_entry_ip)
+        if env.is_provided:
+            if infra is None:
+                raise LabError("既存資源の識別子が .env に無いか、届きません（LAB_VM_NODES、LAB_VM_BUCKET）")
+            vm.uninstall(env, infra)
+            vm.empty_unretained(env)
+            if everything:
+                cloud.destroy_provided(env, infra, keep_entry_ip=env.vm_keep_entry_ip)
+                ok(f"{env.target} の既存資源をすべて消しました（VM、浮動 IP、バケット。静的キーとネットワークは用意する側の物なので残る）")
+            else:
+                ok(f"{env.target} の k3s を外し、バケットの保持の無いディレクトリを空にしました（VM、バケット、浮動 IP、静的キーは残る。"
+                   "全部消すなら ./lab down --all）")
+        else:
+            cloud.destroy(env, keep_entry_ip=env.vm_keep_entry_ip)
+            for key in vm.PROVISIONED_ENV_KEYS:
+                if env.get(key):
+                    env.set(key, "")
+            for user in [*clouds.STATIC_KEY_USERS, clouds.OPERATOR_USER]:
+                for name in render.s3_env_names(user, env):
+                    if env.get(name):
+                        env.set(name, "")
+            ok(f"{env.target} の有料リソースを削除しました（VM、ディスク、バケット、静的キー、中継"
+               + ("。浮動 IP は残しました）" if env.vm_keep_entry_ip else "、浮動 IP）") + "。.env の識別子も消しました")
         vm.INFRA_FILE.unlink(missing_ok=True)
-        ok(f"{env.target} の有料リソースを削除しました（VM、ディスク、バケット、静的キー"
-           + ("。浮動 IP は残しました）" if env.vm_keep_entry_ip else "、浮動 IP）"))
         return
     if cluster_exists():
         run(["k3d", "cluster", "delete", CLUSTER])
@@ -84,10 +108,14 @@ ChatGPT:         {yn(env.has_chatgpt())}  → Codex 用のモデルと二次判�
         try:
             infra = vm.load_infra(env)
             holder = clouds.for_env(env).entry_ip_holder(env, infra)
-            print(f"VM:              {', '.join(f'{n.id}({n.public_ip})' for n in infra.nodes)}\n"
+            print(f"基盤:            LAB_INFRA={env.infra_mode}（バケット {infra.bucket}）\n"
+                  f"VM:              {', '.join(f'{n.id}({n.public_ip})' for n in infra.nodes)}\n"
                   f"浮動 IP:         {infra.entry_ip}（持ち主 {holder or '無し'}）\n"
                   f"k3s の版:        {', '.join(sorted(set(vm.node_versions().values())))}\n"
-                  f"22 の許可:       {vm.operator_cidr(env)}\n80/443 の許可:   {vm.web_cidr(env)}")
+                  f"出口プロキシ:    {env.egress_proxy or '無し'}"
+                  + (f"（中継の VM {infra.proxy.id}、Mac は {env.egress_proxy_mac or '通さない'}）" if infra.proxy else ""))
+            if not env.is_provided:
+                print(f"22 の許可:       {vm.operator_cidr(env)}\n80/443 の許可:   {vm.web_cidr(env)}")
         except LabError as e:
             warn(str(e))
     if http_ok(f"{env.base_url}/health/liveliness"):
@@ -133,14 +161,14 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
     oldest = min(versions.values(), key=vm.parse_k3s_version)
     vm.check_upgrade_step(oldest, target)
     if all(v == target for v in versions.values()):
-        vm.set_version(env, cloud, infra, target)
+        vm.set_version(env, target)
         ok(f"3 台とも {target} です")
         return {"version": target, "upgraded": []}
     holder = cloud.entry_ip_holder(env, infra)
     order = vm.upgrade_order(infra.node_ids(), holder, vm.forward_target())
     failover.wait_healthy(env)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    vm.etcd_snapshot(infra.node(order[-1]), f"lab-pre-upgrade-{stamp}")
+    vm.etcd_snapshot(env, infra.node(order[-1]), f"lab-pre-upgrade-{stamp}")
     todo = [i for i in order if versions.get(vm.k8s_name_for_node(infra.node(i))) != target]
     eta = datetime.now() + timedelta(minutes=8 * len(todo))
     info(f"{len(todo)} 台を {' → '.join(todo)} の順に上げます（浮動 IP の台 {holder} は最後）。"
@@ -160,7 +188,7 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
             info(f"--- {name}（{node_id}）: {versions[name]} → {target}")
             vm.ensure_forward(env, infra, avoid=node_id)
             vm.drain_node(name)
-            vm.install_k3s(node, target)
+            vm.install_k3s(env, node, target)
             vm.wait_node_version(name, target)
             vm.uncordon_node(name)
             failover.wait_healthy(env)
@@ -173,7 +201,7 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
     finally:
         if load is not None:
             load.__exit__(None, None, None)
-    vm.set_version(env, cloud, infra, target)
+    vm.set_version(env, target)
 
     result: dict = {"version": target, "upgraded": upgraded, "seconds": round(_time.time() - t0)}
     restarts_after = failover.litellm_restarts()

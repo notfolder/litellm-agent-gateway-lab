@@ -1,9 +1,8 @@
 # GCP 固有の手順（vm/node-init.sh の HOOKS の印に差し込む。labtool/clouds/gcp.py が @@名前@@ を埋める）。
-# gcloud は使わず、メタデータサーバーのトークンで Cloud Storage と Compute Engine の REST API を呼ぶ
-# （変更設計書 .history/2026-10-30-VM環境の共通化とGCP追加/ 5.6 節、6.2 節）。
+# gcloud は使わず、メタデータサーバーのトークンで Compute Engine の REST API を呼ぶ（中継があれば curl が環境変数で通る。
+# メタデータサーバーだけは中継を通さない）。
 LAB_PROJECT="@@PROJECT@@"
 LAB_REGION="@@REGION@@"
-LAB_CLUSTER_BUCKET="@@CLUSTER_BUCKET@@"      # k3s のトークンと版を置くバケット
 LAB_ADDRESS_NAME="@@ADDRESS_NAME@@"          # 静的な外部 IP の名前
 LAB_META="http://metadata.google.internal/computeMetadata/v1"
 LAB_COMPUTE="https://compute.googleapis.com/compute/v1"
@@ -11,7 +10,6 @@ LAB_COMPUTE="https://compute.googleapis.com/compute/v1"
 lab_hook_values() {
   echo "LAB_PROJECT='${LAB_PROJECT}'"
   echo "LAB_REGION='${LAB_REGION}'"
-  echo "LAB_CLUSTER_BUCKET='${LAB_CLUSTER_BUCKET}'"
   echo "LAB_ADDRESS_NAME='${LAB_ADDRESS_NAME}'"
   echo "LAB_META='${LAB_META}'"
   echo "LAB_COMPUTE='${LAB_COMPUTE}'"
@@ -22,19 +20,12 @@ lab_install_tools() {  # curl と python3（JSON の読み取り）は Ubuntu �
 }
 
 lab_token() {  # VM のサービスアカウントのアクセストークン
-  curl -s -H 'Metadata-Flavor: Google' "${LAB_META}/instance/service-accounts/default/token" \
+  curl -s --noproxy '*' -H 'Metadata-Flavor: Google' "${LAB_META}/instance/service-accounts/default/token" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
 }
 
 lab_meta() {  # 引数: instance/ 以下のパス
-  curl -s -H 'Metadata-Flavor: Google' "${LAB_META}/instance/$1"
-}
-
-lab_read_object() {  # 引数: バケットの鍵。標準出力に中身（JSON API、alt=media）
-  local key
-  key="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1")"
-  curl -sf -H "Authorization: Bearer $(lab_token)" \
-    "https://storage.googleapis.com/storage/v1/b/${LAB_CLUSTER_BUCKET}/o/${key}?alt=media"
+  curl -s --noproxy '*' -H 'Metadata-Flavor: Google' "${LAB_META}/instance/$1"
 }
 
 lab_self_id() {  # <ゾーン>/<名前>

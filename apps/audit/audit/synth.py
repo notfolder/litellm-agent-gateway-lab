@@ -72,15 +72,15 @@ def main(argv: list[str]) -> int:
                     FROM range({per_hour}))
               ORDER BY user_email, ts_start
             ) TO '{dest}' (FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)""")
-            s3.upload_file(str(dest), DERIVED, f"synth/meta/dt={day}/hour={hour:02d}/part-0.parquet")
+            s3.upload_file(str(dest), DERIVED.bucket, DERIVED.key(f"synth/meta/dt={day}/hour={hour:02d}/part-0.parquet"))
         # 日ごとの整形済みのデータと日次の集計（その日の 24 時間分から。整形の処理と同じ形）
-        src = f"read_parquet('s3://{DERIVED}/synth/meta/dt={day}/hour=*/part-0.parquet')"
+        src = f"read_parquet('{DERIVED.url(f'synth/meta/dt={day}/hour=*/part-0.parquet')}')"
         con.execute("LOAD httpfs")
         con.execute(cfg.duckdb_secret_sql())
         day_file = tmp / "day.parquet"
         con.execute(f"COPY (SELECT * FROM {src} ORDER BY user_email NULLS FIRST, ts_start) TO '{day_file}' "
                     f"(FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)")
-        s3.upload_file(str(day_file), DERIVED, f"synth/meta_day/dt={day}/part-0.parquet")
+        s3.upload_file(str(day_file), DERIVED.bucket, DERIVED.key(f"synth/meta_day/dt={day}/part-0.parquet"))
         dest = tmp / "d.parquet"
         con.execute(f"""COPY (
             SELECT '{day}'::DATE AS day, user_id, any_value(user_email) AS user_email, team_id, model_group, model,
@@ -88,7 +88,7 @@ def main(argv: list[str]) -> int:
                    sum(tokens_out) AS tokens_out, sum(tokens_cache_read) AS tokens_cache_read,
                    sum(tokens_cache_write) AS tokens_cache_write, sum(cost_usd) AS cost_usd
             FROM {src} GROUP BY ALL ORDER BY user_id) TO '{dest}' (FORMAT parquet, COMPRESSION zstd)""")
-        s3.upload_file(str(dest), DERIVED, f"synth/usage_daily/dt={day}/part-0.parquet")
+        s3.upload_file(str(dest), DERIVED.bucket, DERIVED.key(f"synth/usage_daily/dt={day}/part-0.parquet"))
         print(f"synth: {day} を作りました（{per_hour * 24:,} 件、経過 {int(time.monotonic() - t0)} 秒）", flush=True)
     return 0
 

@@ -1,9 +1,10 @@
-"""GCP のクラウド固有層（LAB_TARGET=gcp-vm。変更設計書 .history/2026-10-30-VM環境の共通化とGCP追加/ 5 章）。
+"""GCP のクラウド固有層（LAB_TARGET=gcp-vm。変更設計書 .history/2026-10-30-既存資源からの構築と出口プロキシ/ 3 章）。
 
-Compute Engine 3 台（C4A、Ubuntu 24.04 arm64）、VPC とファイアウォール、静的な外部 IP、Cloud Storage のバケットと
-サービスアカウントの HMAC キー。資源は名前（<env.vm_prefix>-…）とラベル lab-prefix で探し、無ければ作る。
-資格情報はアプリケーション既定の資格情報（gcloud auth application-default login）。Google のライブラリは関数の中で
-読み込む（aws-ec2 だけ使う人の単体試験でも、このモジュールの関数の組を確かめられるように）。
+provision（managed）: VPC とファイアウォール、静的な外部 IP、Cloud Storage のバケット 1 つ（オブジェクト保持ロック）、
+サービスアカウントと HMAC キー、カスタムロール、Compute Engine 3 台（C4A、Ubuntu 24.04 arm64。startup-script は使わず
+SSH で初期化する）、中継（出口プロキシ）の VM。資源は名前（<env.vm_prefix>-…）とラベル lab-prefix で探し、無ければ作る。
+setup（両モード）: .env の識別子（<ゾーン>/<名前>、アドレスの名前、バケット名）を読む。
+資格情報はアプリケーション既定の資格情報（gcloud auth application-default login）。Google のライブラリは関数の中で読み込む。
 """
 
 from __future__ import annotations
@@ -13,30 +14,33 @@ import json
 import time
 
 from .. import objectstore as objstore
+from .. import render
 from ..core import ROOT, Env, LabError, info, ok, warn
 from . import (
-    CLUSTER_BUCKET, IMAGES_BUCKET, LOCKED_BUCKETS, NODE_COUNT, STATIC_KEY_USERS, Infra, Node, bucket_specs, network_plan,
-    static_key_policies,
+    GCS_ROLE_LISTER, GCS_ROLE_WRITER, NODE_COUNT, OPERATOR_USER, PROXY_PORT, STATIC_KEY_USERS, Infra, Node, gcs_bindings,
+    network_plan,
 )
 
 LABEL_KEY = "lab-prefix"
 HOOKS_SCRIPT = ROOT / "vm" / "hooks-gcp.sh"
 IMAGE_PROJECT = "ubuntu-os-cloud"
 IMAGE_FAMILY = "ubuntu-2404-lts-arm64"
+PROXY_IMAGE_FAMILY = "ubuntu-2404-lts-amd64"
+PROXY_MACHINE_TYPE = "e2-small"
 DISK_TYPE = "hyperdisk-balanced"   # C4A は pd-* を使えない
 S3_ENDPOINT = "https://storage.googleapis.com"
 SCOPE = "https://www.googleapis.com/auth/cloud-platform"
-# 操作者が S3 互換の API（boto3）でバケットに触るための HMAC キー（Secret lab-operator-s3 にだけ置く）
-OPERATOR_USER = "operator"
-# VM のサービスアカウントの権限（浮動 IP の付け替えと、自分の情報の読み取り）
+# VM のサービスアカウントの権限（浮動 IP の付け替えと、自分の情報の読み取り。バケットの権限は要らない）
 NODE_PERMISSIONS = [
     "compute.instances.get", "compute.instances.list", "compute.instances.addAccessConfig",
     "compute.instances.deleteAccessConfig", "compute.addresses.get", "compute.addresses.list", "compute.addresses.use",
     "compute.zoneOperations.get", "compute.subnetworks.use", "compute.subnetworks.useExternalIp",
 ]
-# S3 の操作 → Cloud Storage の IAM のロール
-ROLE_FOR_ACTION = {"s3:PutObject": "roles/storage.objectCreator", "s3:GetObject": "roles/storage.objectViewer",
-                   "s3:ListBucket": "roles/storage.objectViewer", "s3:*": "roles/storage.objectAdmin"}
+# カスタムロール（custom:… → ロール ID の末尾と権限）
+CUSTOM_ROLES = {
+    GCS_ROLE_WRITER: ("writer", ["storage.objects.create", "storage.objects.setRetention"]),
+    GCS_ROLE_LISTER: ("lister", ["storage.objects.list", "storage.buckets.get"]),
+}
 
 
 def _compute():
@@ -47,12 +51,21 @@ def _compute():
 def _names(env: Env) -> dict[str, str]:
     p = env.vm_prefix
     return {"network": f"{p}-net", "subnet": f"{p}-subnet", "fw_web": f"{p}-web", "fw_internal": f"{p}-internal",
-            "fw_ssh": f"{p}-ssh", "tag": f"{p}-node", "address": f"{p}-entry", "node_sa": f"{p}-node",
-            "node_role": p.replace("-", "_") + "_node"}
+            "fw_ssh": f"{p}-ssh", "fw_proxy": f"{p}-proxy-in", "fw_egress_deny": f"{p}-egress-deny",
+            "fw_egress_internal": f"{p}-egress-internal", "tag": f"{p}-node", "proxy_tag": f"{p}-proxy",
+            "address": f"{p}-entry", "node_sa": f"{p}-node", "node_role": p.replace("-", "_") + "_node",
+            "proxy": f"{p}-proxy", "bucket": f"{env.gcp_prefix}-{env.gcp_project}"}
 
 
 def _sa_email(env: Env, account_id: str) -> str:
     return f"{account_id}@{env.gcp_project}.iam.gserviceaccount.com"
+
+
+def _custom_role_name(env: Env, role: str) -> str:
+    if not role.startswith("custom:"):
+        return role
+    suffix = CUSTOM_ROLES[role][0]
+    return f"projects/{env.gcp_project}/roles/{env.vm_prefix.replace('-', '_')}_{suffix}"
 
 
 _zones_warned: list[str] = []
@@ -137,33 +150,14 @@ def ensure_apis(env: Env) -> None:
     info(f"GCP の API を有効にしました: {', '.join(missing)}")
 
 
-def snapshot(env: Env, prefix: str) -> list[str]:
-    """冪等性の試験用: バケットの設定（均一アクセス、バージョニング、保持、ライフサイクル）と IAM のバインディングを文字列の一覧に
-    （Cloud Storage のクライアントで読む。S3 互換の API では保持と IAM が見えない）。"""
-    client = _storage(env)
-    lines = []
-    for logical in sorted(bucket_specs(env)):
-        name = prefix + logical
-        bucket = client.get_bucket(name)
-        policy = bucket.get_iam_policy(requested_policy_version=3)
-        bindings = sorted(json.dumps({**b, "members": sorted(b["members"])}, sort_keys=True) for b in policy.bindings)
-        lines.append(f"bucket {name} uniform={bool(bucket.iam_configuration.uniform_bucket_level_access_enabled)} "
-                     f"versioning={bool(bucket.versioning_enabled)} retention={bucket.retention_period} "
-                     f"lifecycle={json.dumps([dict(r) for r in bucket.lifecycle_rules], sort_keys=True)} iam={bindings}")
-    return lines
-
-
-def bucket_prefix(env: Env, ident: dict) -> str:
-    return f"{env.gcp_prefix}-{ident['account']}-"
-
-
 def s3_endpoint(env: Env) -> str:
     return S3_ENDPOINT
 
 
 # ---- ネットワーク ----
 def ensure_network(env: Env) -> dict:
-    """VPC（カスタムモード）、リージョンのサブネット 1 つ（Private Google Access あり）、ファイアウォール 3 つ。"""
+    """VPC（カスタムモード）、リージョンのサブネット 1 つ（Private Google Access あり）、ファイアウォール。
+    中継の VM を使うときは、3 台の直接の外向き通信を egress の deny で塞ぎ、サブネットの中だけ許す（中継は .20）。"""
     compute = _compute()
     names = _names(env)
     project = env.gcp_project
@@ -187,6 +181,7 @@ def ensure_network(env: Env) -> dict:
         info(f"サブネット {names['subnet']}（{plan['subnets'][0]}、{env.gcp_region}）を作りました")
     fws = compute.FirewallsClient()
     existing = {f.name for f in fws.list(project=project) if f.name in names.values()}
+    cidr = plan["subnets"][0]
     wanted = {
         names["fw_web"]: compute.Firewall(
             name=names["fw_web"], network=network.self_link, direction="INGRESS",
@@ -194,23 +189,40 @@ def ensure_network(env: Env) -> dict:
             target_tags=[names["tag"]]),
         names["fw_internal"]: compute.Firewall(
             name=names["fw_internal"], network=network.self_link, direction="INGRESS",
-            allowed=[compute.Allowed(I_p_protocol="all")], source_ranges=[plan["subnets"][0]], target_tags=[names["tag"]]),
+            allowed=[compute.Allowed(I_p_protocol="all")], source_ranges=[cidr],
+            target_tags=[names["tag"], names["proxy_tag"]]),
         # 22 の送信元は allow_ssh_from が置き換える。作るときは誰にも開けない
         names["fw_ssh"]: compute.Firewall(
             name=names["fw_ssh"], network=network.self_link, direction="INGRESS",
             allowed=[compute.Allowed(I_p_protocol="tcp", ports=["22"])], source_ranges=["127.0.0.1/32"],
-            target_tags=[names["tag"]]),
+            target_tags=[names["tag"], names["proxy_tag"]]),
     }
+    if env.egress_proxy_vm:
+        wanted[names["fw_proxy"]] = compute.Firewall(
+            name=names["fw_proxy"], network=network.self_link, direction="INGRESS",
+            allowed=[compute.Allowed(I_p_protocol="tcp", ports=[str(PROXY_PORT)])], source_ranges=[cidr],
+            target_tags=[names["proxy_tag"]])
+        wanted[names["fw_egress_deny"]] = compute.Firewall(
+            name=names["fw_egress_deny"], network=network.self_link, direction="EGRESS", priority=1000,
+            denied=[compute.Denied(I_p_protocol="all")], destination_ranges=["0.0.0.0/0"], target_tags=[names["tag"]])
+        wanted[names["fw_egress_internal"]] = compute.Firewall(
+            name=names["fw_egress_internal"], network=network.self_link, direction="EGRESS", priority=900,
+            allowed=[compute.Allowed(I_p_protocol="all")], destination_ranges=[cidr], target_tags=[names["tag"]])
     for name, fw in wanted.items():
         if name not in existing:
             fws.insert(project=project, firewall_resource=fw).result()
             info(f"ファイアウォールの規則 {name} を作りました")
+    if not env.egress_proxy_vm:
+        for name in (names["fw_egress_deny"], names["fw_egress_internal"], names["fw_proxy"]):
+            if name in existing:
+                fws.delete(project=project, firewall=name).result()
+                info(f"ファイアウォールの規則 {name} を消しました（中継の VM を使わない）")
     ok("ネットワークは最新です")
     return {"network": network.self_link, "subnet": subnet.self_link, "plan": plan, "zones": _zones(env),
-            "tag": names["tag"]}
+            "tag": names["tag"], "proxy_tag": names["proxy_tag"]}
 
 
-def _allow_from(env: Env, rule: str, cidr: str, what: str) -> None:
+def _allow_from(env: Env, rule: str, cidrs: list[str], what: str) -> None:
     compute = _compute()
     fws = compute.FirewallsClient()
     name = _names(env)[rule]
@@ -218,19 +230,29 @@ def _allow_from(env: Env, rule: str, cidr: str, what: str) -> None:
         fw = fws.get(project=env.gcp_project, firewall=name)
     except _NotFound():
         return
-    if list(fw.source_ranges) == [cidr]:
+    if sorted(fw.source_ranges) == sorted(cidrs):
         return
-    fws.patch(project=env.gcp_project, firewall=name, firewall_resource=compute.Firewall(source_ranges=[cidr])).result()
-    info(f"{what} の許可を {cidr} だけにしました（前: {', '.join(fw.source_ranges) or '無し'}）")
+    fws.patch(project=env.gcp_project, firewall=name, firewall_resource=compute.Firewall(source_ranges=cidrs)).result()
+    info(f"{what} の許可を {', '.join(cidrs)} だけにしました（前: {', '.join(fw.source_ranges) or '無し'}）")
 
 
 def allow_ssh_from(env: Env, cidr: str) -> None:
-    _allow_from(env, "fw_ssh", cidr, "22")
+    _allow_from(env, "fw_ssh", [cidr], "22")
 
 
 def allow_web_from(env: Env, cidr: str) -> None:
-    """80/443 の送信元を操作者の IP（LAB_WEB_ALLOW_CIDR か 22 と同じ自動検出）だけにする（ユーザーの判断 2026-10-30: A）。"""
-    _allow_from(env, "fw_web", cidr, "80/443")
+    """80/443 の送信元を操作者の IP（LAB_WEB_ALLOW_CIDR か 22 と同じ自動検出）だけにする（ユーザーの判断 2026-10-30: A）。
+    Mac が中継を通すときは、中継の VM からの入口への接続も通す（サブネット）。"""
+    cidrs = [cidr]
+    if env.egress_proxy_vm:
+        cidrs.append(network_plan(env.vm_cidr, subnets_per_node=False)["subnets"][0])
+    _allow_from(env, "fw_web", cidrs, "80/443")
+
+
+def allow_proxy_from(env: Env, cidr: str) -> None:
+    """中継（3128）の送信元: サブネット ＋ 操作者の IP（Mac も中継を通すため）。"""
+    plan = network_plan(env.vm_cidr, subnets_per_node=False)
+    _allow_from(env, "fw_proxy", [plan["subnets"][0], cidr], f"中継（{PROXY_PORT}）")
 
 
 # ---- 浮動 IP ----
@@ -249,6 +271,14 @@ def ensure_entry_ip(env: Env) -> tuple[str, str]:
     return addr.address, name
 
 
+def describe_entry_ip(env: Env, entry_ip_id: str) -> str:
+    """浮動 IP の識別子（アドレスの名前）→ IP。"""
+    try:
+        return _compute().AddressesClient().get(project=env.gcp_project, region=env.gcp_region, address=entry_ip_id).address
+    except _NotFound():
+        raise LabError(f"静的な外部 IP {entry_ip_id}（LAB_VM_ENTRY_IP_ID）が {env.gcp_region} にありません")
+
+
 def entry_ip_holder(env: Env, infra: Infra) -> str | None:
     """静的 IP を持つ Node.id（<ゾーン>/<名前>）。"""
     addr = _compute().AddressesClient().get(project=env.gcp_project, region=env.gcp_region, address=infra.entry_ip_id)
@@ -258,14 +288,14 @@ def entry_ip_holder(env: Env, infra: Infra) -> str | None:
     return None
 
 
-# ---- バケットと静的キー ----
+# ---- バケット（1 つ）と静的キー ----
 def _storage(env: Env):
     from google.cloud import storage
     return storage.Client(project=env.gcp_project)
 
 
 def _lifecycle_rules(spec_rules: list[dict]) -> list[dict]:
-    """S3 のライフサイクル（render.s3_buckets の形）を Cloud Storage の規則に写す。"""
+    """S3 のライフサイクル（render._lifecycle の形）を Cloud Storage の規則に写す。"""
     rules = []
     for r in spec_rules:
         prefix = r.get("Filter", {}).get("Prefix", "")
@@ -282,102 +312,81 @@ def _lifecycle_rules(spec_rules: list[dict]) -> list[dict]:
     return rules
 
 
-def ensure_buckets(env: Env, prefix: str) -> dict[str, str]:
-    """6 バケット。公開アクセスの防止、均一なバケットレベルのアクセス、バージョニング、保持ポリシー、ライフサイクル。"""
+def _canon_rules(rules) -> list[str]:
+    return sorted(json.dumps(dict(r), sort_keys=True) for r in rules)
+
+
+def ensure_bucket(env: Env) -> str:
+    """1 つのバケット（オブジェクト保持ロック有効、バージョニング、公開アクセスの防止、ライフサイクル。
+    均一なバケットレベルのアクセスは無効: registry の S3 ドライバが ACL を付けるため。権限は IAM で同じ）。"""
     from google.cloud import storage
     client = _storage(env)
-    lock_mode = env.get("LAB_AUDIT_LOCK_MODE", "GOVERNANCE")
-    names = {}
-    for logical, spec in bucket_specs(env).items():
-        name = prefix + logical
-        names[logical] = name
-        # images だけは「均一なバケットレベルのアクセス」を切る（registry 3.0 の S3 ドライバは毎回 ACL を付け、均一のバケットは
-        # どの ACL も InvalidArgument で拒む。配備で判明 2026-10-30、設計書 16 章）。権限は IAM のバインディングで同じに保つ
-        uniform = logical != IMAGES_BUCKET
-        bucket = client.lookup_bucket(name)
-        if bucket is None:
-            bucket = storage.Bucket(client, name=name)
-            bucket.iam_configuration.uniform_bucket_level_access_enabled = uniform
-            bucket.iam_configuration.public_access_prevention = "enforced"
-            bucket.labels = {LABEL_KEY: env.vm_prefix}
-            bucket = client.create_bucket(bucket, location=env.gcp_region)
-            info(f"バケット {name} を作りました")
-        changed = False
-        if bool(bucket.iam_configuration.uniform_bucket_level_access_enabled) != uniform:
-            bucket.iam_configuration.uniform_bucket_level_access_enabled = uniform
-            changed = True
-        if bucket.iam_configuration.public_access_prevention != "enforced":
-            bucket.iam_configuration.public_access_prevention = "enforced"
-            changed = True
-        if bool(bucket.versioning_enabled) != spec["versioning"]:
-            bucket.versioning_enabled = spec["versioning"]
-            changed = True
-        want_retention = spec["lock"]["Days"] * 86400 if spec["lock"] else None
-        if bucket.retention_period != want_retention and not bucket.retention_policy_locked:
-            bucket.retention_period = want_retention
-            changed = True
-        want_rules = _lifecycle_rules(spec["lifecycle"])
-        if [dict(r) for r in bucket.lifecycle_rules] != want_rules:
-            bucket.lifecycle_rules = want_rules
-            changed = True
-        if changed:
-            bucket.patch()
-            info(f"バケット {name} の設定を更新しました")
-        if spec["lock"] and lock_mode == "COMPLIANCE" and not bucket.retention_policy_locked:
-            bucket.lock_retention_policy()
-            warn(f"バケット {name} の保持ポリシーをロックしました（COMPLIANCE。保持が切れるまで誰も消せません）")
+    name = _names(env)["bucket"]
+    bucket = client.lookup_bucket(name)
+    if bucket is None:
+        bucket = storage.Bucket(client, name=name)
+        bucket.iam_configuration.uniform_bucket_level_access_enabled = False
+        bucket.iam_configuration.public_access_prevention = "enforced"
+        bucket.versioning_enabled = True
+        bucket.labels = {LABEL_KEY: env.vm_prefix}
+        bucket = client.create_bucket(bucket, location=env.gcp_region, enable_object_retention=True)
+        info(f"バケット {name} を作りました（オブジェクト保持ロックあり）")
+    if bucket.object_retention_mode != "Enabled":
+        raise LabError(f"バケット {name} はオブジェクト保持ロックが無効です（作成時にしか有効にできません。別の名前で作り直すか消してください）")
+    changed = False
+    if bucket.iam_configuration.uniform_bucket_level_access_enabled:
+        bucket.iam_configuration.uniform_bucket_level_access_enabled = False
+        changed = True
+    if bucket.iam_configuration.public_access_prevention != "enforced":
+        bucket.iam_configuration.public_access_prevention = "enforced"
+        changed = True
+    if not bucket.versioning_enabled:
+        bucket.versioning_enabled = True
+        changed = True
+    want = _lifecycle_rules(objstore.vm_lifecycle_rules(env))
+    if _canon_rules(bucket.lifecycle_rules) != _canon_rules(want):
+        bucket.lifecycle_rules = want
+        changed = True
+    if changed:
+        bucket.patch()
+        info(f"バケット {name} の設定を更新しました")
     ok("バケットの設定は最新です")
-    return names
+    return name
 
 
-def check_buckets(env: Env, prefix: str) -> None:
+def check_bucket(env: Env, name: str, strict: bool) -> None:
     client = _storage(env)
+    bucket = client.lookup_bucket(name)
+    if bucket is None:
+        raise LabError(f"バケット {name}（LAB_VM_BUCKET）がありません")
     problems = []
-    for logical, spec in bucket_specs(env).items():
-        name = prefix + logical
-        bucket = client.lookup_bucket(name)
-        if bucket is None:
-            problems.append(f"{name}: バケットがありません")
-            continue
-        if bool(bucket.versioning_enabled) != spec["versioning"]:
-            problems.append(f"{name}: バージョニングが {bucket.versioning_enabled}（仕様 {spec['versioning']}）")
-        want = spec["lock"]["Days"] * 86400 if spec["lock"] else None
-        if bucket.retention_period != want:
-            problems.append(f"{name}: 保持ポリシーが {bucket.retention_period}（仕様 {want}）")
-        if bucket.iam_configuration.public_access_prevention != "enforced":
-            problems.append(f"{name}: 公開アクセスの防止が無効です")
-        if [dict(r) for r in bucket.lifecycle_rules] != _lifecycle_rules(spec["lifecycle"]):
-            problems.append(f"{name}: ライフサイクルが仕様と違います")
-        info(f"{name}: OK")
+    if bucket.object_retention_mode != "Enabled":
+        problems.append("オブジェクト保持ロックが無効です（作成時に有効にする必要がある）")
+    if not bucket.versioning_enabled:
+        problems.append("バージョニングが無効です")
+    if bucket.iam_configuration.public_access_prevention != "enforced":
+        problems.append("公開アクセスの防止が無効です")
+    if bucket.iam_configuration.uniform_bucket_level_access_enabled:
+        problems.append("均一なバケットレベルのアクセスが有効です（registry の S3 ドライバが ACL を付けるので無効にする）")
+    if _canon_rules(bucket.lifecycle_rules) != _canon_rules(_lifecycle_rules(objstore.vm_lifecycle_rules(env))):
+        msg = "ライフサイクルが前提（変更設計書 4.2 節）と違います"
+        if strict:
+            problems.append(msg)
+        else:
+            warn(f"バケット {name}: {msg}（用意する側の設定のまま使います）")
     if problems:
-        raise LabError("Cloud Storage のバケットが仕様と違います:\n  " + "\n  ".join(problems))
+        raise LabError(f"バケット {name} が前提と違います:\n  " + "\n  ".join(problems))
+    ok(f"バケット {name} は前提どおりです")
 
 
-def bucket_bindings(env: Env, prefix: str) -> dict[str, list[dict]]:
-    """利用者ごとの権限（render.s3_policies ＋ registry）を、バケットごとの IAM の条件付きバインディングに写す。
-    戻り値: 実名のバケット → [{"user", "role", "prefix"}]。明示的な拒否は書かない（監査ログの保護は保持ポリシー）。"""
-    out: dict[str, list[dict]] = {}
-    for user, doc in static_key_policies(env).items():
-        for st in doc["Statement"]:
-            for arn in st["Resource"]:
-                path = arn.removeprefix("arn:aws:s3:::")
-                logical, _, obj = path.partition("/")
-                obj_prefix = obj.removesuffix("*")
-                for action in st["Action"]:
-                    if action == "s3:ListBucket" and obj:
-                        continue
-                    role = ROLE_FOR_ACTION[action]
-                    if action == "s3:PutObject" and not obj_prefix:
-                        # バケット全体への書き込みは上書きを含む（整形の parquet など）。GCS の上書きは delete の権限が要るので
-                        # objectUser（create/get/list/update/delete）。接頭辞に限った書き込み（raw/ の原本）は objectCreator の追記だけ
-                        role = "roles/storage.objectUser"
-                    entry = {"user": user, "role": role, "prefix": obj_prefix if obj else ""}
-                    if entry not in out.setdefault(prefix + logical, []):
-                        out[prefix + logical].append(entry)
-    # 操作者（S3 互換の API で初期値を書き、試験で触る）は全バケットの objectAdmin
-    for logical in bucket_specs(env):
-        out.setdefault(prefix + logical, []).append({"user": OPERATOR_USER, "role": "roles/storage.objectAdmin", "prefix": ""})
-    return out
+def snapshot(env: Env, bucket_name: str) -> list[str]:
+    """冪等性の試験用: バケットの設定と IAM のバインディングを文字列の一覧に。"""
+    bucket = _storage(env).get_bucket(bucket_name)
+    policy = bucket.get_iam_policy(requested_policy_version=3)
+    bindings = sorted(json.dumps({**b, "members": sorted(b["members"])}, sort_keys=True) for b in policy.bindings)
+    return [f"bucket {bucket_name} uniform={bool(bucket.iam_configuration.uniform_bucket_level_access_enabled)} "
+            f"versioning={bool(bucket.versioning_enabled)} retention={bucket.object_retention_mode} "
+            f"lifecycle={json.dumps([dict(r) for r in bucket.lifecycle_rules], sort_keys=True)} iam={bindings}"]
 
 
 def _ensure_service_account(env: Env, account_id: str, display: str) -> str:
@@ -393,25 +402,39 @@ def _ensure_service_account(env: Env, account_id: str, display: str) -> str:
     return email
 
 
+def _ensure_custom_role(env: Env, role_name: str, title: str, permissions: list[str]) -> None:
+    from google.cloud import iam_admin_v1
+    iam = iam_admin_v1.IAMClient()
+    try:
+        role = iam.get_role(request={"name": role_name})
+        if sorted(role.included_permissions) != sorted(permissions):
+            role.included_permissions = permissions
+            iam.update_role(request={"name": role_name, "role": role})
+            info(f"カスタムロール {role_name.rsplit('/', 1)[-1]} を更新しました")
+    except _NotFound():
+        iam.create_role(request={"parent": f"projects/{env.gcp_project}", "role_id": role_name.rsplit("/", 1)[-1],
+                                 "role": {"title": title, "included_permissions": permissions, "stage": "GA"}})
+        info(f"カスタムロール {role_name.rsplit('/', 1)[-1]} を作りました")
+
+
 def _set_bucket_iam(env: Env, bucket_name: str, entries: list[dict]) -> None:
     client = _storage(env)
     bucket = client.bucket(bucket_name)
     policy = bucket.get_iam_policy(requested_policy_version=3)
     policy.version = 3
-    # 自分が管理する利用者（静的キーの 5 つ ＋ 操作者）のバインディングだけ作り直す。VM のサービスアカウント（<prefix>-node）の
-    # バインディングは _ensure_node_identity が持つので残す（落とすと VM の段階が付け直し、毎回「更新」になる。2026-10-30）
     managed = {f"serviceAccount:{_sa_email(env, f'{env.vm_prefix}-{u}')}" for u in [*STATIC_KEY_USERS, OPERATOR_USER]}
     keep = [b for b in policy.bindings if not (set(b["members"]) & managed)]
     # 同じロール・同じ条件の利用者は 1 つのバインディングにまとめる（GCS は保存時にまとめるので、分けたままだと毎回「違う」になる）
     merged: dict[str, dict] = {}
     for e in entries:
         member = f"serviceAccount:{_sa_email(env, f'{env.vm_prefix}-{e['user']}')}"
+        role = _custom_role_name(env, e["role"])
         condition = None
         if e["prefix"]:
             condition = {"title": f"{e['user']}-{e['prefix'].strip('/').replace('/', '-')}",
                          "expression": f'resource.name.startsWith("projects/_/buckets/{bucket_name}/objects/{e["prefix"]}")'}
-        key = json.dumps([e["role"], condition], sort_keys=True)
-        binding = merged.setdefault(key, {"role": e["role"], "members": set(), **({"condition": condition} if condition else {})})
+        key = json.dumps([role, condition], sort_keys=True)
+        binding = merged.setdefault(key, {"role": role, "members": set(), **({"condition": condition} if condition else {})})
         binding["members"].add(member)
     new = list(merged.values())
     current = sorted(json.dumps({**b, "members": sorted(b["members"])}, sort_keys=True) for b in policy.bindings)
@@ -422,13 +445,17 @@ def _set_bucket_iam(env: Env, bucket_name: str, entries: list[dict]) -> None:
         info(f"バケット {bucket_name} の権限を更新しました")
 
 
-def ensure_static_keys(env: Env, prefix: str, have: set[str]) -> dict[str, tuple[str, str]]:
-    """役割ごとのサービスアカウント（5 つ ＋ 操作者）と HMAC キー。権限は毎回そろえ、キーは have に無い利用者だけ作り直す。"""
+def ensure_static_keys(env: Env, bucket: str) -> dict[str, tuple[str, str]]:
+    """役割ごとのサービスアカウント（5 つ ＋ 操作者）と HMAC キー。権限は毎回そろえ、キーは .env に無い利用者だけ作り直す。
+    戻り値は作ったキー（利用者 → (アクセス ID, シークレット)）。呼ぶ側が .env に書く。"""
     client = _storage(env)
     keys: dict[str, tuple[str, str]] = {}
+    for role, (suffix, permissions) in CUSTOM_ROLES.items():
+        _ensure_custom_role(env, _custom_role_name(env, role), f"litellm-lab {suffix}", permissions)
     for user in [*STATIC_KEY_USERS, OPERATOR_USER]:
         email = _ensure_service_account(env, f"{env.vm_prefix}-{user}", f"litellm-lab {user} (S3 互換の静的キー)")
-        if user in have:
+        key_name, secret_name = render.s3_env_names(user, env)
+        if env.get(key_name) and env.get(secret_name):
             continue
         for meta in client.list_hmac_keys(service_account_email=email):
             if meta.state == "ACTIVE":
@@ -444,47 +471,19 @@ def ensure_static_keys(env: Env, prefix: str, have: set[str]) -> dict[str, tuple
                     raise
                 time.sleep(5)
         keys[user] = (meta.access_id, secret)
-        info(f"{email} の HMAC キーを作りました（Kubernetes の Secret にだけ置く）")
-    for bucket_name, entries in bucket_bindings(env, prefix).items():
-        _set_bucket_iam(env, bucket_name, entries)
+        info(f"{email} の HMAC キーを作りました（.env の {key_name} に書く）")
+    _set_bucket_iam(env, bucket, gcs_bindings(env, bucket))
     return keys
 
 
-def admin_s3_client(env: Env):
-    """操作者の S3 互換のクライアント（HMAC キーは Secret lab-operator-s3 から。vm.load_static_keys が Env に載せる）。"""
-    from .. import vm
-    vm.load_static_keys(env)
-    return objstore.cloud_user_client(env, OPERATOR_USER)
-
-
-def put_object(env: Env, bucket: str, key: str, body: bytes) -> None:
-    _storage(env).bucket(bucket).blob(key).upload_from_string(body)
-
-
-def get_object(env: Env, bucket: str, key: str) -> bytes | None:
-    blob = _storage(env).bucket(bucket).blob(key)
-    return blob.download_as_bytes() if blob.exists() else None
-
-
 # ---- VM 3 台 ----
-def _ensure_node_identity(env: Env, prefix: str) -> str:
-    """VM のサービスアカウントとカスタムロール（浮動 IP の付け替え）、cluster バケットの k3s/* の読み取り。"""
-    from google.cloud import iam_admin_v1, resourcemanager_v3
+def _ensure_node_identity(env: Env) -> str:
+    """VM のサービスアカウントとカスタムロール（浮動 IP の付け替えだけ。バケットの権限は無い）。"""
+    from google.cloud import resourcemanager_v3
     names = _names(env)
     email = _ensure_service_account(env, names["node_sa"], "litellm-lab node (VM)")
-    iam = iam_admin_v1.IAMClient()
     role_name = f"projects/{env.gcp_project}/roles/{names['node_role']}"
-    try:
-        role = iam.get_role(request={"name": role_name})
-        if sorted(role.included_permissions) != sorted(NODE_PERMISSIONS):
-            role.included_permissions = NODE_PERMISSIONS
-            iam.update_role(request={"name": role_name, "role": role})
-            info(f"カスタムロール {names['node_role']} を更新しました")
-    except _NotFound():
-        iam.create_role(request={"parent": f"projects/{env.gcp_project}", "role_id": names["node_role"],
-                                 "role": {"title": "litellm-lab node", "included_permissions": NODE_PERMISSIONS,
-                                          "stage": "GA"}})
-        info(f"カスタムロール {names['node_role']} を作りました")
+    _ensure_custom_role(env, role_name, "litellm-lab node", NODE_PERMISSIONS)
     projects = resourcemanager_v3.ProjectsClient()
     resource = f"projects/{env.gcp_project}"
     policy = projects.get_iam_policy(request={"resource": resource})
@@ -496,20 +495,11 @@ def _ensure_node_identity(env: Env, prefix: str) -> str:
     elif member not in binding.members:
         binding.members.append(member)
         projects.set_iam_policy(request={"resource": resource, "policy": policy})
-    cluster = prefix + CLUSTER_BUCKET
-    bucket = _storage(env).bucket(cluster)
-    pol = bucket.get_iam_policy(requested_policy_version=3)
-    pol.version = 3
-    want = {"role": "roles/storage.objectViewer", "members": {member},
-            "condition": {"title": "node-k3s", "expression": f'resource.name.startsWith("projects/_/buckets/{cluster}/objects/k3s/")'}}
-    if not any(b.get("condition", {}).get("title") == "node-k3s" and member in b["members"] for b in pol.bindings):
-        pol.bindings.append(want)
-        bucket.set_iam_policy(pol)
     return email
 
 
-def _image(env: Env, existing: list) -> str:
-    """配備済みの台があればそのディスクのイメージ（3 台が同時に置き換わらない）。初回は公式の Ubuntu 24.04 arm64 の最新。"""
+def _image(env: Env, existing: list, family: str) -> str:
+    """配備済みの台があればそのディスクのイメージ（3 台が同時に置き換わらない）。初回は公式の Ubuntu 24.04 の最新。"""
     compute = _compute()
     for inst in existing:
         for d in inst.disks:
@@ -519,65 +509,66 @@ def _image(env: Env, existing: list) -> str:
                 disk = disks.get(project=env.gcp_project, zone=zone, disk=d.source.rsplit("/", 1)[-1])
                 if disk.source_image:
                     return disk.source_image
-    image = compute.ImagesClient().get_from_family(project=IMAGE_PROJECT, family=IMAGE_FAMILY)
+    image = compute.ImagesClient().get_from_family(project=IMAGE_PROJECT, family=family)
     info(f"イメージを {image.name} に決めました（以後の配備もこの値を使う）")
     return image.self_link
 
 
-def _instances(env: Env) -> list:
+def _instances(env: Env, role: str = "node") -> list:
     compute = _compute()
-    req = compute.AggregatedListInstancesRequest(project=env.gcp_project, filter=f"labels.{LABEL_KEY}={env.vm_prefix}")
+    req = compute.AggregatedListInstancesRequest(project=env.gcp_project,
+                                                 filter=f"labels.{LABEL_KEY}={env.vm_prefix} AND labels.lab-role={role}")
     found = []
     for _zone, scoped in compute.InstancesClient().aggregated_list(request=req):
         found.extend(scoped.instances or [])
     return found
 
 
-def _to_node(inst) -> Node:
+def _to_node(inst, index: int | None = None) -> Node:
     zone = inst.zone.rsplit("/", 1)[-1]
     nic = inst.network_interfaces[0] if inst.network_interfaces else None
     public = nic.access_configs[0].nat_i_p if nic and nic.access_configs else ""
-    return Node(id=f"{zone}/{inst.name}", index=int((inst.labels or {}).get("lab-node-index", "0")),
+    return Node(id=f"{zone}/{inst.name}", index=index if index is not None else int((inst.labels or {}).get("lab-node-index", "0")),
                 private_ip=nic.network_i_p if nic else "", public_ip=public or "", zone=zone)
 
 
-def ensure_nodes(env: Env, infra: Infra, user_data) -> list[Node]:
-    """Compute Engine 3 台（別ゾーン、固定の内部 IP、一時的な外部 IP、Ubuntu 24.04 arm64、Hyperdisk）。無い台だけ作る。
-    初期化のスクリプトは startup-script（毎回の起動で走るので、スクリプト自身が ready なら抜ける）。"""
+def _create_instance(env: Env, zone: str, name: str, machine_type: str, image: str, disk_type: str, disk_gb: int,
+                     subnet: str, private_ip: str, pubkey: str, sa_email: str | None, tags: list[str], labels: dict) -> None:
     compute = _compute()
-    net = infra.extra["network"]
+    inst = compute.Instance(
+        name=name, machine_type=f"zones/{zone}/machineTypes/{machine_type}",
+        disks=[compute.AttachedDisk(boot=True, auto_delete=True, initialize_params=compute.AttachedDiskInitializeParams(
+            source_image=image, disk_size_gb=disk_gb, disk_type=f"zones/{zone}/diskTypes/{disk_type}"))],
+        network_interfaces=[compute.NetworkInterface(
+            subnetwork=subnet, network_i_p=private_ip,
+            access_configs=[compute.AccessConfig(name="External NAT", type_="ONE_TO_ONE_NAT")])],
+        metadata=compute.Metadata(items=[
+            compute.Items(key="ssh-keys", value=f"{env.vm_ssh_user}:{pubkey} {env.vm_ssh_user}"),
+            compute.Items(key="enable-oslogin", value="FALSE"),
+        ]),
+        service_accounts=[compute.ServiceAccount(email=sa_email, scopes=[SCOPE])] if sa_email else [],
+        tags=compute.Tags(items=tags),
+        labels=labels,
+    )
+    compute.InstancesClient().insert(project=env.gcp_project, zone=zone, instance_resource=inst).result()
+
+
+def ensure_nodes(env: Env, net: dict, sa_email: str, pubkey: str) -> list[Node]:
+    """Compute Engine 3 台（別ゾーン、固定の内部 IP、一時的な外部 IP、Ubuntu 24.04 arm64、Hyperdisk）。無い台だけ作る。
+    初期化は SSH（labtool/vm.py）なので startup-script は無い。"""
     plan, zones, names = net["plan"], net["zones"], _names(env)
-    sa_email = _ensure_node_identity(env, infra.bucket_prefix)
     existing = _instances(env)
     by_index = {_to_node(i).index: i for i in existing}
-    image = _image(env, existing)
-    planned = [Node(id=f"{zones[n['index'] - 1]}/{env.vm_prefix}-node{n['index']}", index=n["index"],
-                    private_ip=n["private_ip"], public_ip="", zone=zones[n["index"] - 1]) for n in plan["nodes"]]
-    pubkey = infra.extra.get("ssh_pubkey", "")
-    instances = compute.InstancesClient()
+    image = _image(env, existing, IMAGE_FAMILY)
     for n in plan["nodes"]:
         i = n["index"]
         if i in by_index:
             continue
         zone = zones[i - 1]
         name = f"{env.vm_prefix}-node{i}"
-        inst = compute.Instance(
-            name=name, machine_type=f"zones/{zone}/machineTypes/{env.gcp_machine_type}",
-            disks=[compute.AttachedDisk(boot=True, auto_delete=True, initialize_params=compute.AttachedDiskInitializeParams(
-                source_image=image, disk_size_gb=env.vm_disk_gib, disk_type=f"zones/{zone}/diskTypes/{DISK_TYPE}"))],
-            network_interfaces=[compute.NetworkInterface(
-                subnetwork=net["subnet"], network_i_p=n["private_ip"],
-                access_configs=[compute.AccessConfig(name="External NAT", type_="ONE_TO_ONE_NAT")])],
-            metadata=compute.Metadata(items=[
-                compute.Items(key="startup-script", value=user_data(planned[i - 1], planned)),
-                compute.Items(key="ssh-keys", value=f"ubuntu:{pubkey} ubuntu"),
-                compute.Items(key="enable-oslogin", value="FALSE"),
-            ]),
-            service_accounts=[compute.ServiceAccount(email=sa_email, scopes=[SCOPE])],
-            tags=compute.Tags(items=[names["tag"]]),
-            labels={LABEL_KEY: env.vm_prefix, "lab-node-index": str(i)},
-        )
-        instances.insert(project=env.gcp_project, zone=zone, instance_resource=inst).result()
+        _create_instance(env, zone, name, env.gcp_machine_type, image, DISK_TYPE, env.vm_disk_gib, net["subnet"],
+                         n["private_ip"], pubkey, sa_email, [names["tag"]],
+                         {LABEL_KEY: env.vm_prefix, "lab-role": "node", "lab-node-index": str(i)})
         info(f"Compute Engine {name}（{zone}、{n['private_ip']}）を起こしました")
     nodes = sorted((_to_node(i) for i in _instances(env)), key=lambda n: n.index)
     if len(nodes) != NODE_COUNT:
@@ -585,43 +576,46 @@ def ensure_nodes(env: Env, infra: Infra, user_data) -> list[Node]:
     return nodes
 
 
-def recreate_node(env: Env, infra: Infra, index: int, user_data) -> Node:
+def ensure_proxy_node(env: Env, net: dict, pubkey: str) -> Node:
+    """中継（出口プロキシ）の VM 1 台（amd64 の小型、サブネットの .20、公開 IP あり）。"""
+    plan, zones, names = net["plan"], net["zones"], _names(env)
+    existing = _instances(env, role="proxy")
+    if not existing:
+        image = _image(env, [], PROXY_IMAGE_FAMILY)
+        _create_instance(env, zones[0], names["proxy"], PROXY_MACHINE_TYPE, image, "pd-balanced", 10, net["subnet"],
+                         plan["proxy_ip"], pubkey, None, [names["proxy_tag"]], {LABEL_KEY: env.vm_prefix, "lab-role": "proxy"})
+        info(f"中継の VM {names['proxy']}（{zones[0]}、{plan['proxy_ip']}）を起こしました")
+        existing = _instances(env, role="proxy")
+    return _to_node(existing[0], index=0)
+
+
+def describe_nodes(env: Env, ids: list[str]) -> list[Node]:
+    """.env の識別子（<ゾーン>/<名前>）から Node を組む。順番が台の番号。"""
+    compute = _compute()
+    nodes = []
+    for i, node_id in enumerate(ids, start=1):
+        if "/" not in node_id:
+            raise LabError(f"LAB_VM_NODES の {node_id} は <ゾーン>/<名前> の形にしてください")
+        zone, name = node_id.split("/", 1)
+        try:
+            inst = compute.InstancesClient().get(project=env.gcp_project, zone=zone, instance=name)
+        except _NotFound():
+            raise LabError(f"Compute Engine {node_id}（LAB_VM_NODES）がありません")
+        nodes.append(_to_node(inst, index=i))
+    return nodes
+
+
+def recreate_node(env: Env, infra: Infra, index: int, pubkey: str) -> Node:
+    """1 台を消して作り直す（イメージを新しくするとき。managed だけ）。"""
     instances = _compute().InstancesClient()
     for n in infra.nodes:
         if n.index == index:
             zone, name = n.id.split("/", 1)
             instances.delete(project=env.gcp_project, zone=zone, instance=name).result()
             info(f"Compute Engine {name}（node{index}）を消しました")
-    nodes = ensure_nodes(env, infra, user_data)
+    net = ensure_network(env)
+    nodes = ensure_nodes(env, net, _ensure_node_identity(env), pubkey)
     return next(n for n in nodes if n.index == index)
-
-
-def discover(env: Env) -> Infra | None:
-    compute = _compute()
-    names = _names(env)
-    project = env.gcp_project
-    network = subnet = addr = None
-    with contextlib.suppress(_NotFound()):
-        network = compute.NetworksClient().get(project=project, network=names["network"])
-    with contextlib.suppress(_NotFound()):
-        addr = compute.AddressesClient().get(project=project, region=env.gcp_region, address=names["address"])
-    if network is None and addr is None:
-        return None
-    ident = identity(env)
-    prefix = bucket_prefix(env, ident)
-    infra = Infra(region=env.gcp_region, bucket_prefix=prefix,
-                  buckets={logical: prefix + logical for logical in bucket_specs(env)})
-    if network is not None:
-        infra.network_id = network.self_link
-        with contextlib.suppress(_NotFound()):
-            subnet = compute.SubnetworksClient().get(project=project, region=env.gcp_region, subnetwork=names["subnet"])
-        infra.extra["network"] = {"network": network.self_link, "subnet": subnet.self_link if subnet else "",
-                                  "plan": network_plan(env.vm_cidr, subnets_per_node=False), "zones": _zones(env),
-                                  "tag": names["tag"]}
-    if addr is not None:
-        infra.entry_ip, infra.entry_ip_id = addr.address, names["address"]
-    infra.nodes = sorted((_to_node(i) for i in _instances(env)), key=lambda n: n.index)
-    return infra
 
 
 def stop_node(env: Env, node: Node) -> None:
@@ -636,71 +630,131 @@ def start_node(env: Env, node: Node) -> None:
 
 def node_init_hooks(env: Env, infra: Infra, node: Node) -> str:
     text = HOOKS_SCRIPT.read_text()
-    for k, v in {"PROJECT": env.gcp_project, "REGION": env.gcp_region, "CLUSTER_BUCKET": infra.buckets[CLUSTER_BUCKET],
-                 "ADDRESS_NAME": infra.entry_ip_id}.items():
+    for k, v in {"PROJECT": env.gcp_project, "REGION": env.gcp_region, "ADDRESS_NAME": infra.entry_ip_id}.items():
         text = text.replace(f"@@{k}@@", v)
     return text
 
 
+# ---- provision（managed） ----
+def provision(env: Env, pubkey: str, operator_cidr: str, web_cidr: str) -> dict:
+    """作る（無ければ）: ネットワーク → 22 / 80・443 / 中継の許可 → 浮動 IP → バケット → 静的キー → VM の権限 → VM 3 台 → 中継の VM。
+    戻り値を呼ぶ側が .env に書く。"""
+    net = ensure_network(env)
+    allow_ssh_from(env, operator_cidr)
+    allow_web_from(env, web_cidr)
+    if env.egress_proxy_vm:
+        allow_proxy_from(env, operator_cidr)
+    entry_ip, entry_ip_id = ensure_entry_ip(env)
+    bucket = ensure_bucket(env)
+    keys = ensure_static_keys(env, bucket)
+    sa_email = _ensure_node_identity(env)
+    nodes = ensure_nodes(env, net, sa_email, pubkey)
+    proxy = ensure_proxy_node(env, net, pubkey) if env.egress_proxy_vm else None
+    return {"nodes": [n.id for n in nodes], "bucket": bucket, "entry_ip": entry_ip, "entry_ip_id": entry_ip_id,
+            "keys": keys, "proxy": proxy, "proxy_url": f"http://{net['plan']['proxy_ip']}:{PROXY_PORT}" if proxy else ""}
+
+
 # ---- 削除 ----
-def empty_buckets(env: Env, infra: Infra) -> None:
+def _remove_retention_and_delete(bucket, blobs: list) -> None:
+    """保持（Unlocked）の付いたオブジェクトは保持を外してから消す。Locked は消せない（警告）。"""
+    from google.api_core import exceptions as gexc
+    for blob in blobs:
+        try:
+            if blob.retention and blob.retention.mode:
+                if blob.retention.mode == "Locked":
+                    warn(f"{blob.name}（世代 {blob.generation}）は保持が Locked なので消せません（期限まで残ります）")
+                    continue
+                blob.retention.mode = None
+                blob.retention.retain_until_time = None
+                blob.patch(override_unlocked_retention=True)
+            bucket.delete_blob(blob.name, generation=blob.generation)
+        except gexc.NotFound:
+            pass
+
+
+def empty_bucket(env: Env, bucket_name: str, prefixes: list[str] | None = None, remove_retention: bool = False) -> int:
+    """バケット（または接頭辞の下）を版も含めて空にする。remove_retention なら保持（Unlocked）も外して消す。消した数を返す。"""
     client = _storage(env)
-    for logical, name in sorted(infra.buckets.items()):
-        bucket = client.lookup_bucket(name)
-        if bucket is None:
-            continue
-        if bucket.retention_policy_locked or (bucket.retention_period and logical in LOCKED_BUCKETS):
-            if bucket.retention_policy_locked:
-                warn(f"バケット {name} は保持ポリシーがロックされているので消せません（保持が切れるまで残ります）")
-                continue
-            # 解除できる保持ポリシー（GOVERNANCE 相当）は外してから消す。外した直後は削除が 403 になることがあるので反映を待つ
-            bucket.retention_period = None
-            bucket.patch()
-            for _ in range(30):
-                bucket.reload()
-                if not bucket.retention_period:
-                    break
-                time.sleep(2)
-            time.sleep(5)
-        # 版も含めて 100 件ずつまとめて消す（Blob.delete は版を受けない。総当たりの記録で 10 万件を超えることがある）
-        n = 0
+    bucket = client.lookup_bucket(bucket_name)
+    if bucket is None:
+        return 0
+    n = 0
+    for prefix in (prefixes or [None]):
         chunk: list = []
-        from google.api_core import exceptions as gexc
-
-        def delete_chunk(blobs: list) -> None:
-            for attempt in range(6):   # 保持の解除の反映待ち（403）は 10 秒おきに試す
-                try:
-                    bucket.delete_blobs(blobs, preserve_generation=True, on_error=lambda b: None)
-                    return
-                except gexc.Forbidden:
-                    if attempt == 5:
-                        raise
-                    time.sleep(10)
-
-        for blob in client.list_blobs(name, versions=True):
+        for blob in client.list_blobs(bucket_name, prefix=prefix, versions=True):
             chunk.append(blob)
             if len(chunk) == 100:
-                delete_chunk(chunk)
-                n += len(chunk)
+                n += _delete_chunk(bucket, chunk, remove_retention)
                 chunk = []
         if chunk:
-            delete_chunk(chunk)
-            n += len(chunk)
+            n += _delete_chunk(bucket, chunk, remove_retention)
+    return n
+
+
+def _delete_chunk(bucket, blobs: list, remove_retention: bool) -> int:
+    from google.api_core import exceptions as gexc
+    if remove_retention:
+        _remove_retention_and_delete(bucket, blobs)
+        return len(blobs)
+    for attempt in range(6):
+        try:
+            bucket.delete_blobs(blobs, preserve_generation=True, on_error=lambda b: None)
+            return len(blobs)
+        except gexc.Forbidden:
+            if attempt == 5:
+                raise
+            time.sleep(10)
+    return len(blobs)
+
+
+def _delete_bucket(env: Env, name: str) -> None:
+    client = _storage(env)
+    bucket = client.lookup_bucket(name)
+    if bucket is None:
+        return
+    n = empty_bucket(env, name, remove_retention=True)
+    try:
         bucket.delete()
         info(f"バケット {name} を空にして消しました（{n} 版）")
+    except Exception as e:  # noqa: BLE001 Locked の保持が残っている
+        warn(f"バケット {name} を消せませんでした（{type(e).__name__}）。保持が Locked のオブジェクトが残っているなら期限まで残ります")
+
+
+def _delete_instances(env: Env, node_ids: list[str]) -> None:
+    compute = _compute()
+    instances = compute.InstancesClient()
+    ops = []
+    for node_id in node_ids:
+        zone, name = node_id.split("/", 1)
+        with contextlib.suppress(_NotFound()):
+            ops.append(instances.delete(project=env.gcp_project, zone=zone, instance=name))
+    for op in ops:
+        op.result()
+    if ops:
+        info(f"Compute Engine {len(ops)} 台を消しました")
+
+
+def _delete_address(env: Env, name: str, keep: bool) -> None:
+    compute = _compute()
+    try:
+        addr = compute.AddressesClient().get(project=env.gcp_project, region=env.gcp_region, address=name)
+    except _NotFound():
+        return
+    if keep:
+        info(f"静的な外部 IP {addr.address} は残しました（LAB_VM_KEEP_ENTRY_IP=true。付いていない間も料金が出ます）")
+        return
+    compute.AddressesClient().delete(project=env.gcp_project, region=env.gcp_region, address=name).result()
+    info(f"静的な外部 IP {addr.address} を解放しました")
 
 
 def destroy(env: Env, keep_entry_ip: bool) -> None:
-    """バケット → HMAC キーとサービスアカウント → VM → VM の権限 → ファイアウォール → サブネット → ネットワーク →（静的 IP）。"""
+    """managed: 名前とラベルで探して全部消す。バケット → HMAC キーとサービスアカウント → VM（中継を含む）→ カスタムロール →
+    ファイアウォール → サブネット → ネットワーク →（静的 IP）。"""
     from google.cloud import iam_admin_v1
     compute = _compute()
     names = _names(env)
     project = env.gcp_project
-    infra = discover(env)
-    if infra is None:
-        ok("GCP に消すものはありません")
-        return
-    empty_buckets(env, infra)
+    _delete_bucket(env, names["bucket"])
     client = _storage(env)
     iam = iam_admin_v1.IAMClient()
     for user in [*STATIC_KEY_USERS, OPERATOR_USER, "node"]:
@@ -714,29 +768,28 @@ def destroy(env: Env, keep_entry_ip: bool) -> None:
         with contextlib.suppress(_NotFound()):
             iam.delete_service_account(name=f"projects/{project}/serviceAccounts/{email}")
             info(f"サービスアカウント {email} を消しました")
-    instances = compute.InstancesClient()
-    ops = []
-    for n in infra.nodes:
-        zone, name = n.id.split("/", 1)
-        ops.append(instances.delete(project=project, zone=zone, instance=name))
-    for op in ops:
-        op.result()
-    if ops:
-        info(f"Compute Engine {len(ops)} 台を消しました")
-    with contextlib.suppress(_NotFound()):
-        iam.delete_role(request={"name": f"projects/{project}/roles/{names['node_role']}"})
-    fws = compute.FirewallsClient()
-    for fw in (names["fw_web"], names["fw_internal"], names["fw_ssh"]):
+    ids = [_to_node(i).id for i in _instances(env)] + [_to_node(i).id for i in _instances(env, role="proxy")]
+    _delete_instances(env, ids)
+    for role_name in [f"projects/{project}/roles/{names['node_role']}",
+                      *(_custom_role_name(env, r) for r in CUSTOM_ROLES)]:
         with contextlib.suppress(_NotFound()):
-            fws.delete(project=project, firewall=fw).result()
+            iam.delete_role(request={"name": role_name})
+    fws = compute.FirewallsClient()
+    for key in ("fw_web", "fw_internal", "fw_ssh", "fw_proxy", "fw_egress_deny", "fw_egress_internal"):
+        with contextlib.suppress(_NotFound()):
+            fws.delete(project=project, firewall=names[key]).result()
     with contextlib.suppress(_NotFound()):
         compute.SubnetworksClient().delete(project=project, region=env.gcp_region, subnetwork=names["subnet"]).result()
     with contextlib.suppress(_NotFound()):
         compute.NetworksClient().delete(project=project, network=names["network"]).result()
         info(f"VPC ネットワーク {names['network']} を消しました")
+    _delete_address(env, names["address"], keep_entry_ip)
+
+
+def destroy_provided(env: Env, infra: Infra, keep_entry_ip: bool) -> None:
+    """provided の全削除（./lab down --all）: .env の識別子の VM、浮動 IP、バケットを消す。
+    静的キーとネットワークは用意する側の物なので消さない。"""
+    _delete_bucket(env, infra.bucket)
+    _delete_instances(env, [n.id for n in infra.nodes])
     if infra.entry_ip_id:
-        if keep_entry_ip:
-            info(f"静的な外部 IP {infra.entry_ip} は残しました（LAB_VM_KEEP_ENTRY_IP=true。付いていない間も料金が出ます）")
-        else:
-            compute.AddressesClient().delete(project=project, region=env.gcp_region, address=infra.entry_ip_id).result()
-            info(f"静的な外部 IP {infra.entry_ip} を解放しました")
+        _delete_address(env, infra.entry_ip_id, keep_entry_ip)

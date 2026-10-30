@@ -74,7 +74,8 @@ def stage(fn):
 
 COMMANDS: dict[str, tuple[str, object]] = {
     "up": ("全段階を順に流す（何度でも可）", up),
-    "down": ("クラスタを削除する（Mac: k3d。AWS: 有料のものをすべて消す。残るのは無料の証明書と CDK の bootstrap）", ops.down),
+    "down": ("クラスタを削除する（Mac: k3d。aws: 有料のものをすべて消す。aws-ec2 / gcp-vm: managed は全部消す、"
+             "provided は k3s を外して保持の無いディレクトリを空にする。--all で VM・浮動 IP・バケットも消す）", None),
     "rebuild": ("クラスタを削除して作り直す（所要時間を表示）", rebuild),
     "status": ("状態を表示する", stage(ops.status)),
     # 段階ごと
@@ -108,6 +109,7 @@ COMMANDS: dict[str, tuple[str, object]] = {
     "audit-bench": ("検索の速さの試験（合成データと実際の記録で、目標の操作の時間を測る）", None),
     "audit-compact": ("監査ログの整形を手で流す", None),
     "review-log": ("審査の判定ログを集計する", None),
+    "proxy-log": ("aws-ec2 / gcp-vm: 中継（出口プロキシ）の記録から宛先ホストごとの件数を出す（LAB_EGRESS_PROXY_VM=true のとき）", None),
 }
 
 
@@ -121,6 +123,9 @@ def main(argv: list[str]) -> int:
     parsers["upgrade-k8s"].add_argument("--measure", action="store_true",
                                         help="上げている間、偽 LLM への要求を流し続けて失敗の数と時間を測る（test-failover と同じ測り方）")
     parsers["clean-all"].add_argument("-y", "--yes", action="store_true", help="確認を出さずに消す")
+    parsers["down"].add_argument("--all", action="store_true", dest="everything",
+                                 help="LAB_INFRA=provided でも VM・浮動 IP・バケットまで消す（静的キーとネットワークは残る）")
+    parsers["proxy-log"].add_argument("--since", default="1 hour ago", help="journalctl の --since（既定 '1 hour ago'）")
     parsers["test-load"].add_argument("--vus", default="20", help="同時接続数（既定 20）")
     parsers["test-load"].add_argument("--duration", default="2m", help="時間（既定 2m）")
     parsers["test-load"].add_argument("--scenario", default="chat", choices=["chat", "review"])
@@ -143,6 +148,12 @@ def main(argv: list[str]) -> int:
 
     try:
         match args.command:
+            case "down":
+                ops.down(everything=args.everything)
+            case "proxy-log":
+                from labtool import vm
+                for host, n in vm.proxy_log(loaded(), args.since).items():
+                    print(f"{n:7d}  {host}")
             case "upgrade":
                 ops.upgrade(loaded(), args.version)
             case "upgrade-k8s":

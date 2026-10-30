@@ -567,10 +567,12 @@ class VmTargetTest(unittest.TestCase):
     （変更仕様書 .history/2026-10-30-VM環境の共通化とGCP追加/ 2 章・4 章、変更設計書 2 章・8 章）。local と aws の振る舞いは上のテストで変わらないこと。"""
 
     def vm(self, target="aws-ec2", **extra):
-        e = env(LAB_TARGET=target, LAB_HOSTNAME="lab.example.test", LAB_ACME_EMAIL="ops@example.test",
-                TYPESAFE_API_KEY="t", LAB_GCP_PROJECT="my-project", LAB_JUDGE_ANTHROPIC_API_KEY="sk-judge", **extra)
-        e.values["LAB_BUCKET_PREFIX"] = "litellm-lab-111111111111-" if target == "aws-ec2" else "litellm-lab-my-project-"
-        return e
+        nodes = "i-1,i-2,i-3" if target == "aws-ec2" else "asia-northeast1-b/n1,asia-northeast1-c/n2,asia-northeast1-b/n3"
+        base = dict(LAB_TARGET=target, LAB_HOSTNAME="lab.example.test", LAB_ACME_EMAIL="ops@example.test",
+                    TYPESAFE_API_KEY="t", LAB_GCP_PROJECT="my-project", LAB_JUDGE_ANTHROPIC_API_KEY="sk-judge",
+                    LAB_VM_BUCKET="lab-bucket", LAB_VM_NODES=nodes,
+                    LAB_VM_ENTRY_IP_ID="eipalloc-1" if target == "aws-ec2" else "litellm-lab-entry")
+        return env(**{**base, **extra})
 
     def test_target_flags_and_urls(self):
         e = self.vm()
@@ -583,8 +585,16 @@ class VmTargetTest(unittest.TestCase):
         self.assertEqual((e.vm_prefix, g.vm_prefix), ("litellm-lab-ec2", "litellm-lab"))
         self.assertEqual((e.vm_cidr, e.vm_disk_gib, e.vm_local_port, e.vm_keep_entry_ip), ("10.60.0.0/16", 40, 16443, False))
         self.assertEqual((e.vm_region, g.vm_region, g.gcp_machine_type), ("ap-northeast-1", "asia-northeast1", "c4a-standard-2"))
-        self.assertEqual(render.bucket_name(e, "audit-raw"), "litellm-lab-111111111111-audit-raw")
-        self.assertEqual(render.bucket_name(g, "audit-raw"), "litellm-lab-my-project-audit-raw")
+        # VM の環境は 1 つのバケットのディレクトリ（変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 4.1 節）
+        self.assertEqual(render.store_location(e, "audit-raw"), ("lab-bucket", "audit-raw/"))
+        self.assertEqual(render.store_location(g, "pg-backup"), ("lab-bucket", "pg-backup/"))
+        self.assertEqual(render.store_location(env(), "audit-raw"), ("audit-raw", ""))
+        self.assertEqual(render.store_location(env(LAB_TARGET="aws", LAB_AWS_HOSTNAME="x", LAB_AWS_BUCKET_PREFIX="p-"), "audit-raw"),
+                         ("p-audit-raw", ""))
+        self.assertEqual((e.infra_mode, e.is_provided, env(LAB_TARGET="gcp-vm", LAB_INFRA="provided").is_provided), ("managed", False, True))
+        self.assertEqual(e.vm_nodes, ["i-1", "i-2", "i-3"])
+        with self.assertRaises(Exception):
+            _ = env(LAB_INFRA="other").infra_mode
         with self.assertRaises(Exception):
             _ = env(LAB_TARGET="gcp-vm", LAB_HOSTNAME="x").gcp_project   # プロジェクトが無いと止まる
 
@@ -619,27 +629,30 @@ class VmTargetTest(unittest.TestCase):
         self.assertIn("REDIS_SENTINEL_NODES", ev)                      # Valkey は Mac と同じ Sentinel
         self.assertEqual(o["db"]["endpoint"], "litellm-pg-pooler-rw")  # Pooler も Mac と同じ
         self.assertEqual((ev["AUDIT_S3_ENDPOINT"], ev["AUDIT_S3_REGION"]), ("", "ap-northeast-1"))
-        self.assertEqual(ev["AUDIT_S3_BUCKET"], "litellm-lab-111111111111-audit-raw")
+        self.assertEqual((ev["AUDIT_S3_BUCKET"], ev["AUDIT_S3_KEY_PREFIX"]), ("lab-bucket", "audit-raw/"))
+        self.assertEqual((ev["AUDIT_S3_RETENTION_DAYS"], ev["AUDIT_S3_RETENTION_MODE"]), ("90", "GOVERNANCE"))   # 原本にオブジェクト単位の保持
         self.assertNotIn("AUDIT_S3_CREDENTIAL_CHAIN", ev)              # 静的キー（Secret litellm-secrets）
         self.assertEqual([v["name"] for v in o["volumes"]], ["audit-spool"])   # chatgpt/ の hostPath は無い
+        self.assertNotIn("HTTPS_PROXY", ev)                             # 中継が無ければ何も足さない
+        self.assertNotIn("AUDIT_S3_RETENTION_DAYS", render.helm_overrides(env(), "r", "t", "h")["envVars"])   # Mac は既定の保持
         g = render.helm_overrides(self.vm("gcp-vm"), "lab-registry:5000/litellm-lab", "t", "h")["envVars"]
         self.assertEqual((g["AUDIT_S3_ENDPOINT"], g["AUDIT_S3_REGION"]), ("https://storage.googleapis.com", "asia-northeast1"))
 
     def test_pg_backup_values(self):
         local = render.pg_backup_values(env())
-        self.assertEqual(local["S3_BUCKET_PREFIX"], "")
+        self.assertEqual(local["S3_DEST"], "s3://pg-backup/litellm-pg")
         self.assertEqual(local["S3_ENDPOINT_LINE"], "endpointURL: http://rustfs:9000")
         e = render.pg_backup_values(self.vm())
-        self.assertEqual((e["S3_BUCKET_PREFIX"], e["S3_ENDPOINT_LINE"], e["S3_REGION"]),
-                         ("litellm-lab-111111111111-", "", "ap-northeast-1"))
+        self.assertEqual((e["S3_DEST"], e["S3_ENDPOINT_LINE"], e["S3_REGION"]),
+                         ("s3://lab-bucket/pg-backup/litellm-pg", "", "ap-northeast-1"))
         g = render.pg_backup_values(self.vm("gcp-vm"))
-        self.assertEqual((g["S3_BUCKET_PREFIX"], g["S3_ENDPOINT_LINE"], g["S3_REGION"]),
-                         ("litellm-lab-my-project-", "endpointURL: https://storage.googleapis.com", "asia-northeast1"))
+        self.assertEqual((g["S3_DEST"], g["S3_ENDPOINT_LINE"], g["S3_REGION"]),
+                         ("s3://lab-bucket/pg-backup/litellm-pg", "endpointURL: https://storage.googleapis.com", "asia-northeast1"))
         text = render_template(Path(__file__).resolve().parents[2] / "k8s" / "postgres-cnpg.yaml", e)
         store = next(d for d in yaml.safe_load_all(text) if d["kind"] == "ObjectStore")
-        self.assertEqual(store["spec"]["configuration"]["destinationPath"], "s3://litellm-lab-111111111111-pg-backup/litellm-pg")
+        self.assertEqual(store["spec"]["configuration"]["destinationPath"], "s3://lab-bucket/pg-backup/litellm-pg")
         self.assertNotIn("endpointURL", store["spec"]["configuration"])
-
+        self.assertNotIn("endpointCA", store["spec"]["configuration"])   # 中継が無ければ CA の参照は無い
     def test_tls_ingressroutes_copy_routes_to_websecure(self):
         text = (Path(__file__).resolve().parents[2] / "k8s" / "ingress.yaml").read_text()
         docs = list(yaml.safe_load_all(render.tls_ingressroutes(text)))
@@ -661,17 +674,21 @@ class VmTargetTest(unittest.TestCase):
             render.vm_issuer_manifest(env(LAB_TARGET="aws-ec2", LAB_HOSTNAME="x.test"))
         cert = yaml.safe_load(render.vm_certificate_manifest(self.vm()))
         self.assertEqual((cert["spec"]["dnsNames"], cert["spec"]["secretName"]), (["lab.example.test"], "litellm-tls"))
-        docs = list(yaml.safe_load_all(render.vm_registry_manifest(self.vm("gcp-vm"), "litellm-lab-my-project-images", 30500)))
+        docs = list(yaml.safe_load_all(render.vm_registry_manifest(self.vm("gcp-vm"), "lab-bucket", 30500)))
         svc = next(d for d in docs if d["kind"] == "Service")
         self.assertEqual((svc["spec"]["type"], svc["spec"]["ports"][0]["nodePort"]), ("NodePort", 30500))
         dep = next(d for d in docs if d["kind"] == "Deployment")
         envs = {e["name"]: e["value"] for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
-        self.assertEqual((envs["REGISTRY_STORAGE"], envs["REGISTRY_STORAGE_S3_BUCKET"]), ("s3", "litellm-lab-my-project-images"))
+        self.assertEqual((envs["REGISTRY_STORAGE"], envs["REGISTRY_STORAGE_S3_BUCKET"]), ("s3", "lab-bucket"))
+        self.assertEqual(envs["REGISTRY_STORAGE_S3_ROOTDIRECTORY"], "/images/registry")   # 1 バケットの images/ ディレクトリ
         self.assertEqual((envs["REGISTRY_STORAGE_S3_REGION"], envs["REGISTRY_STORAGE_S3_REGIONENDPOINT"]),
                          ("asia-northeast1", "https://storage.googleapis.com"))
         self.assertEqual(dep["spec"]["replicas"], 2)
-        secret = render.vm_registry_secret(self.vm(S3_REGISTRY_KEY="AKIAREG", S3_REGISTRY_SECRET="sr",
-                                                   LAB_REGISTRY_HTTP_SECRET="h"))
+        # 静的キーは .env の LAB_VM_S3_*（Mac の S3_* とは別の名前。同じ .env で切り替えても混ざらない）
+        secret = render.vm_registry_secret(self.vm(LAB_VM_S3_REGISTRY_KEY="AKIAREG", LAB_VM_S3_REGISTRY_SECRET="sr",
+                                                   S3_REGISTRY_KEY="mac", LAB_REGISTRY_HTTP_SECRET="h"))
+        self.assertEqual(render.s3_env_names("litellm-writer", env()), ("S3_LITELLM_WRITER_KEY", "S3_LITELLM_WRITER_SECRET"))
+        self.assertEqual(render.s3_env_names("litellm-writer", self.vm()), ("LAB_VM_S3_LITELLM_WRITER_KEY", "LAB_VM_S3_LITELLM_WRITER_SECRET"))
         self.assertEqual(secret, {"REGISTRY_STORAGE_S3_ACCESSKEY": "AKIAREG", "REGISTRY_STORAGE_S3_SECRETKEY": "sr",
                                   "REGISTRY_HTTP_SECRET": "h"})
 
@@ -727,7 +744,9 @@ class VmTargetTest(unittest.TestCase):
     def test_env_example_has_vm_items_and_no_ec2_leftovers(self):
         text = (Path(__file__).resolve().parents[2] / ".env.example").read_text()
         for key in ("LAB_HOSTNAME", "LAB_VM_CIDR", "LAB_VM_KEEP_ENTRY_IP", "LAB_SSH_ALLOW_CIDR", "LAB_JUDGE_ANTHROPIC_API_KEY",
-                    "LAB_GCP_PROJECT", "LAB_GCP_MACHINE_TYPE"):
+                    "LAB_GCP_PROJECT", "LAB_GCP_MACHINE_TYPE", "LAB_INFRA", "LAB_VM_NODES", "LAB_VM_BUCKET", "LAB_VM_ENTRY_IP_ID",
+                    "LAB_VM_SSH_KEY", "LAB_VM_S3_LITELLM_WRITER_KEY", "LAB_EGRESS_PROXY", "LAB_EGRESS_CA_FILE",
+                    "LAB_EGRESS_PROXY_MAC", "LAB_EGRESS_PROXY_VM", "LAB_VM_ARCH"):
             self.assertIn(f"\n{key}=", text)
         for old in ("LAB_EC2_VPC_CIDR", "LAB_EC2_DISK_GIB", "LAB_EC2_LOCAL_PORT", "LAB_EC2_KEEP_EIP", "LAB_AWS_HOSTNAME="):
             self.assertNotIn(old, text)
@@ -737,15 +756,26 @@ class CloudLayerTest(unittest.TestCase):
     """クラウド固有層（labtool/clouds/）: 2 つの実装が同じ関数の組を持つこと、ネットワークの計画、VM の初期化の描画
     （変更設計書 3 章〜6 章）。クラウドの API は呼ばない。"""
 
-    def test_vm_drops_env_static_keys(self):
-        """VM の環境では .env の静的キー（Mac の RustFS 用）を読まない（配備で判明 2026-10-30）。"""
+    def test_provided_env_requirements(self):
+        """LAB_INFRA=provided は .env の既存資源の項目（VM 3 台、バケット、浮動 IP、静的キー、中継の CA）がそろっていないと止まる。"""
         from labtool import vm
-        env = VmTargetTest().vm("gcp-vm")
-        env.values.update({"S3_LITELLM_WRITER_KEY": "k", "S3_LITELLM_WRITER_SECRET": "s", "RUSTFS_ACCESS_KEY": "a"})
-        dropped = vm.drop_env_static_keys(env)
-        self.assertEqual(sorted(dropped), ["RUSTFS_ACCESS_KEY", "S3_LITELLM_WRITER_KEY", "S3_LITELLM_WRITER_SECRET"])
-        self.assertIsNone(env.get("S3_LITELLM_WRITER_KEY") or None)
-
+        from labtool.core import LabError
+        e = VmTargetTest().vm("gcp-vm", LAB_INFRA="provided")
+        with self.assertRaises(LabError) as cm:
+            vm.require_provided_env(e)
+        self.assertIn("LAB_VM_S3_LITELLM_WRITER_KEY", str(cm.exception))
+        self.assertIn("LAB_VM_S3_OPERATOR_KEY", str(cm.exception))   # GCP は操作者の HMAC キーも必須
+        for user in ("litellm-writer", "audit-compactor", "audit-viewer", "pg-backup", "registry", "operator"):
+            for name in render.s3_env_names(user, e):
+                e.values[name] = "x"
+        vm.require_provided_env(e)
+        e.values["LAB_EGRESS_PROXY"] = "http://10.0.0.20:3128"
+        with self.assertRaises(LabError):
+            vm.require_provided_env(e)   # 中継があれば CA が要る
+        a = VmTargetTest().vm("aws-ec2", LAB_INFRA="provided", LAB_VM_NODES="i-1,i-2")
+        with self.assertRaises(LabError) as cm:
+            vm.require_provided_env(a)
+        self.assertIn("LAB_VM_NODES", str(cm.exception))
     def test_web_cidr_defaults_to_operator(self):
         """80/443 の送信元: LAB_WEB_ALLOW_CIDR があればそれ、無ければ 22 と同じ操作者の IP（2026-10-30 の判断 A）。"""
         from labtool import vm
@@ -777,11 +807,8 @@ class CloudLayerTest(unittest.TestCase):
         plan = clouds.network_plan("10.60.0.0/16", subnets_per_node=(target == "aws-ec2"))
         nodes = [clouds.Node(id=f"id-{n['index']}", index=n["index"], private_ip=n["private_ip"], public_ip="", zone=f"z{n['index']}")
                  for n in plan["nodes"]]
-        prefix = "litellm-lab-111111111111-" if target == "aws-ec2" else "litellm-lab-my-project-"
-        infra = clouds.Infra(nodes=nodes, entry_ip="203.0.113.10", entry_ip_id="eipalloc-1" if target == "aws-ec2" else "litellm-lab-entry",
-                             buckets={k: prefix + k for k in clouds.bucket_specs(VmTargetTest().vm(target))}, bucket_prefix=prefix)
-        infra.extra["network"] = {"plan": plan, "azs": ["a", "b", "c"], "zones": ["a", "b", "c"]}
-        return infra
+        return clouds.Infra(nodes=nodes, entry_ip="203.0.113.10", entry_ip_id="eipalloc-1" if target == "aws-ec2" else "litellm-lab-entry",
+                            bucket="lab-bucket", region="r")
 
     def test_both_clouds_implement_the_same_functions(self):
         import inspect
@@ -808,76 +835,168 @@ class CloudLayerTest(unittest.TestCase):
         self.assertEqual([n["private_ip"] for n in gcp_plan["nodes"]], ["10.60.0.10", "10.60.0.11", "10.60.0.12"])
         self.assertEqual([n["secondary_ip"] for n in gcp_plan["nodes"]], ["", "", ""])
 
-    def test_bucket_specs_and_policies(self):
-        from labtool import clouds
+    def test_single_bucket_layout_and_policies(self):
+        """1 バケットのディレクトリ構成（変更設計書 4 章）: ライフサイクル、IAM ユーザーの権限の写し、GCS のバインディングの写し。"""
+        from labtool import clouds, objectstore
         from labtool.clouds import aws_ec2, gcp
         e = VmTargetTest().vm()
-        specs = clouds.bucket_specs(e)
-        self.assertEqual(set(specs), {"audit-raw", "audit-access", "audit-derived", "pg-backup", "images", "cluster"})
-        self.assertEqual(specs["cluster"], {"lock": None, "versioning": True, "lifecycle": []})
-        self.assertEqual((aws_ec2.bucket_prefix(e, {"account": "111111111111"}), gcp.bucket_prefix(e, {"account": "my-project"})),
-                         ("litellm-lab-111111111111-", "litellm-lab-my-project-"))
+        rules = {r["ID"]: r for r in objectstore.vm_lifecycle_rules(e)}
+        self.assertEqual(rules["audit-raw-all"]["Filter"], {"Prefix": "audit-raw/"})
+        self.assertEqual((rules["audit-raw-all"]["Expiration"]["Days"], rules["audit-access-all"]["Expiration"]["Days"]), (91, 401))
+        self.assertEqual(rules["audit-derived-meta"]["Filter"], {"Prefix": "audit-derived/meta/"})
+        self.assertEqual(rules["pg-backup-versions"]["NoncurrentVersionExpiration"], {"NoncurrentDays": 1})
+        self.assertNotIn("Expiration", rules["images-versions"])
         self.assertEqual((aws_ec2.s3_endpoint(e), gcp.s3_endpoint(e)), ("", "https://storage.googleapis.com"))
-        # AWS: 接頭辞付きの ARN と、監査ログの削除の明示的な拒否
-        pol = aws_ec2.iam_policies(e, "p-")
+        # AWS: 1 バケットのディレクトリの ARN。一覧はバケット全体。保持を付けて書く利用者に PutObjectRetention。全員に明示的な拒否
+        pol = clouds.s3_user_policies(e, "lab-bucket")
         self.assertEqual(set(pol), set(clouds.STATIC_KEY_USERS))
-        self.assertEqual(pol["litellm-writer"]["Statement"][0]["Resource"], ["arn:aws:s3:::p-audit-raw/raw/*"])
-        self.assertEqual(pol["registry"]["Statement"][0]["Resource"], ["arn:aws:s3:::p-images", "arn:aws:s3:::p-images/*"])
-        deny = pol["pg-backup"]["Statement"][-1]
-        self.assertEqual(deny["Effect"], "Deny")
-        self.assertIn("arn:aws:s3:::p-audit-raw/*", deny["Resource"])
-        # GCP: バケットの IAM の条件付きバインディングに写す（拒否は無く、保持ポリシーが守る）
-        bindings = gcp.bucket_bindings(e, "p-")
-        self.assertEqual(bindings["p-audit-raw"][0], {"user": "litellm-writer", "role": "roles/storage.objectCreator", "prefix": "raw/"})
-        self.assertIn({"user": "audit-viewer", "role": "roles/storage.objectViewer", "prefix": ""}, bindings["p-audit-raw"])
-        self.assertIn({"user": "pg-backup", "role": "roles/storage.objectAdmin", "prefix": ""}, bindings["p-pg-backup"])
-        self.assertTrue(all(any(b["user"] == "operator" for b in v) for v in bindings.values()))
-        rules = gcp._lifecycle_rules(specs["audit-raw"]["lifecycle"])
-        self.assertEqual(rules, [{"action": {"type": "Delete"}, "condition": {"age": 91, "isLive": True}},
-                                 {"action": {"type": "Delete"}, "condition": {"daysSinceNoncurrentTime": 91, "isLive": False}}])
-
+        writer = pol["litellm-writer"]["Statement"]
+        self.assertEqual(writer[0]["Resource"], ["arn:aws:s3:::lab-bucket/audit-raw/raw/*"])
+        self.assertIn({"Effect": "Allow", "Action": ["s3:PutObjectRetention"], "Resource": ["arn:aws:s3:::lab-bucket/audit-raw/raw/*"]}, writer)
+        self.assertFalse(any("s3:ListBucket" in st["Action"] for st in writer if st["Effect"] == "Allow"))
+        compactor = pol["audit-compactor"]["Statement"]
+        self.assertTrue(any(st["Action"][0] == "s3:ListBucket" and st["Resource"] == ["arn:aws:s3:::lab-bucket"] for st in compactor))
+        self.assertEqual(pol["registry"]["Statement"][0]["Resource"], ["arn:aws:s3:::lab-bucket/images/*"])
+        denies = [st for st in pol["pg-backup"]["Statement"] if st["Effect"] == "Deny"]
+        self.assertEqual(len(denies), 2)
+        self.assertIn("arn:aws:s3:::lab-bucket/audit-raw/*", denies[0]["Resource"])
+        self.assertIn("s3:BypassGovernanceRetention", denies[0]["Action"])
+        self.assertIn("s3:PutBucketObjectLockConfiguration", denies[1]["Action"])
+        # GCP: 条件付きバインディング。原本と閲覧記録は追記＋保持の writer、上書きのあるディレクトリは objectUser、一覧は lister
+        b = clouds.gcs_bindings(e, "lab-bucket")
+        self.assertIn({"user": "litellm-writer", "role": clouds.GCS_ROLE_WRITER, "prefix": "audit-raw/raw/"}, b)
+        self.assertIn({"user": "audit-viewer", "role": clouds.GCS_ROLE_WRITER, "prefix": "audit-access/"}, b)
+        self.assertIn({"user": "audit-compactor", "role": "roles/storage.objectUser", "prefix": "audit-derived/"}, b)
+        self.assertIn({"user": "audit-compactor", "role": clouds.GCS_ROLE_LISTER, "prefix": ""}, b)
+        self.assertIn({"user": "audit-viewer", "role": "roles/storage.objectViewer", "prefix": "audit-raw/"}, b)
+        self.assertIn({"user": "pg-backup", "role": "roles/storage.objectAdmin", "prefix": "pg-backup/"}, b)
+        self.assertIn({"user": "registry", "role": "roles/storage.objectAdmin", "prefix": "images/"}, b)
+        self.assertIn({"user": "operator", "role": "roles/storage.objectAdmin", "prefix": ""}, b)
+        self.assertFalse(any(x["user"] == "litellm-writer" and x["role"] != clouds.GCS_ROLE_WRITER for x in b))   # 書き込み用は読めない
+        self.assertEqual(gcp._custom_role_name(e, clouds.GCS_ROLE_WRITER), "projects/my-project/roles/litellm_lab_ec2_writer")
+        gr = gcp._lifecycle_rules([rules["audit-raw-all"]])
+        self.assertEqual(gr, [{"action": {"type": "Delete"}, "condition": {"age": 91, "isLive": True, "matchesPrefix": ["audit-raw/"]}},
+                              {"action": {"type": "Delete"}, "condition": {"daysSinceNoncurrentTime": 91, "isLive": False,
+                                                                           "matchesPrefix": ["audit-raw/"]}}])
+        # 書く側の保持（自己確認用）
+        args = objectstore.retention_put_args(e, "audit-raw")
+        self.assertEqual(args["ObjectLockMode"], "GOVERNANCE")
+        self.assertEqual(objectstore.retention_put_args(e, "pg-backup"), {})
+        self.assertEqual(objectstore.retention_put_args(env(), "audit-raw"), {})
     def test_node_init_rendering_for_both_clouds(self):
+        """SSH で流す初期化スクリプト（変更設計書 5 章）: トークンと版、中継と CA、hooks の関数、置き換え漏れ無し。"""
         from labtool import vm
         from labtool.clouds import aws_ec2, gcp
+        values = {"K3S_VERSION": "v1.35.5+k3s1", "K3S_TOKEN": "tok", "SSH_USER": "ubuntu",
+                  "EGRESS_PROXY": "http://10.60.0.20:3128", "EGRESS_NO_PROXY": "127.0.0.1,10.60.0.0/16", "EGRESS_CA_B64": "Q0E="}
         for target, cloud in (("aws-ec2", aws_ec2), ("gcp-vm", gcp)):
             e = VmTargetTest().vm(target)
             infra = self.infra(target)
             node = infra.nodes[2]
-            hooks = cloud.node_init_hooks(e, infra, node)
-            for fn in ("lab_install_tools", "lab_read_object", "lab_self_id", "lab_take_entry_ip", "lab_ensure_egress", "lab_hook_values"):
+            if target == "gcp-vm":
+                hooks = cloud.node_init_hooks(e, infra, node)
+            else:
+                hooks = aws_ec2.HOOKS_SCRIPT.read_text().replace("@@REGION@@", "r").replace("@@EIP_ALLOCATION_ID@@", "eipalloc-1") \
+                    .replace("@@SECONDARY_IP@@", "10.60.2.11").replace("@@SUBNET_PREFIX@@", "24")   # AWS は API で 2 つ目の IP を読む
+            for fn in ("lab_install_tools", "lab_self_id", "lab_take_entry_ip", "lab_ensure_egress", "lab_hook_values"):
                 self.assertIn(f"{fn}()", hooks, f"{target} の hooks に {fn} がありません")
-            text = vm.render_node_init(node, infra.nodes, hooks, "ssh-ed25519 AAAA test")
-            self.assertEqual(re.findall(r"@@[A-Z_]+@@", text), [])   # 置き換え漏れ無し（説明文の @@名前@@ は残る）
-            self.assertIn('PRIORITY="100"', text)
-            self.assertIn('NODE_INDEX="3"', text)
-            self.assertIn("ssh-ed25519 AAAA test", text)
-            self.assertIn("/etc/rancher/k3s/config.yaml", text)
-            self.assertIn("cluster-init: true", text)
-            self.assertIn("sh -s - server\n", text)
+            self.assertNotIn("lab_read_object", hooks)   # VM はバケットを読まない（トークンと版は SSH で渡す）
+            text = vm.render_node_init(node, infra.nodes, hooks, "ssh-ed25519 AAAA test", values)
+            self.assertEqual(re.findall(r"@@[A-Z_0-9]+@@", text), [])
+            for needle in ('PRIORITY="100"', 'NODE_INDEX="3"', "ssh-ed25519 AAAA test", "/etc/rancher/k3s/config.yaml",
+                           "cluster-init: true", "sh -s - server\n", "nopreempt", "notify_backup", 'K3S_VERSION="v1.35.5+k3s1"',
+                           'K3S_TOKEN="tok"', 'EGRESS_PROXY="http://10.60.0.20:3128"', "update-ca-certificates",
+                           "/etc/systemd/system/k3s.service.env", "docker.io", "lab-egress.service", "/var/lib/lab/ready"):
+                self.assertIn(needle, text, f"{target}: {needle}")
             self.assertNotIn("--cluster-init", text)
-            self.assertIn("nopreempt", text)
-            self.assertIn("lab_read_object k3s/version", text)
-            self.assertIn("notify_backup", text)
             self.assertNotIn("ssm", text.lower())   # Systems Manager は使わない
-        infra = self.infra("aws-ec2")
-        aws_text = aws_ec2.node_init_hooks(VmTargetTest().vm(), infra, infra.nodes[0])
-        self.assertIn("associate-address", aws_text)
-        self.assertIn("LAB_SECONDARY_IP=\"10.60.0.11\"", aws_text)
-        self.assertIn("litellm-lab-111111111111-cluster", aws_text)
+            self.assertNotIn("lab_read_object", text)
         ginfra = self.infra("gcp-vm")
         gcp_text = gcp.node_init_hooks(VmTargetTest().vm("gcp-vm"), ginfra, ginfra.nodes[0])
         self.assertIn("addAccessConfig", gcp_text)
         self.assertIn("LAB_ADDRESS_NAME=\"litellm-lab-entry\"", gcp_text)
+        self.assertIn("--noproxy '*'", gcp_text)   # メタデータサーバーは中継を通さない
         self.assertFalse(any(l.lstrip().startswith("gcloud ") or " gcloud " in l for l in gcp_text.splitlines()
                              if not l.lstrip().startswith("#")))   # gcloud を呼ばない（REST API だけ）
         with self.assertRaises(ValueError):
-            vm.render_node_init(infra.nodes[0], infra.nodes, "", "k", script="x @@UNKNOWN@@")
-
+            vm.render_node_init(ginfra.nodes[0], ginfra.nodes, "", "k", script="x @@UNKNOWN@@")
+        # 中継の値: 中継が無ければ空、あれば除外に VM の CIDR と台の IP
+        e = VmTargetTest().vm("gcp-vm")
+        self.assertEqual(vm.egress_values(e, ginfra), {"EGRESS_PROXY": "", "EGRESS_NO_PROXY": "", "EGRESS_CA_B64": ""})
+        self.assertIn(vm.PROXY_INIT_SCRIPT.name, "proxy-init.sh")
+        self.assertIn("mitmdump --mode regular", vm.PROXY_INIT_SCRIPT.read_text())
     def test_infra_helpers(self):
         from labtool import clouds
         infra = self.infra("aws-ec2")
         self.assertEqual(infra.node_ids(), ["id-1", "id-2", "id-3"])
         self.assertEqual(infra.node("id-2").private_ip, "10.60.1.10")
+        self.assertEqual((infra.bucket, infra.proxy), ("lab-bucket", None))
         with self.assertRaises(Exception):
             infra.node("id-9")
-        self.assertEqual(clouds.network_plan("10.60.0.0/16", True)["vpc"], "10.60.0.0/16")
+        plan = clouds.network_plan("10.60.0.0/16", True)
+        self.assertEqual((plan["vpc"], plan["proxy_ip"]), ("10.60.0.0/16", "10.60.0.20"))   # 中継の VM は先頭のサブネットの .20
+
+    def test_egress_env_and_add_egress(self):
+        """出口プロキシ（変更設計書 7.2 節）: 中継があれば全コンテナに環境変数とマウント、ObjectStore に sidecar の env と endpointCA。無ければ変えない。"""
+        import os
+        import tempfile
+        from labtool.core import HELM_EXTRA, helm
+        with tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False) as f:
+            f.write("-----BEGIN CERTIFICATE-----\nQ0E=\n-----END CERTIFICATE-----\n")
+            ca = f.name
+        e = VmTargetTest().vm("gcp-vm", LAB_EGRESS_PROXY="http://10.60.0.20:3128", LAB_EGRESS_CA_FILE=ca)
+        envs = {x["name"]: x["value"] for x in render.egress_env(e)}
+        self.assertEqual((envs["HTTPS_PROXY"], envs["http_proxy"]), ("http://10.60.0.20:3128", "http://10.60.0.20:3128"))
+        self.assertIn("fake-llm", envs["NO_PROXY"])
+        self.assertIn("10.43.0.0/16", envs["no_proxy"])
+        self.assertEqual((envs["SSL_CERT_FILE"], envs["AWS_CA_BUNDLE"], envs["REQUESTS_CA_BUNDLE"]), (render.EGRESS_CA_PATH,) * 3)
+        self.assertEqual(render.egress_env(VmTargetTest().vm("gcp-vm")), [])
+        docs = [{"kind": "Deployment", "spec": {"template": {"spec": {"containers": [{"name": "a", "env": [{"name": "X", "value": "1"}]},
+                                                                                     {"name": "b"}]}}}},
+                {"kind": "CronJob", "spec": {"jobTemplate": {"spec": {"template": {"spec": {"containers": [{"name": "c"}]}}}}}},
+                {"kind": "ObjectStore", "spec": {"configuration": {"destinationPath": "s3://b/p"},
+                                                 "instanceSidecarConfiguration": {"env": [{"name": "AWS_DEFAULT_REGION", "value": "r"}]}}},
+                {"kind": "Service", "spec": {}}]
+        out = render.add_egress(docs, e)
+        pod = out[0]["spec"]["template"]["spec"]
+        for c in pod["containers"]:
+            self.assertIn("HTTPS_PROXY", {x["name"] for x in c["env"]})
+            self.assertEqual(c["volumeMounts"], [render.egress_mount()])
+        self.assertEqual({x["name"] for x in pod["containers"][0]["env"]} >= {"X", "HTTPS_PROXY"}, True)
+        self.assertEqual(pod["volumes"], [render.egress_volume()])
+        self.assertIn("HTTPS_PROXY", {x["name"] for x in out[1]["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["env"]})
+        store = out[2]["spec"]
+        self.assertEqual(store["configuration"]["endpointCA"], {"name": render.EGRESS_CA_NAME, "key": "ca.crt"})
+        side = {x["name"] for x in store["instanceSidecarConfiguration"]["env"]}
+        self.assertIn("HTTPS_PROXY", side)
+        self.assertNotIn("AWS_CA_BUNDLE", side)   # CA は endpointCA で渡す
+        self.assertEqual(out[3], {"kind": "Service", "spec": {}})
+        # 中継が無ければそのまま
+        plain = VmTargetTest().vm("gcp-vm")
+        self.assertEqual(render.add_egress([{"kind": "Deployment", "spec": {"template": {"spec": {"containers": [{"name": "a"}]}}}}], plain),
+                         [{"kind": "Deployment", "spec": {"template": {"spec": {"containers": [{"name": "a"}]}}}}])
+        self.assertEqual(render.cert_manager_egress_values(plain), {})
+        cm = render.cert_manager_egress_values(e)
+        self.assertEqual((cm["https_proxy"], cm["extraEnv"][0]["name"]), ("http://10.60.0.20:3128", "SSL_CERT_FILE"))
+        ca_docs = list(yaml.safe_load_all(render.egress_ca_manifests(e, ["litellm-lab", "cert-manager"])))
+        self.assertEqual([(d["kind"], d["metadata"]["namespace"]) for d in ca_docs],
+                         [("ConfigMap", "litellm-lab"), ("Secret", "litellm-lab"), ("ConfigMap", "cert-manager"), ("Secret", "cert-manager")])
+        self.assertEqual(render.egress_ca_manifests(plain, ["litellm-lab"]), "")
+        # LiteLLM の Helm の値: 中継があれば環境変数とマウント、aiohttp を切る
+        o = render.helm_overrides(e, "r", "t", "h")
+        self.assertEqual((o["envVars"]["HTTPS_PROXY"], o["envVars"]["DISABLE_AIOHTTP_TRANSPORT"]), ("http://10.60.0.20:3128", "True"))
+        self.assertIn(render.EGRESS_CA_NAME, [v["name"] for v in o["volumes"]])
+        # 操作者の Mac も中継を通す: 環境変数と helm の --ca-file（チャートを取るサブコマンドだけ）
+        saved = dict(os.environ)
+        try:
+            m = VmTargetTest().vm("gcp-vm", LAB_EGRESS_PROXY_MAC="http://203.0.113.20:3128", LAB_EGRESS_CA_FILE=ca)
+            m.apply_mac_proxy()
+            self.assertEqual((os.environ["HTTPS_PROXY"], os.environ["NO_PROXY"]), ("http://203.0.113.20:3128", "127.0.0.1,localhost"))
+            self.assertEqual((os.environ["REQUESTS_CA_BUNDLE"], os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"]), (ca, ca))
+            self.assertEqual(helm("upgrade", "--install", "x", "y")[-2:], ["--ca-file", ca])
+            self.assertNotIn("--ca-file", helm("-n", "ns", "get", "values", "x"))
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+            HELM_EXTRA.clear()
+        os.unlink(ca)

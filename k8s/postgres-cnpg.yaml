@@ -1,5 +1,5 @@
 # LiteLLM 用の PostgreSQL（CloudNativePG、3 台。変更設計書 3 章）。./lab datastores が変数を置き換えて使う:
-# S3_BUCKET_PREFIX（Mac は空、AWS は <接頭辞>-<アカウント>-）、S3_ENDPOINT_LINE（Mac は endpointURL の行、AWS の S3 は空）、
+# S3_DEST（s3://<バケット>/<ディレクトリ>litellm-pg。Mac は s3://pg-backup/litellm-pg）、S3_ENDPOINT_LINE（Mac は endpointURL の行、AWS の S3 は空）、
 # S3_REGION。
 # - 3 台を別々のノードに置き、同期複製（どれか 1 台の standby が受け取れば書き込み完了）。切り替えは過半数の合意で行う
 # - LiteLLM は Pooler（PgBouncer、transaction モード）か、直結（litellm-pg-rw）につなぐ（.env の LAB_DB_POOLER）
@@ -12,7 +12,7 @@ metadata:
 spec:
   retentionPolicy: "30d"
   configuration:
-    destinationPath: s3://${S3_BUCKET_PREFIX}pg-backup/litellm-pg
+    destinationPath: ${S3_DEST}
     ${S3_ENDPOINT_LINE}
     s3Credentials:
       accessKeyId: { name: pg-backup-s3, key: ACCESS_KEY_ID }

@@ -15,12 +15,27 @@ import urllib.request
 import contextlib
 
 from . import render
-from .core import Env, LabError, info, ok, port_forward
+from .core import Env, LabError, info, ok, port_forward, warn
 
 REGION = "us-east-1"
 # boto3 1.36 以降の既定（送信時のチェックサム、aws-chunked）を GCS の XML API が SignatureDoesNotMatch で拒む。
 # S3 互換のストレージ向けの公式の設定（AWS S3 と RustFS には害が無い。配備で判明 2026-10-30）
 CHECKSUM_WHEN_REQUIRED = {"request_checksum_calculation": "when_required", "response_checksum_validation": "when_required"}
+# 保持中のオブジェクトの削除を拒むエラーコード（S3 / RustFS は AccessDenied、GCS の保持ポリシーは RetentionPolicyNotMet、
+# GCS のオブジェクト単位の保持は配備で確かめる。2026-10-30）
+LOCK_DENIED_CODES = ("AccessDenied", "RetentionPolicyNotMet", "ObjectLockedError", "ObjectRetentionLocked", "Forbidden")
+
+
+def gcs_object_lock_headers(client) -> None:
+    """GCS の XML API は保持を x-goog-object-lock-* のヘッダーで受ける。boto3 が付ける x-amz-object-lock-* を写す
+    （Pod 側の実装 litellm/guardrails/audit_log.py、apps/audit/audit/common.py と同じ）。"""
+    def convert(params, **_):
+        headers = params.get("headers", {})
+        for name in ("mode", "retain-until-date"):
+            v = headers.pop(f"x-amz-object-lock-{name}", None)
+            if v is not None:
+                headers[f"x-goog-object-lock-{name}"] = v
+    client.meta.events.register("before-call.s3.PutObject", convert, unique_id="lab-gcs-object-lock")
 
 
 def s3_client(endpoint: str, access_key: str, secret_key: str):
@@ -48,14 +63,14 @@ def cloud_user_client(env: Env, user: str):
 
 @contextlib.contextmanager
 def admin_s3(env: Env):
-    """管理者としてバケットに触る S3 クライアント。Mac は RustFS に port-forward、AWS は操作者の資格情報で S3 に直接。"""
+    """管理者としてバケットに触る S3 クライアント。Mac は RustFS に port-forward、EKS 版は操作者の資格情報で S3 に直接。
+    VM の環境は操作者の静的キー（LAB_VM_S3_OPERATOR_*。GCP は HMAC キーで必須、AWS は無ければ操作者の資格情報）。"""
+    if env.is_vm and (env.is_gcp_vm or user_credentials(env, "operator")[0]):
+        yield cloud_user_client(env, "operator")
+        return
     if env.on_aws:
         from . import aws
         yield aws.client(env, "s3")
-        return
-    if env.is_gcp_vm:
-        from .clouds import gcp
-        yield gcp.admin_s3_client(env)
         return
     with port_forward("svc/rustfs", 9000) as endpoint:
         yield s3_client(endpoint, *admin_credentials(env))
@@ -65,8 +80,6 @@ def admin_s3(env: Env):
 def user_s3(env: Env, user: str):
     """利用者の静的キーでつなぐ S3 クライアント（Mac は RustFS の利用者、aws-ec2 は IAM ユーザー。EKS 版には無い）。"""
     if env.is_vm:
-        from . import vm
-        vm.load_static_keys(env)
         yield cloud_user_client(env, user)
         return
     with port_forward("svc/rustfs", 9000) as endpoint:
@@ -146,8 +159,115 @@ def admin_credentials(env: Env) -> tuple[str, str]:
 
 
 def user_credentials(env: Env, user: str) -> tuple[str, str]:
-    key_name, secret_name = render.s3_env_names(user)
+    key_name, secret_name = render.s3_env_names(user, env)
     return env.get(key_name), env.get(secret_name)
+
+
+# ---- VM の環境: 1 つのバケット（変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 4 章） ----
+# 論理名（ディレクトリ）。Mac の 4 つ ＋ イメージ置き場 ＋ k3s のトークンと版
+VM_STORES, RETAINED_STORES = render.VM_STORES, render.RETAINED_STORES
+
+
+def vm_lifecycle_rules(env: Env) -> list[dict]:
+    """1 バケットのライフサイクル（S3 の形。接頭辞 = ディレクトリ）。原本と閲覧記録は保持 + 1 日で現行も非現行も消す。
+    整形の結果は Mac と同じ規則をディレクトリの下に。pg-backup / images / cluster はバージョニングで残る非現行の版だけ消す。"""
+    rules = []
+    for logical, spec in render.s3_buckets(env).items():
+        for r in spec["lifecycle"]:
+            rule = {**r, "ID": f"{logical}-{r['ID']}", "Filter": {"Prefix": logical + "/" + r["Filter"]["Prefix"]}}
+            rules.append(rule)
+    rules.append(render._lifecycle("pg-backup-versions", "pg-backup/", None, 1))
+    rules.append(render._lifecycle("images-versions", "images/", None, 1))
+    rules.append(render._lifecycle("cluster-versions", "cluster/", None, 30))
+    return sorted(rules, key=lambda r: r["ID"])
+
+
+def ensure_vm_bucket_s3(env: Env, s3, name: str, region: str) -> None:
+    """S3: 1 つのバケットを作る（Object Lock 有効・既定の保持なし、バージョニング、ライフサイクル、公開の遮断）。あれば合わせる。"""
+    from botocore.exceptions import ClientError
+    existing = {b["Name"] for b in s3.list_buckets().get("Buckets", [])}
+    if name not in existing:
+        location = {"CreateBucketConfiguration": {"LocationConstraint": region}} if region != "us-east-1" else {}
+        s3.create_bucket(Bucket=name, ObjectLockEnabledForBucket=True, **location)
+        info(f"バケット {name} を作りました（Object Lock あり。既定の保持は付けない）")
+    if s3.get_bucket_versioning(Bucket=name).get("Status") != "Enabled":
+        s3.put_bucket_versioning(Bucket=name, VersioningConfiguration={"Status": "Enabled"})
+    enabled, rule = _lock_rule(s3, name)
+    if not enabled:
+        s3.put_object_lock_configuration(Bucket=name, ObjectLockConfiguration={"ObjectLockEnabled": "Enabled"})
+        info(f"バケット {name} の Object Lock を有効にしました")
+    elif rule:
+        warn(f"バケット {name} に既定の保持（{rule}）があります。全ディレクトリに掛かるので外すことを勧めます")
+    want = vm_lifecycle_rules(env)
+    if _canon(_lifecycle_rules(s3, name)) != _canon(want):
+        s3.put_bucket_lifecycle_configuration(Bucket=name, LifecycleConfiguration={"Rules": want})
+        info(f"バケット {name} のライフサイクルを更新しました")
+    s3.put_public_access_block(Bucket=name, PublicAccessBlockConfiguration={
+        "BlockPublicAcls": True, "IgnorePublicAcls": True, "BlockPublicPolicy": True, "RestrictPublicBuckets": True})
+    try:
+        s3.get_bucket_lifecycle_configuration(Bucket=name)
+    except ClientError:
+        pass
+    ok(f"バケット {name} の設定は最新です")
+
+
+def check_vm_bucket_s3(env: Env, s3, name: str, strict: bool) -> None:
+    """S3: 1 バケットが前提どおりか。Object Lock・バージョニング・公開の遮断は必須、ライフサイクルは provided では警告だけ。"""
+    problems: list[str] = []
+    try:
+        s3.head_bucket(Bucket=name)
+    except Exception:  # noqa: BLE001
+        raise LabError(f"バケット {name} がありません（LAB_VM_BUCKET）")
+    if s3.get_bucket_versioning(Bucket=name).get("Status") != "Enabled":
+        problems.append("バージョニングが無効です")
+    enabled, _ = _lock_rule(s3, name)
+    if not enabled:
+        problems.append("Object Lock が無効です（保持を付けて書けない。有効にするにはバージョニングが要る）")
+    try:
+        pab = s3.get_public_access_block(Bucket=name)["PublicAccessBlockConfiguration"]
+        if not all(pab.values()):
+            problems.append("パブリックアクセスの遮断が不完全です")
+    except Exception:  # noqa: BLE001
+        problems.append("パブリックアクセスの遮断が設定されていません")
+    if _canon(_lifecycle_rules(s3, name)) != _canon(vm_lifecycle_rules(env)):
+        msg = "ライフサイクルが前提（変更設計書 4.2 節）と違います"
+        if strict:
+            problems.append(msg)
+        else:
+            warn(f"バケット {name}: {msg}（用意する側の設定のまま使います）")
+    if problems:
+        raise LabError(f"バケット {name} が前提と違います:\n  " + "\n  ".join(problems))
+    ok(f"バケット {name} は前提どおりです")
+
+
+def snapshot_vm_bucket_s3(env: Env, s3, name: str) -> list[str]:
+    return [f"bucket {name} versioning={s3.get_bucket_versioning(Bucket=name).get('Status')} lock={_canon(_lock_rule(s3, name))} "
+            f"lifecycle={_canon(_lifecycle_rules(s3, name))}"]
+
+
+def empty_prefixes(s3, bucket: str, prefixes: list[str]) -> int:
+    """バケットのディレクトリ（接頭辞）の下を版も含めて消す（保持の無いディレクトリだけに使う）。消した版の数を返す。"""
+    n = 0
+    for prefix in prefixes:
+        paginator = s3.get_paginator("list_object_versions")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            objs = [{"Key": v["Key"], "VersionId": v["VersionId"]}
+                    for v in page.get("Versions", []) + page.get("DeleteMarkers", [])]
+            for i in range(0, len(objs), 1000):
+                s3.delete_objects(Bucket=bucket, Delete={"Objects": objs[i:i + 1000], "Quiet": True})
+            n += len(objs)
+    return n
+
+
+def retention_put_args(env: Env, logical: str) -> dict:
+    """VM の環境で原本・閲覧記録を書くときの保持（単体試験と自己確認用。Pod 側の実装は各アプリ）。"""
+    import datetime as _dt
+    if not env.is_vm or logical not in RETAINED_STORES:
+        return {}
+    days = int(env.get("LAB_AUDIT_RETENTION_DAYS", "90") if logical == render.AUDIT_RAW
+               else env.get("LAB_AUDIT_ACCESS_RETENTION_DAYS", "400"))
+    until = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=days)
+    return {"ObjectLockMode": env.get("LAB_AUDIT_LOCK_MODE", "GOVERNANCE"), "ObjectLockRetainUntilDate": until}
 
 
 def _canon(obj) -> str:
@@ -254,26 +374,33 @@ def self_check(env: Env, admin_client, user_client) -> None:
         try:
             fn()
         except ClientError as e:
-            return e.response.get("Error", {}).get("Code") in codes
+            code = e.response.get("Error", {}).get("Code")
+            if code not in codes:
+                warn(f"自己確認: 期待と違うエラーコード {code}（{e.response.get('Error', {}).get('Message', '')[:120]}）")
+            return code in codes
         return False
 
-    raw = render.bucket_name(env, render.AUDIT_RAW)
+    raw, raw_prefix = render.store_location(env, render.AUDIT_RAW)
     writer = user_client("litellm-writer")
     viewer = user_client("audit-viewer")
-    key = f"raw/_selfcheck/{time.strftime('%Y%m%dT%H%M%S')}.txt"
-    version = writer.put_object(Bucket=raw, Key=key, Body=b"self-check").get("VersionId")
+    key = f"{raw_prefix}raw/_selfcheck/{time.strftime('%Y%m%dT%H%M%S')}.txt"
+    put_args = retention_put_args(env, render.AUDIT_RAW)
+    if env.is_gcp_vm:
+        gcs_object_lock_headers(writer)
+    version = writer.put_object(Bucket=raw, Key=key, Body=b"self-check", **put_args).get("VersionId")
+    version_arg = {"VersionId": version} if version else {}
     checks = {
         "書き込み用の利用者は原本を読めない": denied(lambda: writer.get_object(Bucket=raw, Key=key)),
         "書き込み用の利用者は原本を消せない": denied(
-            lambda: writer.delete_object(Bucket=raw, Key=key, VersionId=version)),
+            lambda: writer.delete_object(Bucket=raw, Key=key, **version_arg)),
         "書き込み用の利用者は raw/ の外に書けない": denied(
-            lambda: writer.put_object(Bucket=raw, Key="_selfcheck.txt", Body=b"x")),
-        # S3 と RustFS はオブジェクトロックの拒否を AccessDenied で、GCS は保持ポリシーの拒否を RetentionPolicyNotMet で返す
+            lambda: writer.put_object(Bucket=raw, Key=f"{raw_prefix}_selfcheck.txt", Body=b"x")),
+        # S3 と RustFS はオブジェクトロックの拒否を AccessDenied で、GCS は保持ポリシーの拒否を RetentionPolicyNotMet、
+        # オブジェクト単位の保持の拒否を ObjectLockedError 系のコードで返す（配備で確かめる）
         "管理者でも保持の回避なしには原本を消せない": denied(
-            lambda: admin_client.delete_object(Bucket=raw, Key=key, VersionId=version),
-            codes=("AccessDenied", "RetentionPolicyNotMet")),
+            lambda: admin_client.delete_object(Bucket=raw, Key=key, **version_arg), codes=LOCK_DENIED_CODES),
         "検索アプリは原本に書けない": denied(
-            lambda: viewer.put_object(Bucket=raw, Key="raw/_selfcheck/viewer.txt", Body=b"x")),
+            lambda: viewer.put_object(Bucket=raw, Key=f"{raw_prefix}raw/_selfcheck/viewer.txt", Body=b"x")),
         "検索アプリは原本を読める": not denied(lambda: viewer.get_object(Bucket=raw, Key=key)),
     }
     failed = [k for k, v in checks.items() if not v]

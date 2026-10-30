@@ -16,7 +16,7 @@ from datetime import date, datetime, timedelta
 
 from .common import (
     ACCESS, DERIVED, JST, RAW, Config, duckdb_connect, hour_key, latest_json, list_keys, now_jst, parse_iso,
-    put_json, read_body, read_ndjson_gz, read_raw_hour,
+    put_json, read_body, read_ndjson_gz, read_raw_hour, retention_args,
 )
 from .compactor import flatten
 
@@ -34,7 +34,7 @@ class Store:
         return duckdb_connect(self.cfg)
 
     def url(self, key: str) -> str:
-        return f"s3://{DERIVED}/{key}"
+        return DERIVED.url(key)
 
     # ---- 一覧 ----
     def _derived_keys(self, kind: str, days: list[date]) -> dict[str, list[str]]:
@@ -204,7 +204,8 @@ class Store:
     def write_access(self, kind: str, record: dict) -> None:
         body = (json.dumps({"schema": 1, "type": kind, "ts": now_jst().isoformat(timespec="milliseconds"),
                             **record}, ensure_ascii=False, default=str) + "\n").encode()
-        self.s3.put_object(Bucket=ACCESS, Key=self._access_key(kind), Body=gzip.compress(body, mtime=0))
+        self.s3.put_object(**ACCESS.ref(self._access_key(kind)), Body=gzip.compress(body, mtime=0),
+                           **retention_args("AUDIT_ACCESS_RETENTION_DAYS"))
 
     def read_access(self, kind: str, start: date, end: date) -> list[dict]:
         rows: list[dict] = []
@@ -248,7 +249,7 @@ class Store:
 
     def compactor_state(self) -> dict:
         try:
-            return json.loads(self.s3.get_object(Bucket=DERIVED, Key=f"{self.prefix}_state/compactor.json")["Body"]
+            return json.loads(self.s3.get_object(**DERIVED.ref(f"{self.prefix}_state/compactor.json"))["Body"]
                               .read())
         except Exception:  # noqa: BLE001 まだ一度も動いていない
             return {}

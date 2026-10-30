@@ -128,12 +128,7 @@ class Env:
         # kubectl / helm が向くクラスタを環境に合わせる（変更仕様書 2026-10-24-AWS構成 2.3 節）
         set_kube_context({"aws": AWS_KUBE_CONTEXT, **VM_KUBE_CONTEXTS}.get(env.target, f"k3d-{CLUSTER}"))
         if env.is_vm:
-            from . import vm   # 循環参照を避けて関数の中で読む
-            vm.drop_env_static_keys(env)   # .env の静的キー（Mac の RustFS 用）は VM の環境では読まない
-            try:
-                vm.ensure_bucket_prefix(env)   # バケット名の接頭辞。試験など preflight を通らない入口でも要る（2026-10-30）
-            except Exception:  # noqa: BLE001 資格情報が無いときは preflight が知らせる
-                pass
+            env.apply_mac_proxy()   # 操作者の Mac も出口プロキシ（Zscaler）の中にあるとき、./lab 自身の通信を中継に通す
         # 設定は .env だけから読む。コマンドの前に付けた値は効かないので、食い違えば知らせる
         shell = os.environ.get("LAB_NOREVIEW_KEYS", "").strip()
         if shell and shell.lower() != env.get("LAB_NOREVIEW_KEYS", "false").lower():
@@ -303,6 +298,89 @@ class Env:
         """クラウドのリージョン名（S3 互換の設定に渡す）。"""
         return self.gcp_region if self.is_gcp_vm else self.aws_region
 
+    # ---- 既存資源からの構築と出口プロキシ（変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 2 章） ----
+    @property
+    def infra_mode(self) -> str:
+        """managed: ツールがクラウドの資源を作る。provided: 既存の VM 3 台とバケット 1 つを .env の識別子で使う。"""
+        mode = self.get("LAB_INFRA", "managed")
+        if mode not in ("managed", "provided"):
+            raise LabError(f"LAB_INFRA は managed / provided のどちらかです（{mode}）")
+        return mode
+
+    @property
+    def is_provided(self) -> bool:
+        return self.infra_mode == "provided"
+
+    @property
+    def vm_nodes(self) -> list[str]:
+        """VM の識別子 3 つ（AWS: インスタンス ID、GCP: <ゾーン>/<名前>）。順番が台の番号 1〜3。"""
+        return [x.strip() for x in self.get("LAB_VM_NODES").split(",") if x.strip()]
+
+    @property
+    def vm_ssh_key(self) -> Path:
+        value = self.get("LAB_VM_SSH_KEY")
+        return Path(value).expanduser() if value else BUILD_DIR / "vm-ssh-key"
+
+    @property
+    def vm_ssh_user(self) -> str:
+        return self.get("LAB_VM_SSH_USER", "ubuntu")
+
+    @property
+    def vm_bucket(self) -> str:
+        """バケット（1 つ）。論理名はこの中のディレクトリ（audit-raw/ など）。"""
+        return self.get("LAB_VM_BUCKET")
+
+    @property
+    def vm_entry_ip_id(self) -> str:
+        """浮動 IP の識別子（AWS: eipalloc-…、GCP: アドレスの名前）。"""
+        return self.get("LAB_VM_ENTRY_IP_ID")
+
+    @property
+    def vm_arch(self) -> str:
+        """自作イメージのアーキテクチャ（arm64 / amd64）。空なら VM から読む。"""
+        return self.get("LAB_VM_ARCH")
+
+    @property
+    def egress_proxy(self) -> str:
+        """VM と Pod が使う出口プロキシの URL（空なら中継なし）。"""
+        return self.get("LAB_EGRESS_PROXY")
+
+    @property
+    def egress_ca_file(self) -> Path | None:
+        value = self.get("LAB_EGRESS_CA_FILE")
+        if not value:
+            return None
+        p = Path(value).expanduser()
+        return p if p.is_absolute() else ROOT / p
+
+    @property
+    def egress_proxy_mac(self) -> str:
+        """./lab 自身（操作者の Mac）が使う中継の URL（空なら Mac は中継を使わない）。"""
+        return self.get("LAB_EGRESS_PROXY_MAC")
+
+    @property
+    def egress_proxy_vm(self) -> bool:
+        """managed で 4 台目の VM に中継（mitmproxy、独自 CA）を作り、3 台の直接の外向き通信を遮断するか。"""
+        return self.get("LAB_EGRESS_PROXY_VM", "false").lower() == "true"
+
+    def apply_mac_proxy(self) -> None:
+        """LAB_EGRESS_PROXY_MAC があれば、このプロセスと子プロセス（helm、kubectl）の環境変数に中継と CA を入れる。
+        kubectl（127.0.0.1 の転送）と ssh は中継を通らない。Go の道具（helm）は macOS で SSL_CERT_FILE を読まないので、
+        helm には --ca-file を足す（core.helm）。"""
+        proxy = self.egress_proxy_mac
+        if not proxy:
+            return
+        ca = self.egress_ca_file
+        if ca is None or not ca.exists():
+            raise LabError("LAB_EGRESS_PROXY_MAC には LAB_EGRESS_CA_FILE（中継の CA の PEM）が要ります")
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            os.environ[name] = proxy
+        os.environ["NO_PROXY"] = os.environ["no_proxy"] = "127.0.0.1,localhost"
+        for name in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "AWS_CA_BUNDLE", "CURL_CA_BUNDLE",
+                     "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "NODE_EXTRA_CA_CERTS"):
+            os.environ[name] = str(ca)
+        HELM_EXTRA[:] = ["--ca-file", str(ca)]
+
     @property
     def litellm_version(self) -> str:
         return self.get("LAB_LITELLM_VERSION", DEFAULT_LITELLM_VERSION)
@@ -460,8 +538,13 @@ def kn(*args: str) -> list[str]:
     return ["kubectl", "--context", KUBE_CONTEXT, "-n", NS, *args]
 
 
+HELM_EXTRA: list[str] = []   # Mac が出口プロキシの中にあるときの --ca-file（Env.apply_mac_proxy が入れる）
+
+
 def helm(*args: str) -> list[str]:
-    return ["helm", "--kube-context", KUBE_CONTEXT, *args]
+    # --ca-file はチャートを取りに行くサブコマンドだけが受ける（get values などに付けると失敗する）
+    extra = HELM_EXTRA if args and args[0] in ("upgrade", "install", "pull", "show", "repo") else []
+    return ["helm", "--kube-context", KUBE_CONTEXT, *args, *extra]
 
 
 def kapply(*, files: list[Path] | None = None, manifest: str | None = None, namespaced: bool = True) -> bool:

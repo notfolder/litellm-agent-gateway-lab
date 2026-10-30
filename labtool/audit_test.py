@@ -50,11 +50,12 @@ def call(method: str, url: str, headers: dict, body=None, timeout: float = 60) -
 
 # 実際のバケット名（aws では接頭辞が付く）。audit_test() の最初に Env から決める
 BUCKETS = {"raw": render.AUDIT_RAW, "access": render.AUDIT_ACCESS, "derived": render.AUDIT_DERIVED}
+PREFIXES = {"raw": "", "access": "", "derived": ""}   # VM の環境は 1 バケットのディレクトリ（store_location）
 
 
 def set_buckets(env: Env) -> None:
     for k, logical in (("raw", render.AUDIT_RAW), ("access", render.AUDIT_ACCESS), ("derived", render.AUDIT_DERIVED)):
-        BUCKETS[k] = render.bucket_name(env, logical)
+        BUCKETS[k], PREFIXES[k] = render.store_location(env, logical)
 
 
 def raw_records(s3, since: str) -> list[dict]:
@@ -62,7 +63,7 @@ def raw_records(s3, since: str) -> list[dict]:
     rows: list[dict] = []
     token = None
     while True:
-        kw = {"Bucket": BUCKETS["raw"], "Prefix": "raw/meta/"}
+        kw = {"Bucket": BUCKETS["raw"], "Prefix": PREFIXES["raw"] + "raw/meta/"}
         if token:
             kw["ContinuationToken"] = token
         res = s3.list_objects_v2(**kw)
@@ -94,11 +95,15 @@ def run_audit_job(env: Env, name: str, args: list[str], secret: str, memory: str
                 "env": [{"name": "AUDIT_S3_ENDPOINT", "value": s3cfg["S3_ENDPOINT"]},
                         {"name": "AUDIT_S3_REGION", "value": s3cfg["S3_REGION"]},
                         {"name": "AUDIT_S3_BUCKET_PREFIX", "value": s3cfg["S3_BUCKET_PREFIX"]},
+                        {"name": "AUDIT_S3_BUCKET", "value": s3cfg["S3_BUCKET"]},
+                        {"name": "AUDIT_ACCESS_RETENTION_DAYS", "value": s3cfg["ACCESS_RETENTION_DAYS"]},
+                        {"name": "AUDIT_RETENTION_MODE", "value": s3cfg["RETENTION_MODE"]},
                         {"name": "AWS_REQUEST_CHECKSUM_CALCULATION", "value": "when_required"},
                         {"name": "AWS_RESPONSE_CHECKSUM_VALIDATION", "value": "when_required"}],
                 "envFrom": [{"secretRef": {"name": secret}}],
                 "resources": {"requests": {"memory": "256Mi"}, "limits": {"memory": memory}},
             }]}}}}
+    manifest = render.add_egress([manifest], env)[0]
     run(kn("apply", "-f", "-"), input=json.dumps(manifest), quiet=True)
 
     def finished() -> bool:
@@ -273,8 +278,8 @@ def audit_test(env: Env) -> None:
                     return e.response.get("Error", {}).get("Code") in codes
                 return False
 
-            key0 = by_id[ids["chat"]]["body"]["key"]
-            raw_bucket = render.bucket_name(env, render.AUDIT_RAW)
+            key0 = PREFIXES["raw"] + by_id[ids["chat"]]["body"]["key"]   # 記録の鍵は論理の鍵。実際の鍵はディレクトリ付き
+            raw_bucket = BUCKETS["raw"]
             ver = objstore.object_version(s3, raw_bucket, key0)
             if env.is_aws:
                 # EKS 版の利用者は IAM ロール（Pod Identity）で、Mac からは借りられない。ロールごとの検査はクラスタの中で
@@ -287,7 +292,7 @@ def audit_test(env: Env) -> None:
                             lambda: denied(writer, raw_bucket, key0, ver) and denied(viewer, raw_bucket, key0, ver))
             # S3 と RustFS はオブジェクトロックの拒否を AccessDenied で、GCS は保持ポリシーの拒否を RetentionPolicyNotMet で返す
             c.check("原本は、管理者でも保持の回避を指定しなければ消せない",
-                    lambda: denied(s3, raw_bucket, key0, ver, codes=("AccessDenied", "RetentionPolicyNotMet")))
+                    lambda: denied(s3, raw_bucket, key0, ver, codes=objstore.LOCK_DENIED_CODES))
 
             # 整形と検索アプリ
             compact_now(env)
@@ -330,11 +335,11 @@ def audit_test(env: Env) -> None:
             st5, _, views = call("GET", f"{base}/lab-audit/api/views?start={today}&end={today}", admin_sess)
             c.check("本文を開くと閲覧の記録が増える（監査担当・管理者が見られる）", lambda: st5 == 200 and any(
                 v.get("call_id") == ids["chat"] and v.get("viewer_email") == TEST_USER for v in views["rows"]))
-            vkeys = [o["Key"] for o in s3.list_objects_v2(Bucket=BUCKETS["access"], Prefix="view/").get(
+            vkeys = [o["Key"] for o in s3.list_objects_v2(Bucket=BUCKETS["access"], Prefix=PREFIXES["access"] + "view/").get(
                 "Contents", [])]
             c.check("閲覧の記録も消せない", lambda: vkeys and denied(
                 s3, BUCKETS["access"], vkeys[-1], objstore.object_version(s3, BUCKETS["access"], vkeys[-1]),
-                codes=("AccessDenied", "RetentionPolicyNotMet")))
+                codes=objstore.LOCK_DENIED_CODES))
 
             # 精算（円の請求の単位、利用者なし、審査の分の付け方）
             month = datetime.now(JST).strftime("%Y-%m")
@@ -442,7 +447,7 @@ def audit_test(env: Env) -> None:
 
 def objstore_read_body(s3, body: dict) -> dict:
     start, length = int(body["offset"]), int(body["length"])
-    data = s3.get_object(Bucket=BUCKETS["raw"], Key=body["key"],
+    data = s3.get_object(Bucket=BUCKETS["raw"], Key=PREFIXES["raw"] + body["key"],
                          Range=f"bytes={start}-{start + length - 1}")["Body"].read()
     return json.loads(gzip.decompress(data))
 

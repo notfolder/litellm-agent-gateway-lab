@@ -12,10 +12,66 @@ from decimal import ROUND_DOWN, Decimal
 from urllib.parse import urlparse
 
 JST = timezone(timedelta(hours=9))
-# バケット名。AWS では全世界で一意にするため、接頭辞（AUDIT_S3_BUCKET_PREFIX。例 "litellm-lab-123456789012-"）を付ける。
-# Mac の RustFS では空（変更仕様書 2026-10-24-AWS構成 3.3 節）
-_BUCKET_PREFIX = os.environ.get("AUDIT_S3_BUCKET_PREFIX", "")
-RAW, ACCESS, DERIVED = (_BUCKET_PREFIX + "audit-raw", _BUCKET_PREFIX + "audit-access", _BUCKET_PREFIX + "audit-derived")
+
+
+# ---- 置き場（バケットと鍵の接頭辞） ----
+class Store:
+    """論理名（audit-raw など）の置き場。Mac の RustFS は論理名のバケット、EKS 版は接頭辞付きのバケット
+    （AUDIT_S3_BUCKET_PREFIX。例 "litellm-lab-123456789012-"）、VM の環境は 1 つのバケット（AUDIT_S3_BUCKET）の
+    ディレクトリ <論理名>/（変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 4.1 節）。
+    呼ぶ側は論理の鍵（raw/meta/… など）だけを扱い、接頭辞の付け外しはここで行う。"""
+
+    def __init__(self, logical: str, bucket: str, prefix: str) -> None:
+        self.logical, self.bucket, self.prefix = logical, bucket, prefix
+
+    def key(self, key: str) -> str:
+        return self.prefix + key
+
+    def strip(self, key: str) -> str:
+        return key[len(self.prefix):] if self.prefix and key.startswith(self.prefix) else key
+
+    def ref(self, key: str) -> dict:
+        return {"Bucket": self.bucket, "Key": self.key(key)}
+
+    def url(self, key: str) -> str:
+        return f"s3://{self.bucket}/{self.key(key)}"
+
+    def __str__(self) -> str:
+        return self.bucket if not self.prefix else f"{self.bucket}/{self.prefix.rstrip('/')}"
+
+
+def _store(logical: str) -> Store:
+    single = os.environ.get("AUDIT_S3_BUCKET", "")
+    if single:
+        return Store(logical, single, logical + "/")
+    return Store(logical, os.environ.get("AUDIT_S3_BUCKET_PREFIX", "") + logical, "")
+
+
+RAW, ACCESS, DERIVED = _store("audit-raw"), _store("audit-access"), _store("audit-derived")
+
+
+def retention_args(days_env: str) -> dict:
+    """閲覧記録などを書くときの保持（オブジェクト単位。VM の環境だけ。AUDIT_<種類>_RETENTION_DAYS が空なら付けない）。"""
+    days = os.environ.get(days_env, "").strip()
+    if not days:
+        return {}
+    until = datetime.now(timezone.utc) + timedelta(days=int(days))
+    return {"ObjectLockMode": os.environ.get("AUDIT_RETENTION_MODE", "GOVERNANCE") or "GOVERNANCE",
+            "ObjectLockRetainUntilDate": until}
+
+
+def gcs_object_lock_headers(client, endpoint: str) -> None:
+    """GCS の XML API は保持を x-goog-object-lock-* のヘッダーで受ける。boto3 が付ける x-amz-object-lock-* を写す。"""
+    if "googleapis.com" not in (endpoint or ""):
+        return
+
+    def convert(params, **_):
+        headers = params.get("headers", {})
+        for name in ("mode", "retain-until-date"):
+            v = headers.pop(f"x-amz-object-lock-{name}", None)
+            if v is not None:
+                headers[f"x-goog-object-lock-{name}"] = v
+    client.meta.events.register("before-call.s3.PutObject", convert, unique_id="lab-gcs-object-lock")
 
 
 # ---- 設定 ----
@@ -51,7 +107,9 @@ class Config:
             kwargs["config"] = BotoConfig(s3={"addressing_style": "path"}, retries={"max_attempts": 3})
         if self.static_keys:
             kwargs.update(aws_access_key_id=self.access_key, aws_secret_access_key=self.secret_key)
-        return boto3.client("s3", **kwargs)
+        client = boto3.client("s3", **kwargs)
+        gcs_object_lock_headers(client, self.endpoint)
+        return client
 
     def duckdb_secret_sql(self) -> str:
         """DuckDB の S3 の接続（接続先などは設定から組み立てる。変更設計書 6.1 節）。
@@ -79,6 +137,14 @@ def duckdb_connect(cfg: Config, memory_limit: str | None = None):
     con.execute(f"SET memory_limit='{memory_limit or os.environ.get('AUDIT_DUCKDB_MEMORY', '256MB')}'")
     con.execute(f"SET threads={int(os.environ.get('AUDIT_DUCKDB_THREADS', '2'))}")
     con.execute("SET preserve_insertion_order=false")
+    # 出口プロキシ（Zscaler 相当）の中: DuckDB の httpfs は環境変数を読まないので、中継と CA を設定で渡す
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+    if proxy:
+        u = urlparse(proxy)
+        con.execute(f"SET http_proxy='{u.hostname}:{u.port or 80}'")
+    ca = os.environ.get("SSL_CERT_FILE", "")
+    if ca:
+        con.execute(f"SET ca_cert_file='{ca}'")
     con.execute(cfg.duckdb_secret_sql())
     return con
 
@@ -123,22 +189,23 @@ def month_days(month: str) -> list[date]:
 
 
 # ---- S3 の読み書き ----
-def list_keys(s3, bucket: str, prefix: str) -> list[dict]:
+def list_keys(s3, store: Store, prefix: str) -> list[dict]:
+    """置き場の接頭辞の下の一覧。返す Key は論理の鍵（置き場の接頭辞を外したもの）。"""
     out: list[dict] = []
     token = None
     while True:
-        kw = {"Bucket": bucket, "Prefix": prefix}
+        kw = {"Bucket": store.bucket, "Prefix": store.key(prefix)}
         if token:
             kw["ContinuationToken"] = token
         res = s3.list_objects_v2(**kw)
-        out += res.get("Contents", [])
+        out += [{**o, "Key": store.strip(o["Key"])} for o in res.get("Contents", [])]
         if not res.get("IsTruncated"):
             return out
         token = res.get("NextContinuationToken")
 
 
-def read_ndjson_gz(s3, bucket: str, key: str) -> list[dict]:
-    data = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+def read_ndjson_gz(s3, store: Store, key: str) -> list[dict]:
+    data = s3.get_object(**store.ref(key))["Body"].read()
     return [json.loads(line) for line in gzip.decompress(data).decode().splitlines() if line.strip()]
 
 
@@ -156,26 +223,26 @@ def read_raw_hour(s3, dt: str, hour: str) -> list[dict]:
 def read_body(s3, body: dict) -> dict:
     """記録の body（{key, offset, length}）から、本文 1 件だけを範囲指定で読む。"""
     start, length = int(body["offset"]), int(body["length"])
-    data = s3.get_object(Bucket=RAW, Key=body["key"], Range=f"bytes={start}-{start + length - 1}")["Body"].read()
+    data = s3.get_object(**RAW.ref(body["key"]), Range=f"bytes={start}-{start + length - 1}")["Body"].read()
     return json.loads(gzip.decompress(data))
 
 
-def latest_json(s3, bucket: str, prefix: str) -> tuple[str | None, dict | None]:
+def latest_json(s3, store: Store, prefix: str) -> tuple[str | None, dict | None]:
     """接頭辞の下で名前が最も新しいファイル（名前は時刻で始まる）。版の名前と中身を返す。"""
-    keys = sorted(o["Key"] for o in list_keys(s3, bucket, prefix))
+    keys = sorted(o["Key"] for o in list_keys(s3, store, prefix))
     if not keys:
         return None, None
-    return keys[-1], json.loads(s3.get_object(Bucket=bucket, Key=keys[-1])["Body"].read())
+    return keys[-1], json.loads(s3.get_object(**store.ref(keys[-1]))["Body"].read())
 
 
-def put_json(s3, bucket: str, key: str, obj) -> None:
-    s3.put_object(Bucket=bucket, Key=key, Body=json.dumps(obj, ensure_ascii=False, indent=2).encode(),
+def put_json(s3, store: Store, key: str, obj) -> None:
+    s3.put_object(**store.ref(key), Body=json.dumps(obj, ensure_ascii=False, indent=2).encode(),
                   ContentType="application/json")
 
 
-def put_ndjson_gz(s3, bucket: str, key: str, rows: list[dict]) -> None:
+def put_ndjson_gz(s3, store: Store, key: str, rows: list[dict]) -> None:
     body = "".join(json.dumps(r, ensure_ascii=False, default=str) + "\n" for r in rows).encode()
-    s3.put_object(Bucket=bucket, Key=key, Body=gzip.compress(body, mtime=0))
+    s3.put_object(**store.ref(key), Body=gzip.compress(body, mtime=0))
 
 
 # ---- 請求の単位 ----

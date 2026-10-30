@@ -41,6 +41,12 @@ spec:
                   value: when_required
                 - name: AUDIT_S3_BUCKET_PREFIX
                   value: "${S3_BUCKET_PREFIX}"
+                - name: AUDIT_S3_BUCKET
+                  value: "${S3_BUCKET}"
+                - name: AUDIT_ACCESS_RETENTION_DAYS
+                  value: "${ACCESS_RETENTION_DAYS}"
+                - name: AUDIT_RETENTION_MODE
+                  value: "${RETENTION_MODE}"
                 # S3 の静的キー（Mac の RustFS）。AWS では無いので optional
                 - name: AUDIT_S3_ACCESS_KEY
                   valueFrom:

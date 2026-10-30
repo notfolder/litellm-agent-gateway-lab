@@ -12,7 +12,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 
-from .common import JST, Config, list_keys, now_jst
+from .common import DERIVED, JST, Config, list_keys, now_jst
 from .data import Store
 
 TARGETS = {"usage_month_all": 3.0, "history_user_day": 3.0, "history_user_90d": 30.0, "body": 1.0}
@@ -33,7 +33,7 @@ def main(argv: list[str]) -> int:
     cfg.data_prefix = args.prefix
     store = Store(cfg, pod="bench")
     days = sorted({o["Key"].split("/")[-2].removeprefix("dt=")
-                   for o in list_keys(store.s3, "audit-derived", f"{args.prefix}usage_daily/")})
+                   for o in list_keys(store.s3, DERIVED, f"{args.prefix}usage_daily/")})
     results: dict = {"prefix": args.prefix, "days_with_data": len(days)}
     if days:
         last = datetime.fromisoformat(days[-1]).date()
