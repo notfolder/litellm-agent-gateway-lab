@@ -711,17 +711,8 @@ def audit(env: Env) -> None:
     step("audit 監査ログの整形と検索アプリ")
     image = load_audit_image()
     ref = f"{image['repository']}:{image['tag']}"
-    if env.is_aws:
-        # AWS の S3（接続先は空で既定のエンドポイント、接頭辞付きの名前）。資格情報は Pod Identity
-        common = {"IMAGE": ref, "S3_ENDPOINT": "", "S3_REGION": env.aws_region,
-                  "S3_BUCKET_PREFIX": env.get("LAB_AWS_BUCKET_PREFIX")}
-    elif env.is_vm:
-        # クラウドのバケット（接続先はクラウド固有層の s3_endpoint、接頭辞付きの名前）。資格情報は静的キー
-        common = {"IMAGE": ref, "S3_ENDPOINT": render.vm_s3_endpoint(env), "S3_REGION": env.vm_region,
-                  "S3_BUCKET_PREFIX": env.get("LAB_BUCKET_PREFIX")}
-    else:
-        common = {"IMAGE": ref, "S3_ENDPOINT": env.get("LAB_S3_ENDPOINT", render.DEFAULT_S3_ENDPOINT),
-                  "S3_REGION": env.get("LAB_S3_REGION", "us-east-1"), "S3_BUCKET_PREFIX": ""}
+    # 接続先・リージョン・接頭辞は環境ごと（Mac は RustFS、EKS は AWS S3 と Pod Identity、VM はクラウドのバケットと静的キー）
+    common = {"IMAGE": ref, **render.audit_s3_settings(env)}
     kapply(manifest=render_template(K8S / "audit-compactor.yaml", common))
     derived = render.bucket_name(env, render.AUDIT_DERIVED)
     with objstore.admin_s3(env) as s3:

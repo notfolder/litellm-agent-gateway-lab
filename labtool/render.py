@@ -660,6 +660,17 @@ def vm_judge_model(env: Env) -> str:
     return env.get("LAB_VM_JUDGE_MODEL") or DEFAULT_VM_JUDGE_MODEL
 
 
+def audit_s3_settings(env: Env) -> dict[str, str]:
+    """監査の Pod（整形の CronJob、検索アプリ、試験の Job）に渡す S3 互換の設定（接続先、リージョン、バケット名の接頭辞）。
+    Mac は RustFS、EKS 版は AWS S3（Pod Identity）、VM の環境はクラウドのバケット（静的キー）。"""
+    if env.is_aws:
+        return {"S3_ENDPOINT": "", "S3_REGION": env.aws_region, "S3_BUCKET_PREFIX": env.get("LAB_AWS_BUCKET_PREFIX", "")}
+    if env.is_vm:
+        return {"S3_ENDPOINT": vm_s3_endpoint(env), "S3_REGION": env.vm_region, "S3_BUCKET_PREFIX": env.get("LAB_BUCKET_PREFIX", "")}
+    return {"S3_ENDPOINT": env.get("LAB_S3_ENDPOINT", DEFAULT_S3_ENDPOINT), "S3_REGION": env.get("LAB_S3_REGION", "us-east-1"),
+            "S3_BUCKET_PREFIX": ""}
+
+
 def vm_s3_endpoint(env: Env) -> str:
     """クラスタの中の S3 互換の設定に渡す接続先（AWS は空＝既定、GCP は storage.googleapis.com）。"""
     from . import clouds

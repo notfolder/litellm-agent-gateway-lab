@@ -81,6 +81,7 @@ def run_audit_job(env: Env, name: str, args: list[str], secret: str, memory: str
     """監査のイメージで 1 回限りの Job を流し、ログを返す（整形、合成データ、速さの試験）。"""
     from .stages import load_audit_image
     image = load_audit_image()
+    s3cfg = render.audit_s3_settings(env)
     job = f"{name}-{time.strftime('%H%M%S')}"
     manifest = {
         "apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": job, "namespace": "litellm-lab",
@@ -89,8 +90,12 @@ def run_audit_job(env: Env, name: str, args: list[str], secret: str, memory: str
             "restartPolicy": "Never",
             "containers": [{
                 "name": "job", "image": f"{image['repository']}:{image['tag']}", "command": args,
-                "env": [{"name": "AUDIT_S3_ENDPOINT", "value": env.get("LAB_S3_ENDPOINT", render.DEFAULT_S3_ENDPOINT)},
-                        {"name": "AUDIT_S3_REGION", "value": env.get("LAB_S3_REGION", "us-east-1")}],
+                # 接続先などは整形の CronJob と同じ値（VM の環境ではクラウドのバケット。2026-10-30 に Mac の値を使っていたのを直した）
+                "env": [{"name": "AUDIT_S3_ENDPOINT", "value": s3cfg["S3_ENDPOINT"]},
+                        {"name": "AUDIT_S3_REGION", "value": s3cfg["S3_REGION"]},
+                        {"name": "AUDIT_S3_BUCKET_PREFIX", "value": s3cfg["S3_BUCKET_PREFIX"]},
+                        {"name": "AWS_REQUEST_CHECKSUM_CALCULATION", "value": "when_required"},
+                        {"name": "AWS_RESPONSE_CHECKSUM_VALIDATION", "value": "when_required"}],
                 "envFrom": [{"secretRef": {"name": secret}}],
                 "resources": {"requests": {"memory": "256Mi"}, "limits": {"memory": memory}},
             }]}}}}
@@ -258,11 +263,11 @@ def audit_test(env: Env) -> None:
             # 改ざんの防止（原本と閲覧の記録）
             from botocore.exceptions import ClientError
 
-            def denied(client, bucket, k, version=None) -> bool:
+            def denied(client, bucket, k, version=None, codes=("AccessDenied",)) -> bool:
                 try:
                     client.delete_object(Bucket=bucket, Key=k, **({"VersionId": version} if version else {}))
                 except ClientError as e:
-                    return e.response.get("Error", {}).get("Code") == "AccessDenied"
+                    return e.response.get("Error", {}).get("Code") in codes
                 return False
 
             key0 = by_id[ids["chat"]]["body"]["key"]
@@ -277,8 +282,9 @@ def audit_test(env: Env) -> None:
                 with objstore.user_s3(env, "litellm-writer") as writer, objstore.user_s3(env, "audit-viewer") as viewer:
                     c.check("原本は、書き込み用・検索アプリの資格情報では消せない",
                             lambda: denied(writer, raw_bucket, key0, ver) and denied(viewer, raw_bucket, key0, ver))
+            # S3 と RustFS はオブジェクトロックの拒否を AccessDenied で、GCS は保持ポリシーの拒否を RetentionPolicyNotMet で返す
             c.check("原本は、管理者でも保持の回避を指定しなければ消せない",
-                    lambda: denied(s3, raw_bucket, key0, ver))
+                    lambda: denied(s3, raw_bucket, key0, ver, codes=("AccessDenied", "RetentionPolicyNotMet")))
 
             # 整形と検索アプリ
             compact_now(env)
