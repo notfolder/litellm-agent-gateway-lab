@@ -385,7 +385,10 @@ def _set_bucket_iam(env: Env, bucket_name: str, entries: list[dict]) -> None:
     bucket = client.bucket(bucket_name)
     policy = bucket.get_iam_policy(requested_policy_version=3)
     policy.version = 3
-    keep = [b for b in policy.bindings if not any(m.startswith(f"serviceAccount:{env.vm_prefix}-") for m in b["members"])]
+    # 自分が管理する利用者（静的キーの 5 つ ＋ 操作者）のバインディングだけ作り直す。VM のサービスアカウント（<prefix>-node）の
+    # バインディングは _ensure_node_identity が持つので残す（落とすと VM の段階が付け直し、毎回「更新」になる。2026-10-30）
+    managed = {f"serviceAccount:{_sa_email(env, f'{env.vm_prefix}-{u}')}" for u in [*STATIC_KEY_USERS, OPERATOR_USER]}
+    keep = [b for b in policy.bindings if not (set(b["members"]) & managed)]
     # 同じロール・同じ条件の利用者は 1 つのバインディングにまとめる（GCS は保存時にまとめるので、分けたままだと毎回「違う」になる）
     merged: dict[str, dict] = {}
     for e in entries:
