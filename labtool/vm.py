@@ -50,7 +50,7 @@ IP_LOOKUPS = ["https://checkip.amazonaws.com", "https://api.ipify.org"]
 UNRETAINED_PREFIXES = [f"{s}/" for s in render.VM_STORES if s not in render.RETAINED_STORES]
 # .env に provision が書く項目（managed の down で消す）
 PROVISIONED_ENV_KEYS = ["LAB_VM_NODES", "LAB_VM_BUCKET", "LAB_VM_ENTRY_IP_ID", "LAB_VM_PROXY_NODE", "LAB_EGRESS_PROXY",
-                        "LAB_EGRESS_PROXY_MAC", "LAB_EGRESS_CA_FILE"]
+                        "LAB_EGRESS_PROXY_MAC", "LAB_EGRESS_CA_FILE", render.GCS_REGISTRY_KEY_ENV]
 
 
 def kube_context(env: Env) -> str:
@@ -197,6 +197,10 @@ def require_provided_env(env: Env) -> None:
             missing.append(f"{key}（{what}）")
     users = [*clouds.STATIC_KEY_USERS] + ([clouds.OPERATOR_USER] if env.is_gcp_vm else [])
     for user in users:
+        if user == "registry" and env.is_gcp_vm:
+            if not env.get(render.GCS_REGISTRY_KEY_ENV):
+                missing.append(f"{render.GCS_REGISTRY_KEY_ENV}（registry のサービスアカウントの JSON キーを base64 で。GCS ドライバ用）")
+            continue
         key_name, secret_name = render.s3_env_names(user, env)
         if not (env.get(key_name) and env.get(secret_name)):
             missing.append(f"{key_name} / {secret_name}（{user} の静的キー）")

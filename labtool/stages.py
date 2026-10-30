@@ -229,6 +229,9 @@ def _provision_vm(env: Env, pubkey: str) -> None:
     env.set("LAB_VM_BUCKET", result["bucket"])
     env.set("LAB_VM_ENTRY_IP_ID", result["entry_ip_id"])
     for user, (key, secret) in result["keys"].items():
+        if key == "json":   # GCP の registry はサービスアカウントの JSON キー（GCS ドライバ）
+            env.set(render.GCS_REGISTRY_KEY_ENV, secret)
+            continue
         key_name, secret_name = render.s3_env_names(user, env)
         env.set(key_name, key)
         env.set(secret_name, secret)
@@ -282,6 +285,15 @@ def _vm_registry(env: Env) -> None:
     （images の段階が push する前に要り、秘密は secrets の段階が揃え直す）。静的キーは .env の LAB_VM_S3_REGISTRY_*。"""
     env.fill("LAB_REGISTRY_HTTP_SECRET", gen_secret(16))
     kapply(manifest=secret_manifest(render.VM_REGISTRY_NAME, render.vm_registry_secret(env)))
+    if env.is_gcp_vm:
+        # GCS ドライバの JSON キー（Secret にファイルとして置く）と、置き場のディレクトリの印（ドライバは接頭辞が無いと作れない）
+        import base64
+        kapply(manifest=secret_manifest(render.VM_REGISTRY_GCS_SECRET,
+                                        {"key.json": base64.b64decode(env.get(render.GCS_REGISTRY_KEY_ENV)).decode()}))
+        with objstore.admin_s3(env) as s3:
+            marker = render.store_prefix(env, "images") + "registry/"
+            if not s3.list_objects_v2(Bucket=env.vm_bucket, Prefix=marker, MaxKeys=1).get("KeyCount"):
+                s3.put_object(Bucket=env.vm_bucket, Key=marker, Body=b"")
     kapply(manifest=render.vm_registry_manifest(env, env.vm_bucket, clouds.REGISTRY_NODEPORT))
     rollout(f"deploy/{render.VM_REGISTRY_NAME}", 300, "イメージ置き場（registry）の起動")
 

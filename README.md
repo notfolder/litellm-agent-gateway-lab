@@ -9,7 +9,7 @@ LiteLLM を AI エージェント向けゲートウェイとして使うため�
 - **スケール検証**: Mac 1 台の Kubernetes（OrbStack + k3d）で、複数レプリカ構成の LiteLLM を検証する
 - **冗長化と監査ログ**: PostgreSQL（CloudNativePG、3 台）と Valkey（Sentinel）をマネージドサービスを使わずに冗長化し、LLM への入出力を改ざんできない形で 90 日残す。利用者ごとの利用料（概算と按分）と入出力の履歴を検索するアプリ（`/lab-audit/`）付き
 
-全体の構成図は [docs/aws_architecture.md](docs/aws_architecture.md)（Mac と EKS）と [docs/ec2_architecture.md](docs/ec2_architecture.md)（EC2 3 台。GCP 版を足した形への書き直しは配備と試験の後）、仕様は [docs/spec.md](docs/spec.md)、詳細設計は [docs/design.md](docs/design.md) を参照してください。各エージェントが自分の中に持つ LLM 審査（Claude Code の auto mode、Codex の Auto-review、Copilot Studio のリアルタイム保護）と設定方法の調査は [docs/agent-builtin-review.md](docs/agent-builtin-review.md) にあります。変更ごとの経緯（変更仕様書と変更設計書）は `.history/<日付>-<目的>/` にあります。
+全体の構成図は [docs/aws_architecture.md](docs/aws_architecture.md)（Mac と EKS）と [docs/vm_architecture.md](docs/vm_architecture.md)（VM 3 台とバケット 1 つ。AWS と GCP）、仕様は [docs/spec.md](docs/spec.md)、詳細設計は [docs/design.md](docs/design.md) を参照してください。各エージェントが自分の中に持つ LLM 審査（Claude Code の auto mode、Codex の Auto-review、Copilot Studio のリアルタイム保護）と設定方法の調査は [docs/agent-builtin-review.md](docs/agent-builtin-review.md) にあります。変更ごとの経緯（変更仕様書と変更設計書）は `.history/<日付>-<目的>/` にあります。
 
 ## 構築
 
@@ -46,16 +46,23 @@ aws configure sso              # プロファイルを作り、aws sso login --p
 
 ## VM 3 台とオブジェクトストレージだけで動かす（`LAB_TARGET=aws-ec2` / `gcp-vm`）
 
-マネージドサービスを使わず、クラウドの部品を計算資源とオブジェクトストレージに限って同じ構成を動かす環境です。AWS は EC2 3 台（別 AZ）と S3、GCP は Compute Engine 3 台（別ゾーン）と Cloud Storage。どちらも Ubuntu 24.04 LTS arm64 の k3s（server 3 台）で、Kubernetes の中は Mac の k3d と同じ（CloudNativePG 3 台、Valkey と Sentinel、Traefik）、RustFS だけがクラウドのバケットに替わります。クラウドの違いは `labtool/clouds/`（計算資源、ネットワーク、浮動 IP、バケットと静的キー、削除）に閉じ、VM の中と Kubernetes の中は 1 つのコードです。1 台が落ちても処理が続き、`./lab down` で有料のものがすべて消えます（経緯は `.history/2026-10-25-EC2三台構成/` と `.history/2026-10-30-VM環境の共通化とGCP追加/`。実装済み、配備はまだ）。
+マネージドサービスを使わず、クラウドの部品を計算資源とオブジェクトストレージに限って同じ構成を動かす環境です。AWS は EC2 3 台（別 AZ）と S3 のバケット 1 つ、GCP は Compute Engine 3 台（別ゾーン）と Cloud Storage のバケット 1 つ。どちらも Ubuntu 24.04 LTS の k3s（server 3 台）で、Kubernetes の中は Mac の k3d と同じ（CloudNativePG 3 台、Valkey と Sentinel、Traefik）、RustFS だけがクラウドのバケットのディレクトリ（`audit-raw/` など）に替わり、原本と閲覧記録にはオブジェクト単位の保持を付けます。クラウドの違いは `labtool/clouds/` に閉じ、VM の中（SSH で初期化）と Kubernetes の中は 1 つのコードです。1 台が落ちても処理が続きます。構成図は [docs/vm_architecture.md](docs/vm_architecture.md)、仕様は docs/spec.md 12 章、設計は docs/design.md 21 章（経緯は `.history/2026-10-25-EC2三台構成/`、`.history/2026-10-30-VM環境の共通化とGCP追加/`、`.history/2026-10-30-既存資源からの構築と出口プロキシ/`。GCP で配備と試験済み、AWS は EC2 の vCPU 上限の解除待ち）。
+
+基盤の持ち方は 2 つあります（`.env` の `LAB_INFRA`）。
+
+- `managed`（既定、検証用）: `./lab up` がクラウドの API でネットワーク・浮動 IP・バケット・静的キー・VM 3 台を作り、識別子を `.env` に書いてから組み立てます。`./lab down` で有料のものがすべて消えます
+- `provided`（本番用）: 既存の VM 3 台とバケット 1 つを使います。用意する側（VM、ネットワーク、浮動 IP と VM の権限、バケット、役割ごとの静的キー。前提は docs/spec.md 12.2）から受け取った識別子と静的キーを `.env` に書き、`./lab up` はその上に組み立てるだけで、ネットワークやバケットの設定は変えません。`./lab down` は k3s を外して保持の無いディレクトリを空にし、`./lab down --all` で VM・浮動 IP・バケットまで消します
 
 ```bash
 brew install kubectl-cnpg awscli            # GCP は brew install --cask google-cloud-sdk、gcloud auth application-default login
 # .env: LAB_TARGET=aws-ec2 か gcp-vm、LAB_HOSTNAME、LAB_CLOUDFLARE_API_TOKEN（Zone / DNS / Edit）、LAB_ACME_EMAIL、
-#       LAB_JUDGE_ANTHROPIC_API_KEY（審査官）。AWS は LAB_AWS_PROFILE、GCP は LAB_GCP_PROJECT
-./lab up   # 基盤（API を直接呼ぶ: ネットワーク → 浮動 IP → バケットと静的キー → VM 3 台）→ k3s → イメージを中の registry へ → LiteLLM → Let's Encrypt
+#       LAB_JUDGE_ANTHROPIC_API_KEY（審査官）。AWS は LAB_AWS_PROFILE、GCP は LAB_GCP_PROJECT。provided は LAB_VM_* の識別子と静的キー
+./lab up   # managed: 基盤を作る → .env に書く → SSH で k3s を起こす → イメージを VM でビルドして中の registry へ → LiteLLM → Let's Encrypt
 ```
 
-A レコード（ホスト名 → 浮動 IP）は `./lab litellm` が Cloudflare の API で作ります（DNS のみ）。人が行うのはクラウドのサインインと `.env` の秘密だけです。入口は keepalived が浮動 IP を 3 台の間で移し、HTTPS は cert-manager が Let's Encrypt（DNS-01）で取ります。構築ツールは SSH で VM に届き、22 と 80/443 は `./lab` を流すたびに操作者の今の IP だけに開け直します（6443 は開けず、SSH のポート転送で届く）。Claude Code のモデルは Mac と同じ Claude Max のトークンの転送、2 つの審査官は Anthropic の API キーの Claude Haiku 4.5 です（Bedrock / Vertex AI は使わない）。障害の試験は Mac と同じ場面に `--scenario entry-node`（入口の台を止める）が加わります。Kubernetes（k3s）の版は `./lab upgrade-k8s <版>` が 1 台ずつ上げます（Pod を他の台へ追い出してから k3s を再起動。浮動 IP の台は最後。`./lab up` では版を変えません。経緯は `.history/2026-10-26-k3s版上げ/`）。
+本番の VM は Zscaler（外向きの通信を独自 CA で中継する装置）の中にある前提です。`.env` の `LAB_EGRESS_PROXY`（中継の URL）と `LAB_EGRESS_CA_FILE`（CA）を書くと、VM・k3s・外へ出る全 Pod がその中継を通り CA を信頼します。`LAB_EGRESS_PROXY_MAC` で `./lab` 自身も中継を通せます。検証では `LAB_EGRESS_PROXY_VM=true` で 4 台目の VM に中継（mitmproxy）を作り、3 台の直接の外向きを遮断した状態で全試験を通しました（`./lab proxy-log` で中継の記録を宛先ごとに数えられます）。
+
+自作イメージ 2 つ（LiteLLM、監査アプリ）は Mac ではなく k3s の台の Docker でビルドします（アーキテクチャは VM のもの。Mac に Docker は要りません）。A レコード（ホスト名 → 浮動 IP）は `./lab litellm` が Cloudflare の API で作ります。入口は keepalived が浮動 IP を 3 台の間で移し、HTTPS は cert-manager が Let's Encrypt（DNS-01）で取ります。構築ツールは SSH で VM に届き、managed では 22 と 80/443 を `./lab` を流すたびに操作者の今の IP だけに開け直します（6443 は開けず、SSH のポート転送で届く）。Claude Code のモデルは Mac と同じ Claude Max のトークンの転送、2 つの審査官は Anthropic の API キーの Claude Haiku 4.5 です。障害の試験は Mac と同じ場面に `--scenario entry-node`（入口の台を止める）が加わります。Kubernetes（k3s）の版は `./lab upgrade-k8s <版>` が 1 台ずつ上げます（経緯は `.history/2026-10-26-k3s版上げ/`）。
 
 ## よく使うコマンド
 
@@ -69,6 +76,7 @@ A レコード（ホスト名 → 浮動 IP）は `./lab litellm` が Cloudflare
 | `./lab test-unit` / `test-smoke` / `test-idempotency` / `test-load` | 試験 |
 | `./lab test-judge [--context \| --isolated]` | 審査官の事例試験（本物の審査官を呼ぶので ChatGPT の利用枠を使う。指定なしは両方の審査） |
 | `./lab test-failover [--pooler direct]` / `test-restore` | DB と Redis の障害の試験（EKS 版は `--scenario litellm-drain` / `aurora-failover` / `valkey-failover`、VM 3 台は Mac の場面 ＋ `entry-node`） / バックアップから任意の時点に戻す試験 |
+| `./lab down [--all]` / `./lab proxy-log` | VM 3 台: `down` は managed なら全部消し、provided なら k3s を外す（`--all` で VM・浮動 IP・バケットも） / 中継（出口プロキシ）の記録の集計 |
 | `./lab test-audit` | 監査ログの試験（記録、整形、検索アプリ、精算、改ざんの防止、退避と再送） |
 | `./lab audit-synth` / `audit-bench` / `audit-compact` | 検索の速さの試験用の合成データ / 速さの試験 / 監査ログの整形を手で流す |
 | `./lab review-log` | 審査の判定ログの集計 |

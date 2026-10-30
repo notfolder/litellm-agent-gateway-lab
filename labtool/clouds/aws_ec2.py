@@ -222,7 +222,12 @@ def allow_ssh_from(env: Env, cidr: str) -> None:
 
 def allow_web_from(env: Env, cidr: str) -> None:
     """80/443 の送信元を操作者の IP だけにする（ユーザーの判断 2026-10-30: A）。Mac が中継を通すときは VPC の中からも。"""
-    cidrs = [cidr] + ([network_plan(env.vm_cidr, subnets_per_node=True)["vpc"]] if env.egress_proxy_vm else [])
+    cidrs = [cidr]
+    if env.egress_proxy_vm:
+        cidrs.append(network_plan(env.vm_cidr, subnets_per_node=True)["vpc"])
+        for inst in _instances(env, role="proxy"):
+            if inst.get("PublicIpAddress"):
+                cidrs.append(f"{inst['PublicIpAddress']}/32")
     _allow_ports(env, _names(env)["sg"], [80, 443], cidrs, "80/443")
 
 

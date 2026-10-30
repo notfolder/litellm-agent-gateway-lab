@@ -921,19 +921,32 @@ def vm_registry_manifest(env: Env, bucket: str, node_port: int) -> str:
     2 Pod を別々の台に置き、NodePort で各ノードが自分の IP から引く（containerd のミラー設定は vm/node-init.sh）。
     Mac からは ./lab images が kubectl port-forward で push する。"""
     labels = {"app": VM_REGISTRY_NAME}
-    env_vars = [
-        {"name": "REGISTRY_STORAGE", "value": "s3"},
-        {"name": "REGISTRY_STORAGE_S3_REGION", "value": env.vm_region},
-        {"name": "REGISTRY_STORAGE_S3_REGIONENDPOINT", "value": vm_s3_endpoint(env)},
-        {"name": "REGISTRY_STORAGE_S3_BUCKET", "value": bucket},
-        {"name": "REGISTRY_STORAGE_S3_ROOTDIRECTORY", "value": "/" + store_prefix(env, "images") + "registry"},
-        {"name": "REGISTRY_STORAGE_DELETE_ENABLED", "value": "true"},
-        {"name": "REGISTRY_HTTP_ADDR", "value": ":5000"},
-    ]
+    root = "/" + store_prefix(env, "images") + "registry"
+    volumes: list[dict] = []
+    mounts: list[dict] = []
     if env.is_gcp_vm:
-        # GCS の XML API は UploadPartCopy を実装していない（配備で判明 2026-10-30、設計書 16 章）。registry は 32 MB を超える
-        # 層を blobs/ へ移すときにマルチパートのコピーを使うので、しきい値を上限（5 GiB）にして 1 回の CopyObject にする
-        env_vars.append({"name": "REGISTRY_STORAGE_S3_MULTIPARTCOPYTHRESHOLDSIZE", "value": str(5 * 1024 ** 3)})
+        # GCS は「均一なバケットレベルのアクセス」（ディレクトリ単位の権限に必須）のバケットに、registry の S3 ドライバが付ける ACL を
+        # 拒むので、GCS ドライバ（サービスアカウントの JSON キー。Secret lab-registry-gcs）で書く（配備で判明 2026-10-31）
+        env_vars = [
+            {"name": "REGISTRY_STORAGE", "value": "gcs"},
+            {"name": "REGISTRY_STORAGE_GCS_BUCKET", "value": bucket},
+            {"name": "REGISTRY_STORAGE_GCS_ROOTDIRECTORY", "value": root},
+            {"name": "REGISTRY_STORAGE_GCS_KEYFILE", "value": "/etc/registry-gcs/key.json"},
+            {"name": "REGISTRY_STORAGE_DELETE_ENABLED", "value": "true"},
+            {"name": "REGISTRY_HTTP_ADDR", "value": ":5000"},
+        ]
+        volumes.append({"name": "gcs-key", "secret": {"secretName": VM_REGISTRY_GCS_SECRET}})
+        mounts.append({"name": "gcs-key", "mountPath": "/etc/registry-gcs", "readOnly": True})
+    else:
+        env_vars = [
+            {"name": "REGISTRY_STORAGE", "value": "s3"},
+            {"name": "REGISTRY_STORAGE_S3_REGION", "value": env.vm_region},
+            {"name": "REGISTRY_STORAGE_S3_REGIONENDPOINT", "value": vm_s3_endpoint(env)},
+            {"name": "REGISTRY_STORAGE_S3_BUCKET", "value": bucket},
+            {"name": "REGISTRY_STORAGE_S3_ROOTDIRECTORY", "value": root},
+            {"name": "REGISTRY_STORAGE_DELETE_ENABLED", "value": "true"},
+            {"name": "REGISTRY_HTTP_ADDR", "value": ":5000"},
+        ]
     secret_ref = [{"secretRef": {"name": VM_REGISTRY_NAME}}]
     docs = [
         {"apiVersion": "v1", "kind": "Service",
@@ -952,8 +965,9 @@ def vm_registry_manifest(env: Env, bucket: str, node_port: int) -> str:
                            "tolerationSeconds": 30},
                           {"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute",
                            "tolerationSeconds": 30}],
+                      "volumes": volumes,
                       "containers": [{"name": "registry", "image": VM_REGISTRY_IMAGE, "env": env_vars,
-                                      "envFrom": secret_ref,
+                                      "envFrom": secret_ref, "volumeMounts": mounts,
                                       "ports": [{"containerPort": 5000}],
                                       "readinessProbe": {"httpGet": {"path": "/v2/", "port": 5000}, "periodSeconds": 5},
                                       "resources": {"requests": {"cpu": "50m", "memory": "64Mi"},
@@ -962,11 +976,18 @@ def vm_registry_manifest(env: Env, bucket: str, node_port: int) -> str:
     return yaml.safe_dump_all(add_egress(docs, env), sort_keys=False)
 
 
+VM_REGISTRY_GCS_SECRET = "lab-registry-gcs"
+GCS_REGISTRY_KEY_ENV = "LAB_VM_GCS_REGISTRY_KEY_JSON"   # registry のサービスアカウントの JSON キー（base64。GCP だけ）
+
+
 def vm_registry_secret(env: Env) -> dict[str, str]:
-    """registry の Pod に渡す秘密: S3 の静的キー（IAM ユーザー registry）と、2 Pod で共通の HTTP の秘密。"""
-    key_name, secret_name = s3_env_names("registry", env)
-    return {"REGISTRY_STORAGE_S3_ACCESSKEY": env.get(key_name), "REGISTRY_STORAGE_S3_SECRETKEY": env.get(secret_name),
-            "REGISTRY_HTTP_SECRET": env.get("LAB_REGISTRY_HTTP_SECRET")}
+    """registry の Pod に渡す秘密: 2 Pod で共通の HTTP の秘密と、AWS は S3 の静的キー（IAM ユーザー registry）。
+    GCP の鍵は JSON キーの Secret（lab-registry-gcs）で別に渡す。"""
+    data = {"REGISTRY_HTTP_SECRET": env.get("LAB_REGISTRY_HTTP_SECRET")}
+    if not env.is_gcp_vm:
+        key_name, secret_name = s3_env_names("registry", env)
+        data |= {"REGISTRY_STORAGE_S3_ACCESSKEY": env.get(key_name), "REGISTRY_STORAGE_S3_SECRETKEY": env.get(secret_name)}
+    return data
 
 
 def acme_staging(env: Env) -> bool:

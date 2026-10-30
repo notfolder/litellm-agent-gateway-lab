@@ -679,14 +679,20 @@ class VmTargetTest(unittest.TestCase):
         self.assertEqual((svc["spec"]["type"], svc["spec"]["ports"][0]["nodePort"]), ("NodePort", 30500))
         dep = next(d for d in docs if d["kind"] == "Deployment")
         envs = {e["name"]: e["value"] for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]}
-        self.assertEqual((envs["REGISTRY_STORAGE"], envs["REGISTRY_STORAGE_S3_BUCKET"]), ("s3", "lab-bucket"))
-        self.assertEqual(envs["REGISTRY_STORAGE_S3_ROOTDIRECTORY"], "/images/registry")   # 1 バケットの images/ ディレクトリ
-        self.assertEqual((envs["REGISTRY_STORAGE_S3_REGION"], envs["REGISTRY_STORAGE_S3_REGIONENDPOINT"]),
-                         ("asia-northeast1", "https://storage.googleapis.com"))
+        # GCP は GCS ドライバ（均一アクセスのバケットは S3 ドライバの ACL を拒む。2026-10-31）。置き場は 1 バケットの images/ ディレクトリ
+        self.assertEqual((envs["REGISTRY_STORAGE"], envs["REGISTRY_STORAGE_GCS_BUCKET"]), ("gcs", "lab-bucket"))
+        self.assertEqual((envs["REGISTRY_STORAGE_GCS_ROOTDIRECTORY"], envs["REGISTRY_STORAGE_GCS_KEYFILE"]),
+                         ("/images/registry", "/etc/registry-gcs/key.json"))
+        self.assertEqual(dep["spec"]["template"]["spec"]["volumes"][0]["secret"]["secretName"], render.VM_REGISTRY_GCS_SECRET)
         self.assertEqual(dep["spec"]["replicas"], 2)
+        adocs = list(yaml.safe_load_all(render.vm_registry_manifest(self.vm(), "lab-bucket", 30500)))
+        aenvs = {e["name"]: e["value"] for e in next(d for d in adocs if d["kind"] == "Deployment")["spec"]["template"]["spec"]["containers"][0]["env"]}
+        self.assertEqual((aenvs["REGISTRY_STORAGE"], aenvs["REGISTRY_STORAGE_S3_BUCKET"], aenvs["REGISTRY_STORAGE_S3_ROOTDIRECTORY"]),
+                         ("s3", "lab-bucket", "/images/registry"))
         # 静的キーは .env の LAB_VM_S3_*（Mac の S3_* とは別の名前。同じ .env で切り替えても混ざらない）
         secret = render.vm_registry_secret(self.vm(LAB_VM_S3_REGISTRY_KEY="AKIAREG", LAB_VM_S3_REGISTRY_SECRET="sr",
                                                    S3_REGISTRY_KEY="mac", LAB_REGISTRY_HTTP_SECRET="h"))
+        self.assertEqual(render.vm_registry_secret(self.vm("gcp-vm", LAB_REGISTRY_HTTP_SECRET="h")), {"REGISTRY_HTTP_SECRET": "h"})
         self.assertEqual(render.s3_env_names("litellm-writer", env()), ("S3_LITELLM_WRITER_KEY", "S3_LITELLM_WRITER_SECRET"))
         self.assertEqual(render.s3_env_names("litellm-writer", self.vm()), ("LAB_VM_S3_LITELLM_WRITER_KEY", "LAB_VM_S3_LITELLM_WRITER_SECRET"))
         self.assertEqual(secret, {"REGISTRY_STORAGE_S3_ACCESSKEY": "AKIAREG", "REGISTRY_STORAGE_S3_SECRETKEY": "sr",
@@ -765,9 +771,11 @@ class CloudLayerTest(unittest.TestCase):
             vm.require_provided_env(e)
         self.assertIn("LAB_VM_S3_LITELLM_WRITER_KEY", str(cm.exception))
         self.assertIn("LAB_VM_S3_OPERATOR_KEY", str(cm.exception))   # GCP は操作者の HMAC キーも必須
-        for user in ("litellm-writer", "audit-compactor", "audit-viewer", "pg-backup", "registry", "operator"):
+        self.assertIn(render.GCS_REGISTRY_KEY_ENV, str(cm.exception))   # GCP の registry は JSON キー
+        for user in ("litellm-writer", "audit-compactor", "audit-viewer", "pg-backup", "operator"):
             for name in render.s3_env_names(user, e):
                 e.values[name] = "x"
+        e.values[render.GCS_REGISTRY_KEY_ENV] = "e30="
         vm.require_provided_env(e)
         e.values["LAB_EGRESS_PROXY"] = "http://10.0.0.20:3128"
         with self.assertRaises(LabError):

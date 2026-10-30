@@ -245,7 +245,12 @@ def allow_web_from(env: Env, cidr: str) -> None:
     Mac が中継を通すときは、中継の VM からの入口への接続も通す（サブネット）。"""
     cidrs = [cidr]
     if env.egress_proxy_vm:
+        # 中継の VM から入口（浮動 IP）への接続は、送信元が中継の内部 IP か外部 IP のどちらにも見えうるので両方を許す
         cidrs.append(network_plan(env.vm_cidr, subnets_per_node=False)["subnets"][0])
+        for inst in _instances(env, role="proxy"):
+            public = _to_node(inst, index=0).public_ip
+            if public:
+                cidrs.append(f"{public}/32")
     _allow_from(env, "fw_web", cidrs, "80/443")
 
 
@@ -317,15 +322,16 @@ def _canon_rules(rules) -> list[str]:
 
 
 def ensure_bucket(env: Env) -> str:
-    """1 つのバケット（オブジェクト保持ロック有効、バージョニング、公開アクセスの防止、ライフサイクル。
-    均一なバケットレベルのアクセスは無効: registry の S3 ドライバが ACL を付けるため。権限は IAM で同じ）。"""
+    """1 つのバケット（オブジェクト保持ロック有効、バージョニング、公開アクセスの防止、ライフサイクル、均一なバケットレベルのアクセス）。
+    均一アクセスは IAM の条件（ディレクトリ単位の権限）に必須。registry の S3 ドライバは ACL を付けて均一のバケットに書けないので、
+    GCP の registry は GCS ドライバ（サービスアカウントの JSON キー）を使う（配備で判明 2026-10-31）。"""
     from google.cloud import storage
     client = _storage(env)
     name = _names(env)["bucket"]
     bucket = client.lookup_bucket(name)
     if bucket is None:
         bucket = storage.Bucket(client, name=name)
-        bucket.iam_configuration.uniform_bucket_level_access_enabled = False
+        bucket.iam_configuration.uniform_bucket_level_access_enabled = True
         bucket.iam_configuration.public_access_prevention = "enforced"
         bucket.versioning_enabled = True
         bucket.labels = {LABEL_KEY: env.vm_prefix}
@@ -334,8 +340,8 @@ def ensure_bucket(env: Env) -> str:
     if bucket.object_retention_mode != "Enabled":
         raise LabError(f"バケット {name} はオブジェクト保持ロックが無効です（作成時にしか有効にできません。別の名前で作り直すか消してください）")
     changed = False
-    if bucket.iam_configuration.uniform_bucket_level_access_enabled:
-        bucket.iam_configuration.uniform_bucket_level_access_enabled = False
+    if not bucket.iam_configuration.uniform_bucket_level_access_enabled:
+        bucket.iam_configuration.uniform_bucket_level_access_enabled = True
         changed = True
     if bucket.iam_configuration.public_access_prevention != "enforced":
         bucket.iam_configuration.public_access_prevention = "enforced"
@@ -366,8 +372,8 @@ def check_bucket(env: Env, name: str, strict: bool) -> None:
         problems.append("バージョニングが無効です")
     if bucket.iam_configuration.public_access_prevention != "enforced":
         problems.append("公開アクセスの防止が無効です")
-    if bucket.iam_configuration.uniform_bucket_level_access_enabled:
-        problems.append("均一なバケットレベルのアクセスが有効です（registry の S3 ドライバが ACL を付けるので無効にする）")
+    if not bucket.iam_configuration.uniform_bucket_level_access_enabled:
+        problems.append("均一なバケットレベルのアクセスが無効です（ディレクトリ単位の権限（IAM の条件）に要る）")
     if _canon_rules(bucket.lifecycle_rules) != _canon_rules(_lifecycle_rules(objstore.vm_lifecycle_rules(env))):
         msg = "ライフサイクルが前提（変更設計書 4.2 節）と違います"
         if strict:
@@ -407,6 +413,10 @@ def _ensure_custom_role(env: Env, role_name: str, title: str, permissions: list[
     iam = iam_admin_v1.IAMClient()
     try:
         role = iam.get_role(request={"name": role_name})
+        if role.deleted:
+            # 消したカスタムロールは 7 日間は「削除済み」として残り、同じ名前で作れず、権限も付けられない（配備で判明 2026-10-31）
+            role = iam.undelete_role(request={"name": role_name})
+            info(f"削除済みのカスタムロール {role_name.rsplit('/', 1)[-1]} を戻しました")
         if sorted(role.included_permissions) != sorted(permissions):
             role.included_permissions = permissions
             iam.update_role(request={"name": role_name, "role": role})
@@ -445,25 +455,55 @@ def _set_bucket_iam(env: Env, bucket_name: str, entries: list[dict]) -> None:
         info(f"バケット {bucket_name} の権限を更新しました")
 
 
+REGISTRY_JSON_KEY_ENV = "LAB_VM_GCS_REGISTRY_KEY_JSON"   # registry のサービスアカウントの JSON キー（base64）
+
+
+def ensure_registry_json_key(env: Env, email: str) -> str | None:
+    """registry のサービスアカウントの JSON キー（.env に無ければ作り直す。base64 で返す）。"""
+    import base64
+    from google.cloud import iam_admin_v1
+    if env.get(REGISTRY_JSON_KEY_ENV):
+        return None
+    iam = iam_admin_v1.IAMClient()
+    parent = f"projects/{env.gcp_project}/serviceAccounts/{email}"
+    for attempt in range(12):
+        try:
+            for key in iam.list_service_account_keys(request={"name": parent, "key_types": ["USER_MANAGED"]}).keys:
+                iam.delete_service_account_key(request={"name": key.name})
+            created = iam.create_service_account_key(request={"name": parent})
+            break
+        except _NotFound():
+            if attempt == 11:
+                raise
+            time.sleep(5)
+    info(f"{email} の JSON キーを作りました（.env の {REGISTRY_JSON_KEY_ENV} に書く）")
+    return base64.b64encode(created.private_key_data).decode()
+
+
 def ensure_static_keys(env: Env, bucket: str) -> dict[str, tuple[str, str]]:
-    """役割ごとのサービスアカウント（5 つ ＋ 操作者）と HMAC キー。権限は毎回そろえ、キーは .env に無い利用者だけ作り直す。
-    戻り値は作ったキー（利用者 → (アクセス ID, シークレット)）。呼ぶ側が .env に書く。"""
+    """役割ごとのサービスアカウント（5 つ ＋ 操作者）と HMAC キー（registry は GCS ドライバ用の JSON キー）。権限は毎回そろえ、
+    キーは .env に無い利用者だけ作り直す。戻り値は作ったキー（利用者 → (アクセス ID, シークレット)。registry は ("json", base64)）。"""
     client = _storage(env)
     keys: dict[str, tuple[str, str]] = {}
     for role, (suffix, permissions) in CUSTOM_ROLES.items():
         _ensure_custom_role(env, _custom_role_name(env, role), f"litellm-lab {suffix}", permissions)
     for user in [*STATIC_KEY_USERS, OPERATOR_USER]:
         email = _ensure_service_account(env, f"{env.vm_prefix}-{user}", f"litellm-lab {user} (S3 互換の静的キー)")
+        if user == "registry":
+            json_key = ensure_registry_json_key(env, email)
+            if json_key:
+                keys[user] = ("json", json_key)
+            continue
         key_name, secret_name = render.s3_env_names(user, env)
         if env.get(key_name) and env.get(secret_name):
             continue
-        for meta in client.list_hmac_keys(service_account_email=email):
-            if meta.state == "ACTIVE":
-                meta.state = "INACTIVE"
-                meta.update()
-            meta.delete()
-        for attempt in range(12):   # 作った直後のサービスアカウントは数秒〜数十秒は 404 になる
+        for attempt in range(12):   # 作った直後のサービスアカウントは数秒〜数十秒は 404 になる（一覧も作成も）
             try:
+                for meta in client.list_hmac_keys(service_account_email=email):
+                    if meta.state == "ACTIVE":
+                        meta.state = "INACTIVE"
+                        meta.update()
+                    meta.delete()
                 meta, secret = client.create_hmac_key(service_account_email=email, project_id=env.gcp_project)
                 break
             except _NotFound():

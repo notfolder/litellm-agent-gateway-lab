@@ -1373,3 +1373,125 @@ Claude Code の auto mode とゲートウェイの文脈あり審査を併用し
 | プログラムの実行の審査の前提 | 一時的な処理が対象。木のツールと OS・ミドルウェアは安全。実体が読める最後の時点で読む（スクリプトは動かす直前、読めない実体は作る直前、自動で動く場所へ置くものは置く直前） | spec 4.4 |
 | 環境変数の読み方 | 審査官が名前を指定した変数だけを `printenv` で読ませる | 9.4 |
 | 案内の付け方 | 審査官が種類（`advice`）を返し、ゲートウェイが決まった文を添える。判定基準には具体例を書かない | 9.4 |
+
+---
+
+## 21. VM 3 台とオブジェクトストレージだけの環境（`LAB_TARGET=aws-ec2` / `gcp-vm`）
+
+spec 12 章の作り。構成図は [vm_architecture.md](vm_architecture.md)。経緯と配備で分かったことの全文は `.history/2026-10-30-VM環境の共通化とGCP追加/変更設計書.md` と
+`.history/2026-10-30-既存資源からの構築と出口プロキシ/変更設計書.md`。
+
+### 21.1 層の分け方
+
+| 層 | 置き場 | 内容 |
+|---|---|---|
+| クラウド固有層 | `labtool/clouds/aws_ec2.py`、`gcp.py`（同じ関数の組 `clouds.FUNCTIONS`。単体テストが一致を確かめる） | provision（ネットワーク、浮動 IP、バケット、静的キー、VM の権限、VM 3 台、中継の VM、削除。managed だけ）と setup 用の読み取り（`describe_nodes`、`describe_entry_ip`、`entry_ip_holder`、`stop_node` / `start_node`、`check_bucket`、`snapshot`、`empty_bucket`）、`destroy_provided` |
+| VM 共通層 | `labtool/vm.py`、`vm/node-init.sh`、`vm/hooks-aws.sh` / `hooks-gcp.sh`、`vm/proxy-init.sh` | `.env` の識別子から基盤を組む、SSH（鍵、実行、kubeconfig、6443 の転送）、初期化スクリプトの描画と SSH での実行、k3s のトークンと版、VM 上のビルド、中継の VM の初期化、版上げの部品、A レコード、証明書の退避、アンインストール |
+| 段階 | `labtool/stages.py`、`ops.py` | `is_vm` で分岐。Kubernetes の中は Mac と同じ関数 |
+
+### 21.2 `.env` の項目
+
+| 項目 | 既定 | 意味 |
+|---|---|---|
+| `LAB_TARGET` | | `aws-ec2` / `gcp-vm` |
+| `LAB_INFRA` | `managed` | `managed`: provision が作って下の識別子を書く。`provided`: 既存の物の識別子を人が書く |
+| `LAB_VM_NODES` | | VM の識別子 3 つ（AWS: インスタンス ID、GCP: `<ゾーン>/<名前>`）。順番が台の番号 |
+| `LAB_VM_SSH_KEY` / `LAB_VM_SSH_USER` | `.build/vm-ssh-key` / `ubuntu` | SSH の秘密鍵と利用者 |
+| `LAB_VM_BUCKET` | | バケット名（1 つ） |
+| `LAB_VM_ENTRY_IP_ID` | | 浮動 IP の識別子（AWS: `eipalloc-…`、GCP: アドレスの名前） |
+| `LAB_VM_S3_<利用者>_KEY` / `_SECRET` | | 静的キー（`LITELLM_WRITER`、`AUDIT_COMPACTOR`、`AUDIT_VIEWER`、`PG_BACKUP`、`REGISTRY`、`OPERATOR`）。Mac の `S3_*` とは別の名前 |
+| `LAB_VM_ARCH` | （VM から読む） | 自作イメージのアーキテクチャ |
+| `LAB_EGRESS_PROXY` / `LAB_EGRESS_CA_FILE` | | VM と Pod が使う中継の URL と CA（PEM） |
+| `LAB_EGRESS_PROXY_MAC` | | `./lab` 自身が使う中継の URL |
+| `LAB_EGRESS_PROXY_VM` | `false` | managed で 4 台目に中継を作り、3 台の直接の外向きを遮断する（検証） |
+| `LAB_VM_CIDR`、`LAB_VM_DISK_GIB`、`LAB_VM_LOCAL_PORT`、`LAB_VM_KEEP_ENTRY_IP`、`LAB_SSH_ALLOW_CIDR`、`LAB_WEB_ALLOW_CIDR`、`LAB_VM_JUDGE_MODEL`、`LAB_JUDGE_ANTHROPIC_API_KEY`、`LAB_EC2_INSTANCE_TYPE`、`LAB_GCP_*`、`LAB_CLOUDFLARE_API_TOKEN`、`LAB_ACME_EMAIL`、`LAB_ACME_STAGING` | | `.env.example` の説明のとおり |
+
+### 21.3 構築の流れ（`./lab up`）
+
+```mermaid
+flowchart TB
+    P["preflight<br/>道具（kubectl、helm、ssh）、資格情報、ホスト名、provided の項目"] --> C
+    subgraph C["cluster"]
+        PR["provision（managed だけ）<br/>ネットワーク → 22 / 80・443 / 中継の許可 → 浮動 IP → バケット → 静的キー → VM の権限 → VM 3 台 → 中継の VM<br/>→ .env に書く → 中継の VM を SSH で初期化して CA を取る"]
+        LI["load_infra（.env の識別子 → API）→ ensure_access（managed は許可を直す。転送を張る）"]
+        IN["init_nodes: cluster/k3s/token・version（無ければ作る）→ 1 番 → 2 番 → 3 番 を SSH で初期化"]
+        KS["Traefik → namespace → SA → 中継の CA（ConfigMap / Secret）→ registry → cert-manager（中継の値）・CNPG・Barman → ClusterIssuer"]
+        PR --> LI --> IN --> KS
+    end
+    C --> I["images<br/>VM の Docker でビルド（文脈は tar で SSH）→ 127.0.0.1:30500 に push"]
+    I --> S["secrets（.env → Secret。静的キーは LAB_VM_S3_*）"] --> O["objectstore（check_bucket ＋ 自己確認）"] --> D["datastores（Barman の宛先は <バケット>/pg-backup/）"]
+    D --> M["mcp"] --> L["litellm（A レコード → Let's Encrypt）"] --> B["bootstrap"] --> AU["audit"] --> CL["clients"]
+```
+
+### 21.4 VM の初期化（`vm/node-init.sh`、SSH で `sudo bash -s`）
+
+1. CA（`EGRESS_CA_B64`）を `/usr/local/share/ca-certificates/lab-egress.crt` に置き `update-ca-certificates`
+2. 中継（`EGRESS_PROXY`）を `/etc/environment`、apt、Docker の systemd の drop-in、`k3s.service.env` に書く。`NO_PROXY` は `127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,169.254.169.254,metadata.google.internal,metadata,<VM の CIDR>,<台の IP>`
+3. `ready` があれば Docker を再起動して抜ける（2 回目以降）
+4. apt で keepalived、curl、docker.io。hooks の `lab_install_tools`（AWS は awscli の snap と 2 つ目の IP の netplan）
+5. containerd のミラー（`lab-registry:5000` → 自分の NodePort）
+6. k3s: 参加先を探し、`config.yaml` を書き、インストールスクリプト（`INSTALL_K3S_VERSION`、`K3S_TOKEN`。中継の環境変数は `k3s.service.env` に写る）
+7. keepalived（ユニキャスト VRRP、`nopreempt`）と hooks（`declare -f` と値、中継の環境変数と CA を `/var/lib/lab/hooks.sh` に）
+8. 起動時に外向き IP を戻す `lab-egress.service`（GCP の startup-script の代わり）
+9. `touch /var/lib/lab/ready`
+
+hooks の関数: `lab_install_tools`、`lab_self_id`、`lab_take_entry_ip`、`lab_ensure_egress`、`lab_hook_values`。メタデータサーバーは中継を通さない（`--noproxy '*'`）。
+
+### 21.5 バケット 1 つの配置、権限、保持
+
+`render.store_location(env, 論理名)` → `(バケット, 接頭辞)`。Mac は `(論理名, "")`、EKS 版は `(接頭辞付き, "")`、VM は `(LAB_VM_BUCKET, "<論理名>/")`。
+
+| 使う側 | 渡し方 |
+|---|---|
+| LiteLLM の監査コールバック | `AUDIT_S3_BUCKET`、`AUDIT_S3_KEY_PREFIX`（`audit-raw/`）、`AUDIT_S3_RETENTION_DAYS`（90）、`AUDIT_S3_RETENTION_MODE`。記録に残す鍵は接頭辞なしの論理の鍵 |
+| 監査アプリ | `AUDIT_S3_BUCKET`（空なら従来の `AUDIT_S3_BUCKET_PREFIX` ＋ 論理名）、`AUDIT_ACCESS_RETENTION_DAYS`（400）、`AUDIT_RETENTION_MODE`。`common.Store` が接頭辞を付け外しする |
+| Barman | `destinationPath: s3://<バケット>/pg-backup/litellm-pg` |
+| registry | AWS: S3 ドライバ `REGISTRY_STORAGE_S3_ROOTDIRECTORY=/images/registry`。GCP: GCS ドライバ（`REGISTRY_STORAGE_GCS_*`、サービスアカウントの JSON キーを Secret `lab-registry-gcs` で）。均一アクセスのバケットは S3 ドライバの ACL を拒むため |
+| k3s のトークンと版 | `cluster/k3s/token`、`cluster/k3s/version`（操作者の S3 クライアント） |
+
+バケットの仕様: S3 は Object Lock 有効（既定の保持なし）、バージョニング、PAB、接頭辞ごとのライフサイクル（`objectstore.vm_lifecycle_rules`。原本 91 日、閲覧記録 401 日、整形済みは Mac と同じ規則、`pg-backup/` `images/` `cluster/` は非現行の版だけ）。GCS はオブジェクト保持ロック（作成時）、バージョニング、公開アクセスの防止、均一なバケットレベルのアクセス（IAM の条件に必須）、同じライフサイクルを `matchesPrefix` で。
+
+保持の付け方: S3 は `put_object(ObjectLockMode, ObjectLockRetainUntilDate)`。GCS（`storage.googleapis.com`）は boto3 の `before-call.s3.PutObject` で `x-amz-object-lock-*` を `x-goog-object-lock-*` に写す（`gcs_object_lock_headers`）。
+
+権限（`clouds.s3_user_policies` / `clouds.gcs_bindings`）:
+
+| 利用者 | S3（IAM ユーザー） | GCS（サービスアカウント。条件付きバインディング） |
+|---|---|---|
+| litellm-writer | `PutObject` ＋ `PutObjectRetention` on `audit-raw/raw/*` | カスタムロール writer（`objects.create` ＋ `objects.setRetention`）on `audit-raw/raw/` |
+| audit-compactor | `ListBucket`、`GetObject` on `audit-raw/*` `audit-derived/*`、`PutObject` on `audit-derived/*` | lister（`objects.list`、`buckets.get`）、objectViewer on `audit-raw/` `audit-derived/`、objectUser on `audit-derived/` |
+| audit-viewer | `ListBucket`、`GetObject` on 原本・閲覧記録・整形済み、`PutObject` ＋ `PutObjectRetention` on `audit-access/*`、`PutObject` on `audit-derived/billing/contracts/*` `fx_rates/*` | lister、objectViewer、writer on `audit-access/`、objectUser on `audit-derived/billing/…` |
+| pg-backup / registry | `s3:*` on `pg-backup/*` / `images/*`、`ListBucket` | objectAdmin on `pg-backup/` / `images/`、lister |
+| 操作者 | 自分の資格情報（AWS）/ HMAC キー（GCP） | objectAdmin（条件なし） |
+| 全員（Deny） | `DeleteObjectVersion`、`BypassGovernanceRetention`、`PutObjectLegalHold` on `audit-raw/*` `audit-access/*`。`DeleteBucket`、`PutBucketObjectLockConfiguration`、`PutLifecycleConfiguration`、`PutBucketVersioning` | （明示的な拒否は無い。保持ロックが守る） |
+
+### 21.6 VM 上のビルド（`vm.build_and_push_on_node`）
+
+ビルドする台は SSH の転送先（無ければ 1 番）。アーキテクチャは `LAB_VM_ARCH` か `uname -m`。文脈（`litellm/` または `apps/audit/`、`__pycache__` を除く）に `egress-ca.pem`（中継の CA。無ければ空）を足した tar を SSH の標準入力で渡し、`docker build -` → `docker tag` → `docker push 127.0.0.1:30500/<name>:<tag>`（Docker は 127.0.0.0/8 を平文の置き場として扱う）。置き場に同じタグがあれば何もしない。監査アプリの Dockerfile は `egress-ca.pem` に中身があれば OS と pip に信頼させる。
+
+### 21.7 出口プロキシ
+
+| 配る先 | 方法 |
+|---|---|
+| VM、k3s、Docker、apt | 21.4 節 |
+| Pod（LiteLLM、Gmail の MCP、registry、監査アプリ、監査の試験の Job） | `render.add_egress`: 全コンテナに `HTTP(S)_PROXY` / `NO_PROXY`（`render.POD_NO_PROXY`。クラスタの中の名前を列挙）/ `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `AWS_CA_BUNDLE` / `CURL_CA_BUNDLE` と、ConfigMap `lab-egress-ca` のマウント（`/etc/lab-egress/ca.crt`）。LiteLLM は Helm の `envVars` / `volumes` と `DISABLE_AIOHTTP_TRANSPORT=True` |
+| cert-manager | Helm の `http_proxy` / `https_proxy` / `no_proxy`、`extraEnv`、`volumes` / `volumeMounts` |
+| Barman（ObjectStore） | `configuration.endpointCA`（Secret `lab-egress-ca`）と `instanceSidecarConfiguration.env` |
+| DuckDB（監査アプリ） | `SET http_proxy`、`SET ca_cert_file`（環境変数から） |
+| 操作者の Mac | `Env.apply_mac_proxy`: `HTTP(S)_PROXY`、`NO_PROXY=127.0.0.1,localhost`、`REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` / `AWS_CA_BUNDLE` / `CURL_CA_BUNDLE` / `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH`。helm のチャート取得に `--ca-file`。操作者の公開 IP の検出は中継を通さない |
+
+検証の中継の VM（`LAB_EGRESS_PROXY_VM=true`、managed）: サブネットの `.20`、amd64、`vm/proxy-init.sh` で mitmproxy（`--mode regular`、3128、`block_global=false`）を systemd に。CA は SSH で `.build/egress-ca.pem` に取る。3128 はサブネットと操作者の IP に開ける。3 台の直接の外向きは GCP が egress の deny（タグ `<prefix>-node`）＋ サブネットへの allow、AWS がセキュリティグループの egress を VPC の中だけに。`./lab proxy-log` が中継の journal から宛先ホストごとの件数を出す。
+
+### 21.8 削除
+
+| モード | `./lab down` | `./lab down --all` |
+|---|---|---|
+| managed | 証明書を退避 → `cloud.destroy`（名前とタグで全部。中継の VM、カスタムロール、キーペアを含む）→ `.env` の provision が書いた項目を消す | 同じ |
+| provided | 証明書を退避 → 3 台で `k3s-uninstall.sh`、keepalived と `lab-egress` を外す → `audit-derived/` `pg-backup/` `images/` `cluster/` を空にする | 加えて VM、浮動 IP、バケット（保持を外して）を消す。静的キーとネットワークは用意する側の物なので消さない |
+
+### 21.9 用意する側への前提
+
+spec 12.2 節。静的キーの権限は 21.5 節の表。GCS は「均一なバケットレベルのアクセス」を有効にする（IAM の条件に必須）。registry 3.0 の S3 ドライバは ACL を付けて均一のバケットに書けないので、GCP の registry はサービスアカウントの JSON キーで GCS ドライバを使う（`LAB_VM_GCS_REGISTRY_KEY_JSON`）。
+
+### 21.10 配備と試験の結果
+
+（GCP での配備と試験の後に書く。AWS は EC2 の vCPU 上限で配備できていない）

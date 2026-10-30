@@ -93,6 +93,18 @@
 | [spec.md](spec.md) 9.3 の無停止のバージョンアップを実際に試験する | この文書の見込みを実測で確かめられる | 中 |
 | 本番では、RustFS を S3 に替え、オペレーター・Traefik・Gmail の MCP を 2 台以上にする | 1 台しかない部品が無くなる | 本番の設計で決める |
 
+## 5. VM 3 台の環境（`LAB_TARGET=aws-ec2` / `gcp-vm`）での違い
+
+| 作業 | やり方 |
+|---|---|
+| 構築ツールの接続 | `./lab` を流すたびに SSH のポート転送（k3s の 6443 → 127.0.0.1:16443）を確かめて張り直す。`kubectl --context litellm-lab-gcp`（`-ec2`）でクラスタに届く |
+| 自作イメージの更新 | `./lab images` が k3s の台の Docker でビルドしてクラスタの中の registry に push する。Mac の Docker は使わない |
+| Kubernetes（k3s）の版上げ | `./lab upgrade-k8s <版> [--measure]`。1 台ずつ、浮動 IP の台は最後。マイナー版は 1 つずつ |
+| 既存資源（`LAB_INFRA=provided`）での注意 | 構築ツールはネットワーク・浮動 IP・権限・バケットの設定を変えない。操作者の回線が変わったら 22 と 80/443 の開け直しを用意する側に頼む |
+| 出口プロキシ（Zscaler）の CA の更新 | `.env` の `LAB_EGRESS_CA_FILE` を新しい CA にして `./lab up`。VM の信頼店（SSH で直す）、Pod の ConfigMap、`./lab` 自身の環境変数が揃う |
+| 整形の Job のメモリ | 1 時間の原本の件数に比例する。入口を操作者の IP に絞っていれば 2 GiB で足りる（総当たりを受けた 10 万件/時で 1 GiB を超えた） |
+| 片付け | managed: `./lab down`（全部消す）。provided: `./lab down`（k3s を外す）または `./lab down --all`（VM・浮動 IP・バケットも） |
+
 ## 参考
 
 - [LiteLLM: prisma migrations](https://docs.litellm.ai/docs/troubleshoot/prisma_migrations)

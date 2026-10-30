@@ -948,3 +948,51 @@ env_http_headers = { "x-litellm-api-key" = "LITELLM_MCP_AUTH" }  # 値は "Beare
 - [RustFS](https://github.com/rustfs/rustfs) / [Object Lock](https://docs.rustfs.com/administration/data/object/object-lock)
 - MinIO の開発終了: [GitHub（archived）](https://github.com/minio/minio)
 - Langfuse（採らなかった理由）: [License key](https://langfuse.com/self-hosting/license-key) / [Metrics API](https://langfuse.com/docs/metrics/features/metrics-api)
+
+---
+
+## 12. VM 3 台とオブジェクトストレージだけの環境（`LAB_TARGET=aws-ec2` / `gcp-vm`）
+
+Mac の検証環境（8 章）と同じ中身を、マネージドサービスを使わずクラウドの部品を計算資源とオブジェクトストレージに限って動かす環境。構成図は [vm_architecture.md](vm_architecture.md)。
+経緯は `.history/2026-10-25-EC2三台構成/`、`.history/2026-10-30-VM環境の共通化とGCP追加/`、`.history/2026-10-30-既存資源からの構築と出口プロキシ/`。
+
+### 12.1 要件
+
+| 項目 | 内容 |
+|---|---|
+| クラウドの部品 | 計算資源（VM 3 台）とオブジェクトストレージ（バケット 1 つ）以外を使わない。付随する物（ネットワーク、浮動 IP、VM の権限、役割ごとの静的キー）は使う。パラメータストア、Secret Manager、Session Manager、IAP、Bedrock、Vertex AI は使わない |
+| クラウド | AWS（EC2 と S3、東京）と GCP（Compute Engine と Cloud Storage、東京）。クラウドごとに違ってよいのは「計算資源とネットワークを作るところ」だけで、VM の中と Kubernetes の中は 1 つのコード |
+| 可用性 | 1 台が落ちても処理が続く（k3s の server 3 台、PostgreSQL 3 台、Valkey と Sentinel 3 台）。入口は浮動 IP を keepalived が 3 台の間で移す |
+| 基盤の持ち方 | `LAB_INFRA=managed`（構築ツールが作る。検証）と `provided`（既存の VM 3 台とバケット 1 つを使う。本番）。provided では構築ツールはネットワーク・浮動 IP・権限・バケットの設定を変えない。既存の物は `.env` に識別子と静的キーを書いて伝える |
+| VM の初期化 | 構築ツールが SSH で初期化する（起動時のユーザーデータは使わない。既存の VM で使えないため）。k3s のトークンと版は SSH で渡し、VM にバケットの権限を求めない |
+| オブジェクトストレージ | バケットは 1 つ。論理名（原本、閲覧記録、整形済み、DB のバックアップ、イメージ置き場、k3s のトークンと版）はディレクトリ。原本と閲覧記録は書くときにオブジェクト単位の保持（90 日、400 日）を付ける。バケット全体の既定の保持は使わない。権限は 5.3 の意味を保つ（書き込み用は原本を読めず消せない、検索アプリは原本に書けない、誰も原本と閲覧記録の版を消せず保持を回避できない）。一覧はバケット全体に許す |
+| 自作イメージ | k3s の台の Docker でビルドし、クラスタの中の置き場（registry）に push する。アーキテクチャは VM のもの（arm64 でも amd64 でも同じ手順）。Mac の Docker は使わない |
+| 出口プロキシ | 本番の VM は Zscaler の中。`.env` に中継の URL と CA を書けば、VM・k3s（containerd）・外へ出る全 Pod・`./lab` 自身がその中継を通り CA を信頼する。方式は明示プロキシ（環境変数） |
+| モデルと審査官 | Claude Code 用は Mac と同じ Claude Max のトークンの転送。審査官は Anthropic の API キーの Claude Haiku 4.5（Max のトークンを審査官に使うことは Anthropic が認めていない）。Codex のモデル（ChatGPT）は置かない |
+| 入口の送信元 | 22 と 80/443 は操作者の回線だけに開く（公開の入口には API キーの総当たりが来る）。managed では `./lab` を流すたびに直す。provided では用意する側が開ける |
+| 削除 | `./lab down` は managed なら有料の物を全部消し、provided なら k3s を外して保持の無いディレクトリを空にする。`./lab down --all` で provided でも VM・浮動 IP・バケットまで消す |
+
+### 12.2 用意する側への前提（`LAB_INFRA=provided`）
+
+| 項目 | 内容 |
+|---|---|
+| VM | Ubuntu 24.04（arm64 / amd64）、3 台、固定の内部 IP、公開 IP、ディスク 40 GiB 以上。SSH の鍵と `sudo` できる利用者 |
+| ネットワーク | 3 台の間はすべて通る。22、80、443 は操作者の回線から届く。外向きは中継（Zscaler）経由 |
+| 浮動 IP と VM の権限 | 浮動 IP 1 つと、VM が付け替えられる権限（AWS: `ec2:AssociateAddress` / `DisassociateAddress` / `DescribeAddresses`、GCP: `compute.instances.*AccessConfig`、`compute.addresses.use` など）。AWS は各台に 2 つ目のプライベート IP |
+| バケット | 1 つ。S3: Object Lock 有効（既定の保持なし）、バージョニング有効、パブリックアクセスの遮断。GCS: オブジェクト保持ロック有効（作成時）、バージョニング有効、公開アクセスの防止、均一なバケットレベルのアクセス（ディレクトリ単位の権限に要る） |
+| 静的キー | 役割ごとに 5 組（GCP は操作者を含めて 6 組。GCP の registry は HMAC でなくサービスアカウントの JSON キー）。権限は design 21.5 節 |
+| 中継 | URL と CA（PEM） |
+
+### 12.3 検証項目
+
+| 項目 | 確かめ方 |
+|---|---|
+| 構築 | `./lab up` が managed（作って組み立てる）と provided（既存の物の上に組み立てる）の両方で通り、2 回目で何も変わらない（`test-idempotency`） |
+| 疎通・監査・障害 | `test-smoke`、`test-audit`、`test-failover`（Mac の 6 場面 ＋ `entry-node`） |
+| 保持 | 原本と閲覧記録が、書き込み用・検索アプリ・管理者（保持の回避なし）のどの資格情報でも消せない |
+| 出口プロキシ | 3 台の直接の外向き通信を遮断した状態で全段階と全試験が通る。中継の記録に Anthropic・Let's Encrypt・Cloudflare・バケット・イメージの取得が現れる。`./lab` 自身も中継経由で通る |
+| VM 上のビルド | Mac の Docker 無しで `./lab images` が通る |
+| 版上げ | `./lab upgrade-k8s` で 1 台ずつ上がり、入口の台が最後になる |
+| 全削除 | `./lab down`（managed）/ `down --all`（provided）の後に有料の物が残らない |
+
+結果は `docs/design.md` 21.10 節。
