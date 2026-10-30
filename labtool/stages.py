@@ -95,7 +95,7 @@ def ensure_access(env: Env) -> None:
 def _preflight_vm(env: Env) -> None:
     """VM 3 台の環境の前提: 道具（ssh、kubectl、helm、docker、クラウドの CLI）、資格情報、ホスト名、Let's Encrypt と審査官の設定。
     バケット名の接頭辞を Env に載せる（変更設計書 2026-10-30-VM環境の共通化とGCP追加 7 章）。"""
-    require_commands("docker", "kubectl", "helm", "ssh", "ssh-keygen", "aws" if env.is_aws_ec2 else "gcloud")
+    require_commands("docker", "kubectl", "helm", "ssh", "ssh-keygen", *(["aws"] if env.is_aws_ec2 else []))
     _ = env.hostname   # 無ければここで止まる
     for key, what in (("LAB_CLOUDFLARE_API_TOKEN", "Cloudflare の API トークン（DNS-01 用。Zone / DNS / Edit）"),
                       ("LAB_ACME_EMAIL", "Let's Encrypt の連絡先のメールアドレス"),
@@ -216,6 +216,7 @@ def _cluster_vm(env: Env) -> None:
     イメージ置き場（registry、保存先はバケット）→ オペレーター（replica 2）→ Let's Encrypt の ClusterIssuer
     （変更設計書 2026-10-30-VM環境の共通化とGCP追加 7 章）。"""
     cloud = clouds.for_env(env)
+    cloud.ensure_apis(env)
     pubkey = vm.ensure_ssh_key()
     infra = cloud.discover(env) or clouds.Infra(region=env.vm_region)
     infra.extra["network"] = cloud.ensure_network(env)
@@ -670,11 +671,12 @@ def litellm(env: Env) -> None:
 
 def _ingress_vm(env: Env) -> None:
     """HTTPS の入口: Let's Encrypt の証明書（退避があれば先に戻す）と、Traefik の経路を websecure に TLS 付きで写す。
-    ホスト名 → 浮動 IP の A レコードが引けるまで待つ（変更設計書 2026-10-25-EC2三台構成 4.6 節）。"""
+    ホスト名 → 浮動 IP の A レコードを Cloudflare に作り、引けるまで待つ（変更設計書 2026-10-30-VM環境の共通化とGCP追加 16 章）。"""
     infra = vm.load_infra(env)
     vm.restore_tls_secret()
     kapply(manifest=render.vm_certificate_manifest(env))
     kapply(manifest=render.tls_ingressroutes((K8S / "ingress.yaml").read_text()))
+    vm.ensure_a_record(env, infra.entry_ip)
     vm.wait_for_a_record(env, infra.entry_ip)
     wait_until(900, f"Let's Encrypt の証明書（{env.hostname}）の発行",
                kn("wait", f"certificate/{render.VM_TLS_SECRET}", "--for=condition=Ready", "--timeout=5s"))

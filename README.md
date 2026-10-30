@@ -55,7 +55,7 @@ brew install kubectl-cnpg awscli            # GCP は brew install --cask google
 ./lab up   # 基盤（API を直接呼ぶ: ネットワーク → 浮動 IP → バケットと静的キー → VM 3 台）→ k3s → イメージを中の registry へ → LiteLLM → Let's Encrypt
 ```
 
-人が行うこと: `./lab litellm` が表示する浮動 IP（Elastic IP / 静的な外部 IP）への A レコードを Cloudflare に足す（DNS のみ）。入口は keepalived が浮動 IP を 3 台の間で移し、HTTPS は cert-manager が Let's Encrypt（DNS-01）で取ります。構築ツールは SSH で VM に届き、22 は `./lab` を流すたびに操作者の今の IP だけに開け直します（6443 は開けず、SSH のポート転送で届く）。Claude Code のモデルは Mac と同じ Claude Max のトークンの転送、2 つの審査官は Anthropic の API キーの Claude Haiku 4.5 です（Bedrock / Vertex AI は使わない）。障害の試験は Mac と同じ場面に `--scenario entry-node`（入口の台を止める）が加わります。Kubernetes（k3s）の版は `./lab upgrade-k8s <版>` が 1 台ずつ上げます（Pod を他の台へ追い出してから k3s を再起動。浮動 IP の台は最後。`./lab up` では版を変えません。経緯は `.history/2026-10-26-k3s版上げ/`）。
+A レコード（ホスト名 → 浮動 IP）は `./lab litellm` が Cloudflare の API で作ります（DNS のみ）。人が行うのはクラウドのサインインと `.env` の秘密だけです。入口は keepalived が浮動 IP を 3 台の間で移し、HTTPS は cert-manager が Let's Encrypt（DNS-01）で取ります。構築ツールは SSH で VM に届き、22 は `./lab` を流すたびに操作者の今の IP だけに開け直します（6443 は開けず、SSH のポート転送で届く）。Claude Code のモデルは Mac と同じ Claude Max のトークンの転送、2 つの審査官は Anthropic の API キーの Claude Haiku 4.5 です（Bedrock / Vertex AI は使わない）。障害の試験は Mac と同じ場面に `--scenario entry-node`（入口の台を止める）が加わります。Kubernetes（k3s）の版は `./lab upgrade-k8s <版>` が 1 台ずつ上げます（Pod を他の台へ追い出してから k3s を再起動。浮動 IP の台は最後。`./lab up` では版を変えません。経緯は `.history/2026-10-26-k3s版上げ/`）。
 
 ## よく使うコマンド
 

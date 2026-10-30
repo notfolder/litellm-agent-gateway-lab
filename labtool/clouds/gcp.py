@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import time
 
 from .. import objectstore as objstore
 from ..core import ROOT, Env, LabError, info, ok, warn
@@ -83,10 +84,47 @@ def _zones(env: Env) -> list[str]:
 # ---- 操作者、名前 ----
 def identity(env: Env) -> dict:
     import google.auth
-    creds, project = google.auth.default(scopes=[SCOPE])
+    from google.auth import exceptions as gauth_exc
+    try:
+        creds, project = google.auth.default(scopes=[SCOPE])
+    except gauth_exc.DefaultCredentialsError as e:
+        raise LabError("GCP の資格情報（ADC）がありません。gcloud auth application-default login を実行してください"
+                       "（gcloud が Python の版で起動しないなら CLOUDSDK_PYTHON=/opt/homebrew/bin/python3 を前に付ける）") from e
     principal = getattr(creds, "service_account_email", None) or getattr(creds, "_account", None) or "(ADC)"
     return {"account": env.gcp_project, "principal": principal, "region": env.gcp_region,
             "adc_project": project or ""}
+
+
+REQUIRED_APIS = ["compute.googleapis.com", "iam.googleapis.com", "cloudresourcemanager.googleapis.com",
+                 "storage.googleapis.com"]
+
+
+def ensure_apis(env: Env) -> None:
+    """要る API（Compute Engine、IAM、Resource Manager、Cloud Storage）をプロジェクトで有効にする（Service Usage の REST。
+    有効化は無料。gcloud を使わない）。"""
+    import google.auth
+    from google.auth.transport.requests import AuthorizedSession
+    creds, _ = google.auth.default(scopes=[SCOPE])
+    session = AuthorizedSession(creds)
+    base = f"https://serviceusage.googleapis.com/v1/projects/{env.gcp_project}/services"
+    r = session.get(base, params={"filter": "state:ENABLED", "pageSize": 200}, timeout=60)
+    r.raise_for_status()
+    enabled = {svc["config"]["name"] for svc in r.json().get("services", [])}
+    missing = [a for a in REQUIRED_APIS if a not in enabled]
+    if not missing:
+        ok("GCP の API は有効です")
+        return
+    r = session.post(f"{base}:batchEnable", json={"serviceIds": missing}, timeout=60)
+    r.raise_for_status()
+    op = r.json()
+    for _ in range(60):
+        if op.get("done"):
+            break
+        time.sleep(5)
+        op = session.get(f"https://serviceusage.googleapis.com/v1/{op['name']}", timeout=60).json()
+    if op.get("error"):
+        raise LabError(f"GCP の API の有効化に失敗しました: {op['error']}")
+    info(f"GCP の API を有効にしました: {', '.join(missing)}")
 
 
 def bucket_prefix(env: Env, ident: dict) -> str:

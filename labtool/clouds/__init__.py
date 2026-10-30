@@ -33,7 +33,7 @@ LOCKED_BUCKETS = ("audit-raw", "audit-access")
 
 # 両方の実装が持つ公開関数（単体試験が名前と引き数の一致を確かめる。変更設計書 3.2 節）
 FUNCTIONS = [
-    "identity", "bucket_prefix", "s3_endpoint", "ensure_network", "allow_ssh_from", "ensure_entry_ip",
+    "identity", "ensure_apis", "bucket_prefix", "s3_endpoint", "ensure_network", "allow_ssh_from", "ensure_entry_ip",
     "ensure_buckets", "check_buckets", "ensure_static_keys", "put_object", "get_object", "ensure_nodes",
     "recreate_node", "discover", "entry_ip_holder", "stop_node", "start_node", "node_init_hooks", "destroy",
     "empty_buckets",

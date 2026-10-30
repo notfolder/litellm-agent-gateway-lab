@@ -731,6 +731,12 @@ class CloudLayerTest(unittest.TestCase):
     """クラウド固有層（labtool/clouds/）: 2 つの実装が同じ関数の組を持つこと、ネットワークの計画、VM の初期化の描画
     （変更設計書 3 章〜6 章）。クラウドの API は呼ばない。"""
 
+    def test_cloudflare_zone_candidates(self):
+        """A レコードを作るときのゾーン名の候補: ホスト名から長い順に、TLD だけは除く。"""
+        from labtool import vm
+        self.assertEqual(vm.zone_candidates("litellm-lab.example.com"), ["litellm-lab.example.com", "example.com"])
+        self.assertEqual(vm.zone_candidates("a.b.example.co.jp"), ["a.b.example.co.jp", "b.example.co.jp", "example.co.jp", "co.jp"])
+
     def test_gcp_zone_assignment(self):
         """GCP のゾーンの割り振り: 3 つあれば 1 台ずつ、2 つしかなければ繰り返す（東京の C4A は b と c だけ。2026-10-30 に判明）、無ければ止まる。"""
         from labtool.clouds import gcp

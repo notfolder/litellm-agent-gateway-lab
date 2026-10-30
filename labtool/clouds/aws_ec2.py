@@ -49,6 +49,10 @@ def identity(env: Env) -> dict:
     return {"account": ident["Account"], "principal": ident["Arn"], "region": env.aws_region}
 
 
+def ensure_apis(env: Env) -> None:
+    """AWS はサービスの有効化が要らない。"""
+
+
 def bucket_prefix(env: Env, ident: dict) -> str:
     return f"{env.aws_prefix}-{ident['account']}-"
 

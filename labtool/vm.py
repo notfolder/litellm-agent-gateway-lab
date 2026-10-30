@@ -17,6 +17,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from dataclasses import asdict
 from pathlib import Path
@@ -27,7 +28,7 @@ from . import clouds, render
 from .clouds import CLUSTER_BUCKET, PRIORITIES, REGISTRY_HOST, REGISTRY_NODEPORT, TOKEN_KEY, VERSION_KEY, Infra, Node
 from .core import (
     BUILD_DIR, K3S_IMAGE, NS, ROOT, VM_KUBE_CONTEXTS, Env, LabError, gen_secret, info, kc, kn, ok, output, run,
-    succeeds, wait_until, warn, write_if_changed,
+    succeeds, wait_until, write_if_changed,
 )
 
 SSH_KEY = BUILD_DIR / "vm-ssh-key"
@@ -407,6 +408,58 @@ def uncordon_node(node_name: str) -> None:
 
 
 # ---- A レコードと証明書の退避 ----
+CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
+
+
+def zone_candidates(host: str) -> list[str]:
+    """ホスト名から、Cloudflare のゾーン名の候補を長い順に（litellm-lab.example.com → [litellm-lab.example.com, example.com]）。"""
+    labels = host.strip(".").split(".")
+    return [".".join(labels[i:]) for i in range(len(labels) - 1)]
+
+
+def _cloudflare(env: Env, method: str, path: str, body: dict | None = None) -> dict:
+    req = urllib.request.Request(f"{CLOUDFLARE_API}{path}", method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": f"Bearer {env.get('LAB_CLOUDFLARE_API_TOKEN')}",
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            out = json.load(r)
+    except urllib.error.HTTPError as e:
+        out = json.load(e)
+    if not out.get("success"):
+        raise LabError(f"Cloudflare の API が失敗しました（{method} {path}）: {out.get('errors')}")
+    return out
+
+
+def ensure_a_record(env: Env, ip: str) -> None:
+    """ホスト名 → 浮動 IP の A レコードを Cloudflare に作る（あれば IP を直す。プロキシは使わず DNS のみ、TTL は自動）。
+    LAB_CLOUDFLARE_API_TOKEN（Zone / DNS / Edit と Zone / Zone / Read）で足りる（ユーザーの指示 2026-10-30）。"""
+    host = env.hostname
+    zone = None
+    for name in zone_candidates(host):
+        found = _cloudflare(env, "GET", f"/zones?name={name}")["result"]
+        if found:
+            zone = found[0]
+            break
+    if zone is None:
+        raise LabError(f"{host} のゾーンが Cloudflare のトークンで見えません（トークンの Zone Resources にそのゾーンが要ります）")
+    records = _cloudflare(env, "GET", f"/zones/{zone['id']}/dns_records?type=A&name={host}")["result"]
+    body = {"type": "A", "name": host, "content": ip, "ttl": 1, "proxied": False,
+            "comment": "litellm-agent-gateway-lab（./lab が管理）"}
+    if not records:
+        _cloudflare(env, "POST", f"/zones/{zone['id']}/dns_records", body)
+        info(f"Cloudflare に A レコードを作りました: {host} → {ip}（DNS のみ）")
+    elif records[0]["content"] != ip or records[0].get("proxied"):
+        _cloudflare(env, "PATCH", f"/zones/{zone['id']}/dns_records/{records[0]['id']}", body)
+        info(f"Cloudflare の A レコードを直しました: {host} → {ip}（前: {records[0]['content']}）")
+    else:
+        ok(f"Cloudflare の A レコードは最新です: {host} → {ip}")
+    for extra in records[1:]:
+        _cloudflare(env, "DELETE", f"/zones/{zone['id']}/dns_records/{extra['id']}")
+        info(f"余分な A レコードを消しました: {host} → {extra['content']}")
+
+
 def wait_for_a_record(env: Env, ip: str) -> None:
     """手持ちの DNS の A レコード（ホスト名 → 浮動 IP）が引けるまで待つ。引けない間は手順を知らせる。"""
     import sys
@@ -422,8 +475,7 @@ def wait_for_a_record(env: Env, ip: str) -> None:
             ok(f"{host} が {ip} に解決できました")
             return
         if not told:
-            warn(f"手持ちの DNS（Cloudflare）に A レコードを足してください: {host}  →  {ip}（プロキシは使わず DNS のみ）\n"
-                 "  （反映されるまで待ちます。Ctrl-C で中断しても、もう一度 ./lab up を流せば続きから進みます）")
+            info(f"{host} が {ip} に解決できるまで待ちます（Cloudflare に入れた A レコードの反映待ち）")
             told = True
         if time.monotonic() - start > 3600:
             raise LabError(f"{host} が 1 時間たっても {ip} に解決できません（A レコードを確かめてください）")
