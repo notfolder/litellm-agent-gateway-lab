@@ -656,10 +656,18 @@ def empty_buckets(env: Env, infra: Infra) -> None:
             # 解除できる保持ポリシー（GOVERNANCE 相当）は外してから消す
             bucket.retention_period = None
             bucket.patch()
+        # 版も含めて 100 件ずつまとめて消す（Blob.delete は版を受けない。総当たりの記録で 10 万件を超えることがある）
         n = 0
+        chunk: list = []
         for blob in client.list_blobs(name, versions=True):
-            blob.delete(generation=blob.generation)
-            n += 1
+            chunk.append(blob)
+            if len(chunk) == 100:
+                bucket.delete_blobs(chunk, preserve_generation=True, on_error=lambda b: None)
+                n += len(chunk)
+                chunk = []
+        if chunk:
+            bucket.delete_blobs(chunk, preserve_generation=True, on_error=lambda b: None)
+            n += len(chunk)
         bucket.delete()
         info(f"バケット {name} を空にして消しました（{n} 版）")
 
