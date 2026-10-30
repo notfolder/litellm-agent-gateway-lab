@@ -18,6 +18,9 @@ from . import render
 from .core import Env, LabError, info, ok, port_forward
 
 REGION = "us-east-1"
+# boto3 1.36 以降の既定（送信時のチェックサム、aws-chunked）を GCS の XML API が SignatureDoesNotMatch で拒む。
+# S3 互換のストレージ向けの公式の設定（AWS S3 と RustFS には害が無い。配備で判明 2026-10-30）
+CHECKSUM_WHEN_REQUIRED = {"request_checksum_calculation": "when_required", "response_checksum_validation": "when_required"}
 
 
 def s3_client(endpoint: str, access_key: str, secret_key: str):
@@ -26,7 +29,7 @@ def s3_client(endpoint: str, access_key: str, secret_key: str):
 
     return boto3.client("s3", endpoint_url=endpoint, aws_access_key_id=access_key,
                         aws_secret_access_key=secret_key, region_name=REGION,
-                        config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 3}))
+                        config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 3}, **CHECKSUM_WHEN_REQUIRED))
 
 
 def cloud_user_client(env: Env, user: str):
@@ -39,7 +42,8 @@ def cloud_user_client(env: Env, user: str):
     cloud = clouds.for_env(env)
     access, secret = user_credentials(env, user)
     return boto3.client("s3", region_name=env.vm_region, aws_access_key_id=access, aws_secret_access_key=secret,
-                        endpoint_url=cloud.s3_endpoint(env) or None, config=Config(retries={"max_attempts": 3}))
+                        endpoint_url=cloud.s3_endpoint(env) or None,
+                        config=Config(retries={"max_attempts": 3}, **CHECKSUM_WHEN_REQUIRED))
 
 
 @contextlib.contextmanager
