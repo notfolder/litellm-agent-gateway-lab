@@ -253,7 +253,7 @@ def _cluster_vm(env: Env) -> None:
     if not env.is_provided:
         _provision_vm(env, pubkey)
     infra = vm.load_infra(env)
-    vm.ensure_access(env)
+    vm.ensure_access(env, forward=False)   # 初期化の前は k3s が無いので転送は張らない
     vm.init_nodes(env, infra, pubkey)
     vm.ensure_forward(env, infra)
     wait_until(300, "全ノードの Ready", kc("wait", "--for=condition=Ready", "nodes", "--all", "--timeout=5s"))

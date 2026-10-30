@@ -996,6 +996,8 @@ class CloudLayerTest(unittest.TestCase):
         self.assertIn(render.EGRESS_CA_NAME, [v["name"] for v in o["volumes"]])
         # 操作者の Mac も中継を通す: 環境変数と helm の --ca-file（チャートを取るサブコマンドだけ）
         saved = dict(os.environ)
+        import labtool.core as core
+        core.MAC_PROXY_CHECK = False
         try:
             m = VmTargetTest().vm("gcp-vm", LAB_EGRESS_PROXY_MAC="http://203.0.113.20:3128", LAB_EGRESS_CA_FILE=ca)
             m.apply_mac_proxy()
@@ -1007,4 +1009,5 @@ class CloudLayerTest(unittest.TestCase):
             os.environ.clear()
             os.environ.update(saved)
             HELM_EXTRA.clear()
+            core.MAC_PROXY_CHECK = True
         os.unlink(ca)

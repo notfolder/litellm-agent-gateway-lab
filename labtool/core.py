@@ -14,6 +14,7 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -380,6 +381,24 @@ class Env:
                      "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "NODE_EXTRA_CA_CERTS"):
             os.environ[name] = str(ca)
         HELM_EXTRA[:] = ["--ca-file", str(ca)]
+        # 中継と CA が合っているか確かめる（managed で中継の VM を作り直すと、手元の CA が古いまま最初の API を呼んでしまう）
+        if not MAC_PROXY_CHECK:
+            return
+        try:
+            ctx = ssl.create_default_context(cafile=str(ca))
+            urllib.request.urlopen("https://storage.googleapis.com/", timeout=15, context=ctx).close()
+        except urllib.error.HTTPError:
+            pass   # 応答が返れば中継と CA は正しい（状態コードは問わない）
+        except Exception as e:  # noqa: BLE001 中継に届かない、CA が合わない
+            if self.is_provided or not self.egress_proxy_vm:
+                raise LabError(f"Mac から中継 {proxy} を通せません（{type(e).__name__}: {str(e)[:120]}）。"
+                               "LAB_EGRESS_PROXY_MAC と LAB_EGRESS_CA_FILE を確かめてください") from e
+            warn(f"Mac から中継 {proxy} を通せないので、この実行は中継を使いません（中継の VM を作り直すと CA を取り直すまで合わない。"
+                 f"{type(e).__name__}）")
+            for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy", "REQUESTS_CA_BUNDLE",
+                         "SSL_CERT_FILE", "AWS_CA_BUNDLE", "CURL_CA_BUNDLE", "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "NODE_EXTRA_CA_CERTS"):
+                os.environ.pop(name, None)
+            HELM_EXTRA.clear()
 
     @property
     def litellm_version(self) -> str:
@@ -539,6 +558,7 @@ def kn(*args: str) -> list[str]:
 
 
 HELM_EXTRA: list[str] = []   # Mac が出口プロキシの中にあるときの --ca-file（Env.apply_mac_proxy が入れる）
+MAC_PROXY_CHECK = True       # apply_mac_proxy が中継の疎通を確かめるか（単体テストは切る）
 
 
 def helm(*args: str) -> list[str]:

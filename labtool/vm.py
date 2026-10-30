@@ -46,7 +46,8 @@ TLS_SECRET = "litellm-tls"
 NODE_INIT_SCRIPT = ROOT / "vm" / "node-init.sh"
 PROXY_INIT_SCRIPT = ROOT / "vm" / "proxy-init.sh"
 K3S_INSTALL_URL = "https://get.k3s.io"
-IP_LOOKUPS = ["https://checkip.amazonaws.com", "https://api.ipify.org"]
+# 操作者の公開 IP の問い合わせ先。中継を通さず、平文（Mac が中継の CA だけを信頼する設定のときに TLS の検証で失敗しないため）
+IP_LOOKUPS = ["http://checkip.amazonaws.com", "http://api.ipify.org"]
 UNRETAINED_PREFIXES = [f"{s}/" for s in render.VM_STORES if s not in render.RETAINED_STORES]
 # .env に provision が書く項目（managed の down で消す）
 PROVISIONED_ENV_KEYS = ["LAB_VM_NODES", "LAB_VM_BUCKET", "LAB_VM_ENTRY_IP_ID", "LAB_VM_PROXY_NODE", "LAB_EGRESS_PROXY",
@@ -236,9 +237,9 @@ def try_load_infra(env: Env) -> Infra | None:
         return None
 
 
-def ensure_access(env: Env) -> None:
+def ensure_access(env: Env, forward: bool = True) -> None:
     """VM に届く状態にする: managed は 22 と 80/443（と中継）の許可を操作者の今の IP に合わせ、ポート転送を確かめる。
-    provided はネットワークを触らず、転送だけ。基盤が無ければ何もしない。"""
+    provided はネットワークを触らず、転送だけ。基盤が無ければ何もしない。forward=False なら許可だけ（初期化の前）。"""
     infra = try_load_infra(env)
     if infra is None or not infra.nodes:
         return
@@ -249,7 +250,8 @@ def ensure_access(env: Env) -> None:
         cloud.allow_web_from(env, web_cidr(env))
         if env.egress_proxy_vm:
             cloud.allow_proxy_from(env, cidr)
-    ensure_forward(env, infra)
+    if forward:
+        ensure_forward(env, infra)
 
 
 def refresh_public_ips(env: Env, infra: Infra) -> bool:
@@ -267,14 +269,28 @@ def refresh_public_ips(env: Env, infra: Infra) -> bool:
     return changed
 
 
+def _ssh_ok(env: Env, node: Node) -> bool:
+    """SSH でログインして true が返るか（22 が開いた直後は sshd がまだ鍵を用意しておらず、banner exchange で切れる）。
+    台を作り直して鍵が変わっていれば（同じ識別子の古い行が known_hosts に残る）、その行を消して次で受け入れる。"""
+    try:
+        proc = subprocess.run([*ssh_base(env, node), "true"], capture_output=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if proc.returncode != 0 and b"Host key verification failed" in proc.stderr:
+        info(f"{node.id} のホスト鍵が変わっています（台の作り直し）。known_hosts の古い行を消します")
+        forget_host(node)
+        proc = subprocess.run([*ssh_base(env, node), "true"], capture_output=True, timeout=30)
+    return proc.returncode == 0
+
+
 def wait_ssh(env: Env, nodes: list[Node], infra: Infra | None = None, timeout: int = 600) -> None:
     def reachable() -> bool:
-        if all(n.public_ip and _port_open(n.public_ip, 22) for n in nodes):
+        if all(n.public_ip and _port_open(n.public_ip, 22) and _ssh_ok(env, n) for n in nodes):
             return True
         if infra is not None:
             refresh_public_ips(env, infra)
         return False
-    wait_until(timeout, f"{len(nodes)} 台の SSH（22）", reachable)
+    wait_until(timeout, f"{len(nodes)} 台の SSH（22）でログイン", reachable)
 
 
 # ---- kubeconfig とポート転送 ----
@@ -313,7 +329,7 @@ def ensure_forward(env: Env, infra: Infra, avoid: str | None = None) -> None:
     if forward_alive() and (avoid is None or forward_target() != avoid):
         return
     refresh_public_ips(env, infra)
-    nodes = [n for n in infra.nodes if n.id != avoid and n.public_ip and _port_open(n.public_ip, 22)]
+    nodes = [n for n in infra.nodes if n.id != avoid and n.public_ip and _port_open(n.public_ip, 22) and _ssh_ok(env, n)]
     if not nodes:
         raise LabError("SSH で届くノードがありません（./lab cluster で作るか、起動を待ってください）")
     stop_forward()
@@ -457,11 +473,18 @@ def build_node(env: Env, infra: Infra) -> Node:
 def _context_tar(context_dir: Path, ca_text: str) -> bytes:
     """ビルドの文脈（__pycache__ と .pyc を除く）に egress-ca.pem（中継の CA。無ければ空）を足した tar。"""
     buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w") as tar:
+    # GNU 形式にする。既定の PAX 形式は小数の mtime を拡張ヘッダに書き、Docker のビルダーが別のファイルを Dockerfile と読み違える
+    # （配備で判明 2026-10-31）
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.GNU_FORMAT) as tar:
         for p in sorted(context_dir.rglob("*")):
             if not p.is_file() or "__pycache__" in p.parts or p.suffix == ".pyc" or p.name == "egress-ca.pem":
                 continue
-            tar.add(p, arcname=str(p.relative_to(context_dir)))
+            ti = tar.gettarinfo(p, arcname=str(p.relative_to(context_dir)))
+            ti.mtime = int(ti.mtime)
+            ti.uid = ti.gid = 0
+            ti.uname = ti.gname = "root"
+            with open(p, "rb") as f:
+                tar.addfile(ti, f)
         data = ca_text.encode()
         ti = tarfile.TarInfo("egress-ca.pem")
         ti.size = len(data)
