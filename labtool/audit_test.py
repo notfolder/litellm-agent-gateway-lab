@@ -482,6 +482,7 @@ def failover_audit_check(env: Env):
     """障害の試験の監査ログの欠けの照合（変更設計書 10 章）。Pod を消す場面と計画的な切り替えでは 0 件。
     ノードを止める場面では、止める直前の書き出し前の分（LAB_AUDIT_FLUSH_SECONDS 秒）だけを許す。"""
     flush = float(env.get("LAB_AUDIT_FLUSH_SECONDS", "10"))
+    set_buckets(env)   # 実名のバケット（接頭辞付き）。障害の試験の入口は audit_test() を通らない（2026-10-30 に判明）
 
     def check(results: list[dict]) -> None:
         since = min(datetime.fromtimestamp(r["t0"] - 30, tz=timezone.utc) for r in results)
