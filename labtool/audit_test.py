@@ -329,9 +329,9 @@ def audit_test(env: Env) -> None:
                 v.get("call_id") == ids["chat"] and v.get("viewer_email") == TEST_USER for v in views["rows"]))
             vkeys = [o["Key"] for o in s3.list_objects_v2(Bucket=BUCKETS["access"], Prefix="view/").get(
                 "Contents", [])]
-            c.check("閲覧の記録も消せない", lambda: vkeys and denied(s3, BUCKETS["access"], vkeys[-1],
-                                                                    s3.head_object(Bucket=BUCKETS["access"],
-                                                                                   Key=vkeys[-1]).get("VersionId")))
+            c.check("閲覧の記録も消せない", lambda: vkeys and denied(
+                s3, BUCKETS["access"], vkeys[-1], objstore.object_version(s3, BUCKETS["access"], vkeys[-1]),
+                codes=("AccessDenied", "RetentionPolicyNotMet")))
 
             # 精算（円の請求の単位、利用者なし、審査の分の付け方）
             month = datetime.now(JST).strftime("%Y-%m")
