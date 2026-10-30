@@ -52,4 +52,4 @@ spec:
                   value: 512MB
               resources:
                 requests: { cpu: 100m, memory: 256Mi }
-                limits: { memory: 1Gi }
+                limits: { memory: 2Gi }   # 1 時間に 10 万件（API キーの総当たり）でも整形できる量（2026-10-30 の実測: 3Gi で 66 秒）

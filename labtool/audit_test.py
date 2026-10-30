@@ -77,7 +77,7 @@ def raw_records(s3, since: str) -> list[dict]:
     return [r for r in rows if (r.get("ts_start") or "") >= since]
 
 
-def run_audit_job(env: Env, name: str, args: list[str], secret: str, memory: str = "1Gi", timeout: int = 900) -> str:
+def run_audit_job(env: Env, name: str, args: list[str], secret: str, memory: str = "2Gi", timeout: int = 900) -> str:
     """監査のイメージで 1 回限りの Job を流し、ログを返す（整形、合成データ、速さの試験）。"""
     from .stages import load_audit_image
     image = load_audit_image()
