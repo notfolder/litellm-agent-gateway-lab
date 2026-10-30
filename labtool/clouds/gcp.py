@@ -393,7 +393,14 @@ def ensure_static_keys(env: Env, prefix: str, have: set[str]) -> dict[str, tuple
                 meta.state = "INACTIVE"
                 meta.update()
             meta.delete()
-        meta, secret = client.create_hmac_key(service_account_email=email, project_id=env.gcp_project)
+        for attempt in range(12):   # 作った直後のサービスアカウントは数秒〜数十秒は 404 になる
+            try:
+                meta, secret = client.create_hmac_key(service_account_email=email, project_id=env.gcp_project)
+                break
+            except _NotFound():
+                if attempt == 11:
+                    raise
+                time.sleep(5)
         keys[user] = (meta.access_id, secret)
         info(f"{email} の HMAC キーを作りました（Kubernetes の Secret にだけ置く）")
     for bucket_name, entries in bucket_bindings(env, prefix).items():

@@ -731,6 +731,15 @@ class CloudLayerTest(unittest.TestCase):
     """クラウド固有層（labtool/clouds/）: 2 つの実装が同じ関数の組を持つこと、ネットワークの計画、VM の初期化の描画
     （変更設計書 3 章〜6 章）。クラウドの API は呼ばない。"""
 
+    def test_vm_drops_env_static_keys(self):
+        """VM の環境では .env の静的キー（Mac の RustFS 用）を読まない（配備で判明 2026-10-30）。"""
+        from labtool import vm
+        env = VmTargetTest().vm("gcp-vm")
+        env.values.update({"S3_LITELLM_WRITER_KEY": "k", "S3_LITELLM_WRITER_SECRET": "s", "RUSTFS_ACCESS_KEY": "a"})
+        dropped = vm.drop_env_static_keys(env)
+        self.assertEqual(sorted(dropped), ["RUSTFS_ACCESS_KEY", "S3_LITELLM_WRITER_KEY", "S3_LITELLM_WRITER_SECRET"])
+        self.assertIsNone(env.get("S3_LITELLM_WRITER_KEY") or None)
+
     def test_cloudflare_zone_candidates(self):
         """A レコードを作るときのゾーン名の候補: ホスト名から長い順に、TLD だけは除く。"""
         from labtool import vm

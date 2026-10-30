@@ -102,6 +102,8 @@ def _preflight_vm(env: Env) -> None:
                       (render.JUDGE_KEY_ENV, "審査官の Anthropic の API キー")):
         if not env.get(key):
             raise LabError(f"LAB_TARGET={env.target} には .env の {key}（{what}）が要ります")
+    if vm.drop_env_static_keys(env):
+        info("VM の環境では .env の静的キー（S3_*、RUSTFS_*）は読みません（Kubernetes の Secret にだけ置く）")
     cloud = clouds.for_env(env)
     ident = cloud.identity(env)
     env.values["LAB_BUCKET_PREFIX"] = cloud.bucket_prefix(env, ident)

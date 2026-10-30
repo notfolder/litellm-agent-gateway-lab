@@ -362,19 +362,35 @@ def _read_secret(name: str) -> dict[str, str]:
     return {k: base64.b64decode(v).decode() for k, v in data.items()}
 
 
+def drop_env_static_keys(env: Env) -> list[str]:
+    """VM の環境では .env の静的キー（S3_<利用者>_KEY / _SECRET、RUSTFS_*）を読まない。Mac の RustFS 用の値が同じ名前で
+    .env に残っていて、クラウドの Secret に写してしまうため（配備で判明 2026-10-30）。消した名前を返す。"""
+    dropped = []
+    names = [n for user in KEY_SECRETS for n in render.s3_env_names(user)] + ["RUSTFS_ACCESS_KEY", "RUSTFS_SECRET_KEY"]
+    for name in names:
+        if env.values.pop(name, None):
+            dropped.append(name)
+    return dropped
+
+
 def load_static_keys(env: Env) -> set[str]:
-    """Kubernetes の Secret にある静的キーを Env に載せる（S3_<利用者>_KEY / _SECRET。.env には書かない）。見つかった利用者を返す。"""
+    """Kubernetes の Secret にある静的キーを Env に載せる（S3_<利用者>_KEY / _SECRET。.env には書かない）。見つかった利用者を返す。
+    同じ実行で一度載せた値は使い回す。"""
     found = set()
     for user, (secret, key_item, secret_item) in KEY_SECRETS.items():
         key_name, secret_name = render.s3_env_names(user)
-        if env.get(key_name) and env.get(secret_name):
+        if user in _loaded_users and env.get(key_name) and env.get(secret_name):
             found.add(user)
             continue
         data = _read_secret(secret)
         if data.get(key_item) and data.get(secret_item):
             env.values[key_name], env.values[secret_name] = data[key_item], data[secret_item]
             found.add(user)
+            _loaded_users.add(user)
     return found
+
+
+_loaded_users: set[str] = set()
 
 
 def ensure_static_keys(env: Env, cloud, infra: Infra) -> None:
@@ -386,6 +402,7 @@ def ensure_static_keys(env: Env, cloud, infra: Infra) -> None:
     for user, (key, secret) in new.items():
         key_name, secret_name = render.s3_env_names(user)
         env.values[key_name], env.values[secret_name] = key, secret
+        _loaded_users.add(user)
     op_key, op_secret = render.s3_env_names("operator")
     if env.get(op_key) and not _read_secret(KEY_SECRETS["operator"][0]):
         kapply(manifest=secret_manifest(KEY_SECRETS["operator"][0],
