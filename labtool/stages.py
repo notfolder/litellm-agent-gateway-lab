@@ -224,6 +224,7 @@ def _cluster_vm(env: Env) -> None:
     infra.extra["network"] = cloud.ensure_network(env)
     infra.network_id = infra.extra["network"].get("vpc_id") or infra.extra["network"].get("network", "")
     cloud.allow_ssh_from(env, vm.operator_cidr(env))
+    cloud.allow_web_from(env, vm.web_cidr(env))
     infra.entry_ip, infra.entry_ip_id = cloud.ensure_entry_ip(env)
     infra.bucket_prefix = env.get("LAB_BUCKET_PREFIX") or cloud.bucket_prefix(env, cloud.identity(env))
     infra.buckets = cloud.ensure_buckets(env, infra.bucket_prefix)

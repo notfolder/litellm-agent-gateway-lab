@@ -106,6 +106,15 @@ def operator_cidr(env: Env, lookup=None) -> str:
     return f"{text}/32"
 
 
+def web_cidr(env: Env) -> str:
+    """80/443 を開ける送信元。.env の LAB_WEB_ALLOW_CIDR があればそれ、無ければ 22 と同じ（操作者の IP）。
+    公開の入口には API キーの総当たりが来るので、検証環境は操作者の回線だけに開く（ユーザーの判断 2026-10-30: A）。"""
+    fixed = env.get("LAB_WEB_ALLOW_CIDR", "").strip()
+    if fixed:
+        return fixed if "/" in fixed else f"{fixed}/32"
+    return operator_cidr(env)
+
+
 def _lookup_public_ip() -> str:
     for url in IP_LOOKUPS:
         try:
@@ -302,12 +311,13 @@ def load_infra(env: Env) -> Infra:
 
 
 def ensure_access(env: Env) -> None:
-    """VM に届く状態にする: 22 の許可を操作者の今の IP に合わせ、ポート転送を確かめる。基盤が無ければ何もしない。"""
+    """VM に届く状態にする: 22 と 80/443 の許可を操作者の今の IP に合わせ、ポート転送を確かめる。基盤が無ければ何もしない。"""
     cloud = clouds.for_env(env)
     infra = cloud.discover(env)
     if infra is None or not infra.nodes:
         return
     cloud.allow_ssh_from(env, operator_cidr(env))
+    cloud.allow_web_from(env, web_cidr(env))
     save_infra(infra)
     ensure_forward(env, infra)
 

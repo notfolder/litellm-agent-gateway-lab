@@ -87,7 +87,7 @@ ChatGPT:         {yn(env.has_chatgpt())}  → Codex 用のモデルと二次判�
             print(f"VM:              {', '.join(f'{n.id}({n.public_ip})' for n in infra.nodes)}\n"
                   f"浮動 IP:         {infra.entry_ip}（持ち主 {holder or '無し'}）\n"
                   f"k3s の版:        {', '.join(sorted(set(vm.node_versions().values())))}\n"
-                  f"22 の許可:       {vm.operator_cidr(env)}")
+                  f"22 の許可:       {vm.operator_cidr(env)}\n80/443 の許可:   {vm.web_cidr(env)}")
         except LabError as e:
             warn(str(e))
     if http_ok(f"{env.base_url}/health/liveliness"):

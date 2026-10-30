@@ -210,10 +210,10 @@ def ensure_network(env: Env) -> dict:
             "tag": names["tag"]}
 
 
-def allow_ssh_from(env: Env, cidr: str) -> None:
+def _allow_from(env: Env, rule: str, cidr: str, what: str) -> None:
     compute = _compute()
     fws = compute.FirewallsClient()
-    name = _names(env)["fw_ssh"]
+    name = _names(env)[rule]
     try:
         fw = fws.get(project=env.gcp_project, firewall=name)
     except _NotFound():
@@ -221,7 +221,16 @@ def allow_ssh_from(env: Env, cidr: str) -> None:
     if list(fw.source_ranges) == [cidr]:
         return
     fws.patch(project=env.gcp_project, firewall=name, firewall_resource=compute.Firewall(source_ranges=[cidr])).result()
-    info(f"22 の許可を {cidr} だけにしました（前: {', '.join(fw.source_ranges) or '無し'}）")
+    info(f"{what} の許可を {cidr} だけにしました（前: {', '.join(fw.source_ranges) or '無し'}）")
+
+
+def allow_ssh_from(env: Env, cidr: str) -> None:
+    _allow_from(env, "fw_ssh", cidr, "22")
+
+
+def allow_web_from(env: Env, cidr: str) -> None:
+    """80/443 の送信元を操作者の IP（LAB_WEB_ALLOW_CIDR か 22 と同じ自動検出）だけにする（ユーザーの判断 2026-10-30: A）。"""
+    _allow_from(env, "fw_web", cidr, "80/443")
 
 
 # ---- 浮動 IP ----

@@ -740,6 +740,15 @@ class CloudLayerTest(unittest.TestCase):
         self.assertEqual(sorted(dropped), ["RUSTFS_ACCESS_KEY", "S3_LITELLM_WRITER_KEY", "S3_LITELLM_WRITER_SECRET"])
         self.assertIsNone(env.get("S3_LITELLM_WRITER_KEY") or None)
 
+    def test_web_cidr_defaults_to_operator(self):
+        """80/443 の送信元: LAB_WEB_ALLOW_CIDR があればそれ、無ければ 22 と同じ操作者の IP（2026-10-30 の判断 A）。"""
+        from labtool import vm
+        env = VmTargetTest().vm("gcp-vm")
+        env.values["LAB_SSH_ALLOW_CIDR"] = "203.0.113.5"
+        self.assertEqual(vm.web_cidr(env), "203.0.113.5/32")
+        env.values["LAB_WEB_ALLOW_CIDR"] = "0.0.0.0/0"
+        self.assertEqual(vm.web_cidr(env), "0.0.0.0/0")
+
     def test_cloudflare_zone_candidates(self):
         """A レコードを作るときのゾーン名の候補: ホスト名から長い順に、TLD だけは除く。"""
         from labtool import vm

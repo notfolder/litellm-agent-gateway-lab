@@ -71,7 +71,7 @@ def s3_endpoint(env: Env) -> str:
 # ---- ネットワーク ----
 def ensure_network(env: Env) -> dict:
     """VPC、公開サブネット 3 つ（別 AZ）、インターネットゲートウェイ、経路、S3 のゲートウェイエンドポイント、
-    セキュリティグループ（80/443 は全体、台の間はすべて。22 は allow_ssh_from）。"""
+    セキュリティグループ（台の間はすべて。22 は allow_ssh_from、80/443 は allow_web_from が操作者の IP に絞る）。"""
     ec2 = _ec2(env)
     plan = network_plan(env.vm_cidr, subnets_per_node=True)
     vpcs = ec2.describe_vpcs(Filters=_filters(env))["Vpcs"]
@@ -135,7 +135,7 @@ def ensure_network(env: Env) -> dict:
     else:
         sg_id = ec2.create_security_group(
             GroupName=f"{env.vm_prefix}-nodes", VpcId=vpc_id,
-            Description="litellm-lab vm nodes: 80/443 from anywhere, 22 from the operator, everything between nodes",
+            Description="litellm-lab vm nodes: 80/443 and 22 from the operator, everything between nodes",
             TagSpecifications=_tag_spec(env, "security-group", f"{env.vm_prefix}-nodes"))["GroupId"]
         ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[
             {"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "HTTP"}]},
@@ -147,22 +147,34 @@ def ensure_network(env: Env) -> dict:
     return {"vpc_id": vpc_id, "subnet_ids": subnet_ids, "security_group_id": sg_id, "plan": plan, "azs": azs}
 
 
-def allow_ssh_from(env: Env, cidr: str) -> None:
-    """22 の送信元を操作者の今の IP（cidr）だけにする。他の送信元の 22 は消す。"""
+def _allow_ports(env: Env, ports: list[int], cidr: str, what: str) -> None:
+    """ports の送信元を cidr だけにする（他の送信元は消す）。"""
     ec2 = _ec2(env)
     sgs = ec2.describe_security_groups(Filters=_filters(env))["SecurityGroups"]
     if not sgs:
         return
     sg = sgs[0]
-    ssh_rules = [p for p in sg["IpPermissions"] if p.get("FromPort") == 22 and p.get("ToPort") == 22]
-    current = {r["CidrIp"] for p in ssh_rules for r in p.get("IpRanges", [])}
-    if current == {cidr} and all(not p.get("UserIdGroupPairs") and not p.get("Ipv6Ranges") for p in ssh_rules):
+    rules = [p for p in sg["IpPermissions"] if p.get("FromPort") in ports and p.get("ToPort") == p.get("FromPort")]
+    current = {r["CidrIp"] for p in rules for r in p.get("IpRanges", [])}
+    covered = {p.get("FromPort") for p in rules}
+    if current == {cidr} and covered == set(ports) and all(not p.get("UserIdGroupPairs") and not p.get("Ipv6Ranges") for p in rules):
         return
-    if ssh_rules:
-        ec2.revoke_security_group_ingress(GroupId=sg["GroupId"], IpPermissions=ssh_rules)
+    if rules:
+        ec2.revoke_security_group_ingress(GroupId=sg["GroupId"], IpPermissions=rules)
     ec2.authorize_security_group_ingress(GroupId=sg["GroupId"], IpPermissions=[
-        {"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": cidr, "Description": "lab-operator"}]}])
-    info(f"22 の許可を {cidr} だけにしました" + (f"（前: {', '.join(sorted(current)) or '無し'}）" if current != {cidr} else ""))
+        {"IpProtocol": "tcp", "FromPort": port, "ToPort": port, "IpRanges": [{"CidrIp": cidr, "Description": "lab-operator"}]}
+        for port in ports])
+    info(f"{what} の許可を {cidr} だけにしました" + (f"（前: {', '.join(sorted(current)) or '無し'}）" if current != {cidr} else ""))
+
+
+def allow_ssh_from(env: Env, cidr: str) -> None:
+    """22 の送信元を操作者の今の IP（cidr）だけにする。他の送信元の 22 は消す。"""
+    _allow_ports(env, [22], cidr, "22")
+
+
+def allow_web_from(env: Env, cidr: str) -> None:
+    """80/443 の送信元を操作者の IP（LAB_WEB_ALLOW_CIDR か 22 と同じ自動検出）だけにする（ユーザーの判断 2026-10-30: A）。"""
+    _allow_ports(env, [80, 443], cidr, "80/443")
 
 
 # ---- 浮動 IP ----
