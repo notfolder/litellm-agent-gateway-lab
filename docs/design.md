@@ -847,7 +847,7 @@ audit-derived/
 | `view` | `ts`、`viewer_email`、`viewer_role`、`subject_user_id`、`subject_user_email`、`call_id`、`reason`、`client_ip` |
 | `admin` | `ts`、`actor_email`、`action`（`contract_update`、`fx_rate_update`）、`before`、`after`、`base_version`（編集の元にした版） |
 
-どちらも `audit-access` に書く（13 か月、消せない形）。検索アプリは、閲覧の記録を S3 に書けたことを確かめてから本文を返す。
+どちらも `audit-access` に書く（90 日、消せない形）。検索アプリは、閲覧の記録を S3 に書けたことを確かめてから本文を返す。
 
 ### 10.6 整形の定期処理（`apps/audit/audit/compactor.py`）
 
@@ -1016,7 +1016,7 @@ OAuth クライアントは 1 つ（ウェブ アプリケーション）にし�
 | Docker のイメージ・ボリューム | OrbStack | 残る |
 | PostgreSQL（ユーザー、キー、MCP の OAuth トークン、使用額、日次の集計） | クラスタ内の PVC（3 台） | **消える**（作り直すたびにまっさらから試すため）。ユーザーとキーは `./lab bootstrap` が同じ値で作り直す。Gmail のサインインだけはやり直す |
 | PostgreSQL のバックアップと WAL | RustFS の `pg-backup`（30 日） | **消える**（RustFS がクラスタの中にあるため） |
-| 監査ログ（原本と審査の記録 90 日、閲覧・管理操作の記録 13 か月、整形済み・日次の集計・精算） | RustFS の `audit-raw`、`audit-access`、`audit-derived` | **消える**（検証環境だけの振る舞い。本番の置き場はクラスタの外に置く） |
+| 監査ログ（原本と審査の記録 90 日、閲覧・管理操作の記録 90 日、整形済み・日次の集計・精算） | RustFS の `audit-raw`、`audit-access`、`audit-derived` | **消える**（検証環境だけの振る舞い。本番の置き場はクラスタの外に置く） |
 | chatgpt/ のトークン（`auth.json`） | `${LAB_DATA_DIR}/chatgpt`（SSD） | 残る |
 | `.env`（秘密情報） | リポジトリ直下（Git 管理外） | 残る |
 
@@ -1456,7 +1456,7 @@ flowchart TB
 | registry | AWS: S3 ドライバ `REGISTRY_STORAGE_S3_ROOTDIRECTORY=/images/registry`。GCP: GCS ドライバ（`REGISTRY_STORAGE_GCS_*`、サービスアカウントの JSON キーを Secret `lab-registry-gcs` で）。均一アクセスのバケットは S3 ドライバの ACL を拒むため |
 | k3s のトークンと版 | `cluster/k3s/token`、`cluster/k3s/version`（操作者の S3 クライアント） |
 
-バケットの仕様: S3 は Object Lock 有効（既定の保持なし）、バージョニング、PAB、接頭辞ごとのライフサイクル（`objectstore.vm_lifecycle_rules`。原本 91 日、閲覧記録 401 日、整形済みは Mac と同じ規則、`pg-backup/` `images/` `cluster/` は非現行の版だけ）。GCS はオブジェクト保持ロック（作成時）、バージョニング、公開アクセスの防止、均一なバケットレベルのアクセス（IAM の条件に必須）、同じライフサイクルを `matchesPrefix` で。
+バケットの仕様: S3 は Object Lock 有効（既定の保持なし）、バージョニング、PAB、接頭辞ごとのライフサイクル（`objectstore.vm_lifecycle_rules`。原本 91 日、閲覧記録 91 日、整形済みは Mac と同じ規則、`pg-backup/` `images/` `cluster/` は非現行の版だけ）。GCS はオブジェクト保持ロック（作成時）、バージョニング、公開アクセスの防止、均一なバケットレベルのアクセス（IAM の条件に必須）、同じライフサイクルを `matchesPrefix` で。
 
 保持の付け方: S3 は `put_object(ObjectLockMode, ObjectLockRetainUntilDate)`。GCS（`storage.googleapis.com`）は boto3 の `before-call.s3.PutObject` で `x-amz-object-lock-*` を `x-goog-object-lock-*` に写す（`gcs_object_lock_headers`）。
 

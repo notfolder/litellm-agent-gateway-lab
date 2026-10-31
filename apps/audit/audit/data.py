@@ -194,7 +194,7 @@ class Store:
         return read_body(self.s3, {"key": row["body_key"], "offset": row["body_offset"],
                                    "length": row["body_length"]})
 
-    # ---- 閲覧の記録と管理操作の記録（audit-access。13 か月、消せない形） ----
+    # ---- 閲覧の記録と管理操作の記録（audit-access。原本と同じ 90 日、消せない形） ----
     def _access_key(self, kind: str) -> str:
         t = now_jst()
         stamp = t.strftime("%Y%m%dT%H%M%S") + f"{t.microsecond:06d}JST"

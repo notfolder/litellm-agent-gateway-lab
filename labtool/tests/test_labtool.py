@@ -316,7 +316,7 @@ class ObjectStoreSpecTest(unittest.TestCase):
         b = render.s3_buckets(env(LAB_AUDIT_LOCK_MODE="COMPLIANCE", LAB_AUDIT_RETENTION_DAYS="30"))
         self.assertEqual(b["audit-raw"]["lock"], {"Mode": "COMPLIANCE", "Days": 30})
         self.assertEqual(b["audit-raw"]["lifecycle"][0]["Expiration"], {"Days": 31})
-        self.assertEqual(b["audit-access"]["lock"]["Days"], 400)
+        self.assertEqual(b["audit-access"]["lock"]["Days"], 90)   # 閲覧記録も原本と同じ 90 日（2026-10-31）
         self.assertIsNone(b["audit-derived"]["lock"])
         self.assertFalse(b["pg-backup"]["versioning"])
 
@@ -897,7 +897,7 @@ class CloudLayerTest(unittest.TestCase):
         e = VmTargetTest().vm()
         rules = {r["ID"]: r for r in objectstore.vm_lifecycle_rules(e)}
         self.assertEqual(rules["audit-raw-all"]["Filter"], {"Prefix": "audit-raw/"})
-        self.assertEqual((rules["audit-raw-all"]["Expiration"]["Days"], rules["audit-access-all"]["Expiration"]["Days"]), (91, 401))
+        self.assertEqual((rules["audit-raw-all"]["Expiration"]["Days"], rules["audit-access-all"]["Expiration"]["Days"]), (91, 91))
         self.assertEqual(rules["audit-derived-meta"]["Filter"], {"Prefix": "audit-derived/meta/"})
         self.assertEqual(rules["pg-backup-versions"]["NoncurrentVersionExpiration"], {"NoncurrentDays": 1})
         self.assertNotIn("Expiration", rules["images-versions"])

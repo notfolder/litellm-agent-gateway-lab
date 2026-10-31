@@ -525,7 +525,7 @@ def s3_buckets(env: Env) -> dict[str, dict]:
     保持の日数 + 1 日で期限切れにする（保持が切れた版から消える）。"""
     mode = env.get("LAB_AUDIT_LOCK_MODE", "GOVERNANCE")
     raw_days = int(env.get("LAB_AUDIT_RETENTION_DAYS", "90"))
-    access_days = int(env.get("LAB_AUDIT_ACCESS_RETENTION_DAYS", "400"))
+    access_days = int(env.get("LAB_AUDIT_ACCESS_RETENTION_DAYS", "90"))   # 原本と同じ（2026-10-31 の決定）
     return {
         AUDIT_RAW: {"lock": {"Mode": mode, "Days": raw_days}, "versioning": True,
                     "lifecycle": [_lifecycle("all", "", raw_days + 1, raw_days + 1)]},
@@ -680,7 +680,7 @@ def retention_settings(env: Env) -> dict[str, str]:
     if not env.is_vm:
         return {"RAW_RETENTION_DAYS": "", "ACCESS_RETENTION_DAYS": "", "RETENTION_MODE": ""}
     return {"RAW_RETENTION_DAYS": env.get("LAB_AUDIT_RETENTION_DAYS", "90"),
-            "ACCESS_RETENTION_DAYS": env.get("LAB_AUDIT_ACCESS_RETENTION_DAYS", "400"),
+            "ACCESS_RETENTION_DAYS": env.get("LAB_AUDIT_ACCESS_RETENTION_DAYS", "90"),
             "RETENTION_MODE": env.get("LAB_AUDIT_LOCK_MODE", "GOVERNANCE")}
 
 

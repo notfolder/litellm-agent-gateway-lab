@@ -256,7 +256,7 @@ def retention_put_args(env: Env, logical: str) -> dict:
     if not env.is_vm or logical not in RETAINED_STORES:
         return {}
     days = int(env.get("LAB_AUDIT_RETENTION_DAYS", "90") if logical == render.AUDIT_RAW
-               else env.get("LAB_AUDIT_ACCESS_RETENTION_DAYS", "400"))
+               else env.get("LAB_AUDIT_ACCESS_RETENTION_DAYS", "90"))
     until = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=days)
     return {"ObjectLockMode": env.get("LAB_AUDIT_LOCK_MODE", "GOVERNANCE"), "ObjectLockRetainUntilDate": until}
 

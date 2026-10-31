@@ -92,7 +92,7 @@ flowchart TB
                 end
             end
         end
-        S3[("バケット × 1<br/>audit-raw/（保持 90 日）audit-access/（保持 400 日）<br/>audit-derived/ pg-backup/ images/ cluster/")]
+        S3[("バケット × 1<br/>audit-raw/（保持 90 日）audit-access/（保持 90 日）<br/>audit-derived/ pg-backup/ images/ cluster/")]
         KEYS["静的キー × 5〜6（.env の LAB_VM_S3_*）"]
     end
     CLI -->|"SSH の転送（踏み台経由）"| PX -->|"443"| LB
@@ -154,7 +154,7 @@ flowchart LR
 | ディレクトリ | 中身 | 保持 | 書く利用者 |
 |---|---|---|---|
 | `audit-raw/` | 監査ログの原本（`raw/meta`、`raw/body`） | オブジェクト単位、90 日（書くときに付ける） | litellm-writer（追記と保持だけ。読めない・消せない） |
-| `audit-access/` | 閲覧と管理操作の記録 | オブジェクト単位、400 日 | audit-viewer |
+| `audit-access/` | 閲覧と管理操作の記録 | オブジェクト単位、90 日 | audit-viewer |
 | `audit-derived/` | 整形済み（Parquet）、集計、精算、請求の単位 | 無し（ライフサイクルで期限） | audit-compactor、audit-viewer（請求の単位） |
 | `pg-backup/` | PostgreSQL の WAL とバックアップ | 無し | pg-backup（Barman） |
 | `images/` | クラスタの中の registry の保存先 | 無し | registry |
