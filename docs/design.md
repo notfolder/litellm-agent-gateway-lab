@@ -847,7 +847,7 @@ audit-derived/
 | `view` | `ts`、`viewer_email`、`viewer_role`、`subject_user_id`、`subject_user_email`、`call_id`、`reason`、`client_ip` |
 | `admin` | `ts`、`actor_email`、`action`（`contract_update`、`fx_rate_update`）、`before`、`after`、`base_version`（編集の元にした版） |
 
-どちらも `audit-access` に書く（13 か月、消せない形）。検索アプリは、閲覧の記録を S3 に書けたことを確かめてから本文を返す。
+どちらも `audit-access` に書く（90 日、消せない形）。検索アプリは、閲覧の記録を S3 に書けたことを確かめてから本文を返す。
 
 ### 10.6 整形の定期処理（`apps/audit/audit/compactor.py`）
 
@@ -1016,7 +1016,7 @@ OAuth クライアントは 1 つ（ウェブ アプリケーション）にし�
 | Docker のイメージ・ボリューム | OrbStack | 残る |
 | PostgreSQL（ユーザー、キー、MCP の OAuth トークン、使用額、日次の集計） | クラスタ内の PVC（3 台） | **消える**（作り直すたびにまっさらから試すため）。ユーザーとキーは `./lab bootstrap` が同じ値で作り直す。Gmail のサインインだけはやり直す |
 | PostgreSQL のバックアップと WAL | RustFS の `pg-backup`（30 日） | **消える**（RustFS がクラスタの中にあるため） |
-| 監査ログ（原本と審査の記録 90 日、閲覧・管理操作の記録 13 か月、整形済み・日次の集計・精算） | RustFS の `audit-raw`、`audit-access`、`audit-derived` | **消える**（検証環境だけの振る舞い。本番の置き場はクラスタの外に置く） |
+| 監査ログ（原本と審査の記録 90 日、閲覧・管理操作の記録 90 日、整形済み・日次の集計・精算） | RustFS の `audit-raw`、`audit-access`、`audit-derived` | **消える**（検証環境だけの振る舞い。本番の置き場はクラスタの外に置く） |
 | chatgpt/ のトークン（`auth.json`） | `${LAB_DATA_DIR}/chatgpt`（SSD） | 残る |
 | `.env`（秘密情報） | リポジトリ直下（Git 管理外） | 残る |
 
@@ -1373,3 +1373,204 @@ Claude Code の auto mode とゲートウェイの文脈あり審査を併用し
 | プログラムの実行の審査の前提 | 一時的な処理が対象。木のツールと OS・ミドルウェアは安全。実体が読める最後の時点で読む（スクリプトは動かす直前、読めない実体は作る直前、自動で動く場所へ置くものは置く直前） | spec 4.4 |
 | 環境変数の読み方 | 審査官が名前を指定した変数だけを `printenv` で読ませる | 9.4 |
 | 案内の付け方 | 審査官が種類（`advice`）を返し、ゲートウェイが決まった文を添える。判定基準には具体例を書かない | 9.4 |
+
+---
+
+## 21. VM 3 台とオブジェクトストレージだけの環境（`LAB_TARGET=aws-ec2` / `gcp-vm`）
+
+spec 12 章の作り。構成図は [vm_architecture.md](vm_architecture.md)。経緯と配備で分かったことの全文は `.history/2026-10-30-VM環境の共通化とGCP追加/変更設計書.md`、
+`.history/2026-10-30-既存資源からの構築と出口プロキシ/変更設計書.md`、`.history/2026-10-31-内部LBとVM側の防御とZabbix/変更設計書.md`、
+`.history/2026-10-31-台の増減とLiteLLMのメモリ/変更設計書.md`。
+
+### 21.1 層の分け方
+
+| 層 | 置き場 | 内容 |
+|---|---|---|
+| クラウド固有層 | `labtool/clouds/aws_ec2.py`、`gcp.py`（同じ関数の組 `clouds.FUNCTIONS`。単体テストが一致を確かめる） | provision（ネットワーク、バケット、静的キー、VM 3 台、足す台（`ensure_workers` / `list_workers` / `remove_workers`）、内部ロードバランサ、中継（踏み台）の VM、削除。managed だけ）と setup 用の読み取り（`describe_nodes`、`describe_entry_ip`（ロードバランサの識別子 → 内部 IP）、`lb_targets_healthy`、`health_check_ranges`、`meta_ips`、`dns_ips`、`stop_node` / `start_node`、`check_bucket`、`snapshot`、`empty_bucket`）、`destroy_provided`。VM にクラウドの権限は付けない |
+| VM 共通層 | `labtool/vm.py`、`vm/node-init.sh`、`vm/proxy-init.sh` | `.env` の識別子から基盤を組む、SSH（鍵、実行、kubeconfig、転送 3 本: k3s の 6443 はノード経由、入口の 443 と Zabbix の web は踏み台経由）、初期化スクリプト（nftables、Zabbix agent 2 を含む）の描画と SSH での実行、k3s のトークンと版、VM 上のビルド、中継（踏み台、Zabbix サーバー）の VM の初期化、版上げの部品、A レコード、証明書の退避、アンインストール |
+| 監視 | `labtool/zabbix.py` | Zabbix の API（JSON-RPC）でグループ・自動登録・プロキシ・ホスト・入口の HTTP 監視を冪等に登録、Helm チャート、`./lab status` の要約 |
+| 段階 | `labtool/stages.py`、`ops.py` | `is_vm` で分岐。Kubernetes の中は Mac と同じ関数 |
+
+### 21.2 `.env` の項目
+
+| 項目 | 既定 | 意味 |
+|---|---|---|
+| `LAB_TARGET` | | `aws-ec2` / `gcp-vm` |
+| `LAB_INFRA` | `managed` | `managed`: provision が作って下の識別子を書く。`provided`: 既存の物の識別子を人が書く |
+| `LAB_VM_NODES` | | VM の識別子 3 つ（AWS: インスタンス ID、GCP: `<ゾーン>/<名前>`）。順番が台の番号 |
+| `LAB_VM_WORKERS` / `LAB_VM_WORKER_NODES` | `0` / | 足す台（21.12 節）。managed は台数を書き、`./lab` が `<接頭辞>-worker<番号>` を作って一覧を書く。provided は一覧を人が書く |
+| `LAB_LITELLM_MEMORY_REQUEST` / `LAB_LITELLM_MEMORY_LIMIT` | `512Mi` / `1Gi` | LiteLLM 1 つのメモリの予約と上限（21.12 節） |
+| `LAB_VM_SSH_KEY` / `LAB_VM_SSH_USER` | `.build/vm-ssh-key` / `ubuntu` | SSH の秘密鍵と利用者 |
+| `LAB_VM_BUCKET` | | バケット名（1 つ） |
+| `LAB_VM_ENTRY_IP_ID` | | 入口（内部ロードバランサ）の識別子（AWS: NLB の ARN、GCP: 転送ルールの名前）。入口の IP はここから引く |
+| `LAB_VM_BASTION_HOST` / `LAB_VM_BASTION_CIDR` | | 踏み台の SSH の宛先と内部 IP（managed は中継の VM。provision が書く） |
+| `LAB_LOCAL_HOSTNAME` / `LAB_VM_LOCAL_HTTPS_PORT` | / `18443` | Mac 用の別名（A レコード 127.0.0.1、証明書の SAN）と転送口。`Env.base_url` は `https://<別名>:<ポート>` |
+| `LAB_ZABBIX_VM` / `LAB_ZABBIX_SERVER` / `LAB_ZABBIX_API_URL` / `LAB_ZABBIX_API_TOKEN` / `LAB_ZABBIX_ADMIN_PASSWORD` / `LAB_ZABBIX_LOCAL_PORT` | `false` / / / / / `18080` | Zabbix（21.11 節）。`LAB_ZABBIX_VM=true` なら provision と `./lab zabbix` が宛先・トークン・Admin のパスワードを書く |
+| `LAB_VM_S3_<利用者>_KEY` / `_SECRET` | | 静的キー（`LITELLM_WRITER`、`AUDIT_COMPACTOR`、`AUDIT_VIEWER`、`PG_BACKUP`、`REGISTRY`、`OPERATOR`）。Mac の `S3_*` とは別の名前 |
+| `LAB_VM_ARCH` | （VM から読む） | 自作イメージのアーキテクチャ |
+| `LAB_EGRESS_PROXY` / `LAB_EGRESS_CA_FILE` | | VM と Pod が使う中継の URL と CA（PEM） |
+| `LAB_EGRESS_PROXY_MAC` | | `./lab` 自身が使う中継の URL |
+| `LAB_EGRESS_PROXY_VM` | `false` | managed で 4 台目に中継を作り、3 台の直接の外向きを遮断する（検証） |
+| `LAB_VM_CIDR`、`LAB_VM_DISK_GIB`、`LAB_VM_LOCAL_PORT`、`LAB_SSH_ALLOW_CIDR`、`LAB_VM_JUDGE_MODEL`、`LAB_JUDGE_ANTHROPIC_API_KEY`、`LAB_EC2_INSTANCE_TYPE`、`LAB_GCP_*`、`LAB_CLOUDFLARE_API_TOKEN`、`LAB_ACME_EMAIL`、`LAB_ACME_STAGING` | | `.env.example` の説明のとおり。provided では `LAB_VM_CIDR` に VPC の実際の CIDR（nftables が 80/443 を通す範囲） |
+
+### 21.3 構築の流れ（`./lab up`）
+
+```mermaid
+flowchart TB
+    P["preflight<br/>道具（kubectl、helm、ssh）、資格情報、ホスト名、provided の項目"] --> C
+    subgraph C["cluster"]
+        PR["provision（managed だけ）<br/>ネットワーク（通す規則だけ）→ 22 / 中継の許可 → バケット → 静的キー → VM 3 台 → 内部ロードバランサ → 中継（踏み台）の VM<br/>→ .env に書く → 中継の VM を SSH で初期化（mitmproxy、nftables、Zabbix サーバー）して CA を取る"]
+        LI["load_infra（.env の識別子 → API）→ ensure_access（managed は 22 の許可を直す）→ 減らした足す台を外す（21.12 節）"]
+        IN["init_nodes: cluster/k3s/token・version（無ければ作る）→ 足す台の CPU とメモリの確認 → 1 番 → 2 番 → 3 番 → 足す台 を SSH で初期化（nftables、agent 2、k3s）→ 6443 の転送"]
+        KS["全台の Ready → 入口の印 → Traefik（全台に 1 つ、hostPort 80/443）→ 入口の 443 の転送（踏み台経由）→ namespace → NetworkPolicy → SA → 中継の CA → registry → cert-manager（中継と再帰リゾルバ）・CNPG・Barman → ClusterIssuer"]
+        PR --> LI --> IN --> KS
+    end
+    C --> I["images<br/>VM の Docker でビルド（文脈は tar で SSH）→ 127.0.0.1:30500 に push"]
+    I --> S["secrets（.env → Secret。静的キーは LAB_VM_S3_*）"] --> O["objectstore（check_bucket ＋ 自己確認）"] --> D["datastores（Barman の宛先は <バケット>/pg-backup/）"]
+    D --> M["mcp"] --> L["litellm（最大数の計算、優先度、admin-only の経路、A レコード 2 本 → Let's Encrypt（SAN 2 名））"] --> Z["zabbix（21.11 節）"] --> B["bootstrap"] --> AU["audit（検索アプリも admin-only）"] --> CL["clients（転送口の URL）"]
+```
+
+### 21.4 VM の初期化（`vm/node-init.sh`、SSH で `sudo bash -s`）
+
+1. CA（`EGRESS_CA_B64`）を `/usr/local/share/ca-certificates/lab-egress.crt` に置き `update-ca-certificates`
+0. 役割（`ROLE`）: `server`（今の 3 台）か `worker`（足す台。k3s の agent）。以下は両方で同じで、違う所だけ書く
+2. 中継（`EGRESS_PROXY`）を `/etc/environment`、apt、Docker の systemd の drop-in、`k3s.service.env`（足す台は `k3s-agent.service.env`）に書く。`NO_PROXY` は `127.0.0.1,localhost,10.42.0.0/16,10.43.0.0/16,.svc,.cluster.local,169.254.169.254,metadata.google.internal,metadata,<VM の CIDR>,<台の IP>`
+3. nftables（`/etc/nftables.conf`、表 `inet lab` だけを作り直す。`flush ruleset` は kube-proxy と flannel の規則まで消す）
+   - 入り（`prerouting` priority -150。DNAT の前）: lo、`cni0` / `flannel.1` / `docker0`、確立済み、ICMP、DHCP、22 は踏み台と操作者（`ADMIN_CIDRS`）、80/443 は VPC・Pod 網・Service 網とヘルスチェックの送信元（`HC_RANGES`）、6443 / 2379-2380 / 10250 / 10257 / 10259 / 30500 と 8472/udp は全台（今の 3 台と足す台）、10250 は Pod 網、10050 は Zabbix サーバーと Pod 網。ほかは drop
+   - 転送（`forward`）: Pod 網と docker0 から VPC・Pod 網・Service 網・全台・`egress_ok`（中継、踏み台、メタデータ、ロードバランサ）へ。ほかは drop
+   - 出（`output`）: lo、Pod 網、確立済み、ICMP、DHCP、VPC・全台・`egress_ok`。ほかは drop。中継が無い（`EGRESS_PROXY` が空）なら `egress_ok` は `0.0.0.0/0`
+4. Zabbix agent 2（`ZABBIX_SERVER` があるとき）: 公式リポジトリ（arm64 は `ubuntu-arm64/`）から入れ、`Server=<サーバー>,<Pod 網>`、`ServerActive=<サーバー>`、`Hostname=<VM の名前>`、`HostMetadata=litellm-lab-node`
+4.5. k3s の追加の設定（`config.yaml.d`）: `50-lab-metrics.yaml`（server だけ。21.11 節）、`60-lab-reserved.yaml`（`kubelet-arg+: system-reserved=...`。OS と k3s 本体の分。server は CPU 500m・メモリ 2Gi、worker は 250m・1Gi）。2 回目以降に変われば k3s（`k3s` か `k3s-agent`）を再起動する
+5. `ready` があれば Docker を再起動して抜ける（2 回目以降。1〜4.5 は毎回直す）
+6. apt で curl、docker.io
+7. containerd のミラー（`lab-registry:5000` → 自分の NodePort）
+8. k3s: 参加先（今の 3 台）を探し、`config.yaml` を書き、インストールスクリプト。server は `sh -s - server`（`INSTALL_K3S_VERSION`、`K3S_TOKEN`。中継の環境変数は `k3s.service.env` に写る）。worker は `config.yaml` に `server`、`token`（600）、`node-label: litellm-lab/role=worker` を書いて `sh -s - agent`（インストールスクリプトは再実行のたびにサービスの環境ファイルを作り直すので、トークンを環境変数で渡すと版上げで消える）
+9. `touch /var/lib/lab/ready`
+
+クラウド固有の手順は無い（VM はクラウドの API を呼ばない）。中継（踏み台）の VM は `vm/proxy-init.sh`: mitmproxy（PyPI、`--mode regular`、3128）、nftables（22 は操作者と VPC、3128 は VPC と操作者、10051 は VPC、Zabbix の web は 127.0.0.1 だけ）、`LAB_ZABBIX_VM=true` なら Docker Compose（`postgres:16`、`zabbix-server-pgsql`、`zabbix-web-nginx-pgsql` 7.0）と agent 2。
+
+### 21.5 バケット 1 つの配置、権限、保持
+
+`render.store_location(env, 論理名)` → `(バケット, 接頭辞)`。Mac は `(論理名, "")`、EKS 版は `(接頭辞付き, "")`、VM は `(LAB_VM_BUCKET, "<論理名>/")`。
+
+| 使う側 | 渡し方 |
+|---|---|
+| LiteLLM の監査コールバック | `AUDIT_S3_BUCKET`、`AUDIT_S3_KEY_PREFIX`（`audit-raw/`）、`AUDIT_S3_RETENTION_DAYS`（90）、`AUDIT_S3_RETENTION_MODE`。記録に残す鍵は接頭辞なしの論理の鍵 |
+| 監査アプリ | `AUDIT_S3_BUCKET`（空なら従来の `AUDIT_S3_BUCKET_PREFIX` ＋ 論理名）、`AUDIT_ACCESS_RETENTION_DAYS`（400）、`AUDIT_RETENTION_MODE`。`common.Store` が接頭辞を付け外しする |
+| Barman | `destinationPath: s3://<バケット>/pg-backup/litellm-pg` |
+| registry | AWS: S3 ドライバ `REGISTRY_STORAGE_S3_ROOTDIRECTORY=/images/registry`。GCP: GCS ドライバ（`REGISTRY_STORAGE_GCS_*`、サービスアカウントの JSON キーを Secret `lab-registry-gcs` で）。均一アクセスのバケットは S3 ドライバの ACL を拒むため |
+| k3s のトークンと版 | `cluster/k3s/token`、`cluster/k3s/version`（操作者の S3 クライアント） |
+
+バケットの仕様: S3 は Object Lock 有効（既定の保持なし）、バージョニング、PAB、接頭辞ごとのライフサイクル（`objectstore.vm_lifecycle_rules`。原本 91 日、閲覧記録 91 日、整形済みは Mac と同じ規則、`pg-backup/` `images/` `cluster/` は非現行の版だけ）。GCS はオブジェクト保持ロック（作成時）、バージョニング、公開アクセスの防止、均一なバケットレベルのアクセス（IAM の条件に必須）、同じライフサイクルを `matchesPrefix` で。
+
+保持の付け方: S3 は `put_object(ObjectLockMode, ObjectLockRetainUntilDate)`。GCS（`storage.googleapis.com`）は boto3 の `before-call.s3.PutObject` で `x-amz-object-lock-*` を `x-goog-object-lock-*` に写す（`gcs_object_lock_headers`）。
+
+権限（`clouds.s3_user_policies` / `clouds.gcs_bindings`。静的キーは 2 つ。2026-10-31 の決定。`.history/2026-10-31-静的キーを2つに/`）:
+
+論理の利用者（Mac の RustFS と同じ litellm-writer、audit-compactor、audit-viewer、pg-backup ＋ registry ＋ 操作者）はコードに残し、VM の環境では
+`render.VM_KEY_ROLE_OF` で 2 つの鍵の役割に写す。鍵の役割ごとに論理の利用者の権限を合併する（`clouds.role_policies`）。
+
+| 鍵の役割 | 使う Pod | S3（IAM ユーザー） | GCS（サービスアカウント。条件付きバインディング） |
+|---|---|---|---|
+| litellm-writer | LiteLLM | `PutObject` ＋ `PutObjectRetention` on `audit-raw/raw/*` | カスタムロール writer（`objects.create` ＋ `objects.setRetention`）on `audit-raw/raw/` |
+| lab-app | 整形の定期処理、検索アプリ、Barman、registry、構築ツール（操作者） | `ListBucket`・`ListBucketVersions`・バケットの設定の読み取り、`GetObject` on 原本・閲覧記録・整形済み、`PutObject` on `audit-derived/*`、`PutObject` ＋ `PutObjectRetention` on `audit-access/*`、`DeleteObject(Version)` on `audit-derived/*`、`s3:*` on `pg-backup/*` `images/*` `cluster/*` | lister（`objects.list`、`buckets.get`）、objectViewer on `audit-raw/` `audit-access/` `audit-derived/`、writer on `audit-access/`、objectUser on `audit-derived/`、objectAdmin on `pg-backup/` `images/` `cluster/`。JSON キーも持つ（registry の GCS ドライバ） |
+| 両方（Deny） | `DeleteObjectVersion`、`BypassGovernanceRetention`、`PutObjectLegalHold` on `audit-raw/*` `audit-access/*`。`DeleteBucket`、`PutBucketObjectLockConfiguration`、`PutLifecycleConfiguration`、`PutBucketVersioning` | （明示的な拒否は無い。保持ロックが守る。無条件の objectAdmin は誰にも付けない） |
+
+`./lab provider-requirements` が、`.env` のバケット名を埋めた IAM ポリシーの JSON、ライフサイクルの規則、GCS のバインディングを出す（[provider-requests.md](provider-requests.md)）。
+
+### 21.6 VM 上のビルド（`vm.build_and_push_on_node`）
+
+ビルドする台は SSH の転送先（無ければ 1 番）。アーキテクチャは `LAB_VM_ARCH` か `uname -m`。文脈（`litellm/` または `apps/audit/`、`__pycache__` を除く）に `egress-ca.pem`（中継の CA。無ければ空）を足した tar を SSH の標準入力で渡し、`docker build -` → `docker tag` → `docker push 127.0.0.1:30500/<name>:<tag>`（Docker は 127.0.0.0/8 を平文の置き場として扱う）。置き場に同じタグがあれば何もしない。監査アプリの Dockerfile は `egress-ca.pem` に中身があれば OS と pip に信頼させる。
+
+### 21.7 出口プロキシ
+
+| 配る先 | 方法 |
+|---|---|
+| VM、k3s、Docker、apt | 21.4 節 |
+| Pod（LiteLLM、Gmail の MCP、registry、監査アプリ、監査の試験の Job） | `render.add_egress`: 全コンテナに `HTTP(S)_PROXY` / `NO_PROXY`（`render.POD_NO_PROXY`。クラスタの中の名前を列挙）/ `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `AWS_CA_BUNDLE` / `CURL_CA_BUNDLE` と、ConfigMap `lab-egress-ca` のマウント（`/etc/lab-egress/ca.crt`）。LiteLLM は Helm の `envVars` / `volumes` と `DISABLE_AIOHTTP_TRANSPORT=True` |
+| cert-manager | Helm の `http_proxy` / `https_proxy` / `no_proxy`、`extraEnv`、`volumes` / `volumeMounts` |
+| Barman（ObjectStore） | `configuration.endpointCA`（Secret `lab-egress-ca`）と `instanceSidecarConfiguration.env` |
+| DuckDB（監査アプリ） | `SET http_proxy`、`SET ca_cert_file`（環境変数から） |
+| cert-manager の DNS-01 の伝搬確認 | Helm の `dns01RecursiveNameservers=<クラウドの DNS>:53`、`dns01RecursiveNameserversOnly=true`（`clouds.dns_ips`: GCP 169.254.169.254、AWS 169.254.169.253）。Pod から外の権威 DNS（53）へは出られないため |
+| 操作者の Mac | `Env.apply_mac_proxy`: `HTTP(S)_PROXY`、`NO_PROXY=127.0.0.1,localhost,<別名>`、`REQUESTS_CA_BUNDLE` / `SSL_CERT_FILE` / `AWS_CA_BUNDLE` / `CURL_CA_BUNDLE` / `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH` は公開 CA の束（certifi）＋ 中継の CA（`.build/mac-ca-bundle.pem`。中継を通らない転送口の Let's Encrypt の証明書も検証できる）。helm のチャート取得に `--ca-file`。操作者の公開 IP の検出は中継を通さない |
+
+検証の中継の VM（`LAB_EGRESS_PROXY_VM=true`、managed）: サブネットの `.20`、amd64（Zabbix サーバーを載せるときは e2-medium / t3.medium）、`vm/proxy-init.sh` で mitmproxy（`--mode regular`、3128、`block_global=false`）を systemd に。CA は SSH で `.build/egress-ca.pem` に取る。3128 はサブネットと操作者の IP に開ける。3 台の直接の外向きは各台の nftables が遮断する（クラウドのファイアウォールは使わない）。この VM は踏み台（管理系の経路の唯一の入口、Mac の転送の経由地）も兼ねる。`./lab proxy-log` が中継の journal から宛先ホストごとの件数を出す。
+
+**入口と守り（21.4 節の nftables に加えて）**: 入口は内部ロードバランサ（AWS: 内部 NLB、固定の内部 IP × 3 サブネット、クロスゾーン、ターゲットグループ TCP 443 / 80、HC TCP 80 10 秒 × 2。GCP: 静的内部 IP、TCP のヘルスチェック 5 秒 × 2、ゾーンごとの非マネージドインスタンスグループ、バックエンドサービス、転送ルール 80/443）→ 各台の 80/443 → **Traefik の hostPort**（`k8s/traefik-config-vm.yaml`。Service は ClusterIP。k3s の ServiceLB は送信元を書き換えるので使わない）。Traefik の Pod が無い台はヘルスチェックに落ちて外れる。管理系の経路は Middleware `admin-only`（`ipAllowList: [踏み台の CIDR]`。`render.admin_only_manifest`）を、LiteLLM の `/ui` `/login` `/sso` `/metrics`（優先度 95 の IngressRoute `litellm-admin`）と検索アプリの経路（`render.add_admin_middleware`）に付ける。DB と Valkey は `k8s/network-policies.yaml`（PostgreSQL は同じクラスタの Pod・オペレーター・Pooler・移行の Job・直結の LiteLLM・監査アプリ、Pooler は LiteLLM・監査アプリ・移行、Valkey は LiteLLM と Valkey 同士。入りだけ）。
+
+### 21.8 削除
+
+| モード | `./lab down` | `./lab down --all` |
+|---|---|---|
+| managed | 転送 3 本を止め、証明書を退避 → `cloud.destroy`（名前とタグで全部。ロードバランサの部品、足す台、中継の VM、カスタムロール、キーペアを含む）→ `.env` の provision が書いた項目（踏み台、Zabbix の宛先・トークンを含む）を消す | 同じ |
+| provided | 転送を止め、証明書を退避 → 全台で `k3s-uninstall.sh`（足す台は `k3s-agent-uninstall.sh`）、Zabbix agent を外し、nftables の表を消す → `audit-derived/` `pg-backup/` `images/` `cluster/` を空にする | 加えて VM、ロードバランサ（識別子からたどる）、バケット（保持を外して）を消す。静的キー・踏み台・ネットワークは用意する側の物なので消さない |
+
+### 21.9 用意する側への前提
+
+spec 12.2 節。静的キーの権限は 21.5 節の表。GCS は「均一なバケットレベルのアクセス」を有効にする（IAM の条件に必須）。registry 3.0 の S3 ドライバは ACL を付けて均一のバケットに書けないので、GCP の registry はサービスアカウントの JSON キーで GCS ドライバを使う（`LAB_VM_GCS_REGISTRY_KEY_JSON`）。VM にクラウドの権限は要らない。ロードバランサは L4 の素通しで送信元 IP を保つこと（管理系の経路の IPAllowList のため）。
+
+### 21.10 配備と試験の結果（GCP、2026-10-31）
+
+`LAB_TARGET=gcp-vm`、managed で中継（踏み台、Zabbix サーバー）の VM を作り（`LAB_EGRESS_PROXY_VM=true`、`LAB_ZABBIX_VM=true`）、Mac も中継経由。
+3 台の直接の外向きは nftables が遮断。AWS は EC2 の vCPU 上限で未配備。手戻りと詳細は `.history/2026-10-31-内部LBとVM側の防御とZabbix/変更設計書.md` 15 章
+（それ以前の配備は `.history/2026-10-30-既存資源からの構築と出口プロキシ/変更設計書.md` 14 章）。
+
+| 試験 | 結果 |
+|---|---|
+| `./lab up`（managed） | 13 回目で全段階を通過（手戻り 12 件: 踏み台の 3128、Zabbix の arm64 リポジトリと設定、docker0 の転送、NetworkPolicy の移行 Job、DNS のキャッシュ、cert-manager の再帰リゾルバ、Mac の CA の束、Zabbix のサインインとセッション、helm の `--ca-file`、ServiceLB の送信元）。最後の 1 回は約 13 分 |
+| VM 側の守り | 台から別の台の 22 は拒否、10250 / 6443 は通る。直接の外向き HTTPS はタイムアウト、中継経由は 200。管理系の経路は台からロードバランサ経由で 403、踏み台と Mac（踏み台経由）から 307。`/v1/models` はどこからも 401（キー無し）。ラベル無しの Pod から Pooler・PostgreSQL・Valkey へ届かず、LiteLLM からは届く |
+| Zabbix | 6 ホスト（VM 3 台と踏み台は自動登録、Kubernetes、入口）すべてに最新値。web は踏み台経由の転送口 |
+| `test-smoke` | 75 件すべて OK |
+| `test-idempotency` | 64 項目を比較して 2 回目で変化なし（2 回目は 148 秒） |
+| `test-audit` | 32 件中 31 件 OK（NG は Gmail 未サインインの「MCP の記録」）。ローリング更新の間の要求 99 件は欠け 0 件 |
+| `test-failover` | pg-switchover 0 / pg-pod 0 / pg-node 123.8 秒（目安 180）/ valkey-pod 0 / valkey-node 0。entry-node（Traefik の載った台を停止）は回復まで 131.5 秒、失敗が続いた時間 82.1 秒（当時の目安 60 秒を超過。2026-11-01 に目安をほかの台を止める場面と同じ 120 秒、GCP 180 秒に改めた）。止めた台に PostgreSQL のレプリカ・Valkey の primary・LiteLLM の Pod も載り、503（DB と Valkey の切り替え）と 502 が混ざる。監査ログの欠けは 6 場面とも 0 件 |
+| `./lab down`（provided）→ `./lab up`（provided） | down は k3s と agent を外し保持の無いディレクトリの 332 版を消す。up は何も作らず、踏み台経由の SSH で全段階を通過（流し直しは 163 秒） |
+| `./lab upgrade-k8s v1.36.5+k3s1 --measure` | 3 台が 235 秒で上がった（1 台 70〜80 秒。Traefik の台が最後）。要求 4,680 件のうち失敗 593 件（状態 0 / 503）、失敗が散らばった幅 88.3 秒。k3s 1.36 の Traefik チャート（40）は Service の鍵が変わるので両方書く |
+| 片付け | provided の `./lab down` → managed の `./lab down`（ロードバランサの部品、VM 4 台、バケット、SA、ロール、ネットワーク）。結果は変更設計書 15.1 節 |
+
+### 21.11 監視（Zabbix。`labtool/zabbix.py`、`./lab zabbix`）
+
+| 部品 | 内容 |
+|---|---|
+| サーバー | managed（`LAB_ZABBIX_VM=true`）: 踏み台の VM に Docker Compose（`postgres:16-alpine`、`zabbix-server-pgsql:ubuntu-7.0-latest`、`zabbix-web-nginx-pgsql:ubuntu-7.0-latest`）。web は 127.0.0.1:8080 だけに開き、Mac は転送口 `http://127.0.0.1:18080/`。provided: 既存サーバー（`LAB_ZABBIX_SERVER`、`LAB_ZABBIX_API_URL`、`LAB_ZABBIX_API_TOKEN`） |
+| 初回の設定 | Admin の初期パスワードを変え（`.env` の `LAB_ZABBIX_ADMIN_PASSWORD`）、API トークンを作って `.env` に書く。パスワードを変えるとセッションが切れるので入り直す。失敗の文言は小文字で判定し、違うと分かったら止める（5 回でブロック） |
+| VM | agent 2（公式リポジトリ 7.0。arm64 は `ubuntu-arm64/`）を能動で。`HostMetadata=litellm-lab-node`（踏み台は `litellm-lab-bastion`）。自動登録のアクション（条件 24 / 演算子 2）がグループ `litellm-lab/vm` と `Linux by Zabbix agent active` を付ける |
+| k3s | 公式 Helm チャート `zabbix-helm-chrt` 1.2.4（`--repo https://cdn.zabbix.com/zabbix/integrations/kubernetes-helm/7.0`、名前空間 `monitoring`）: zabbix-proxy（能動、サーバーは踏み台）と kube-state-metrics。チャートの agent は入れない（VM の agent 2 と 10050 とノード名が重なる）。ホスト `litellm-lab-k8s`（プロキシ経由、`Kubernetes cluster state by HTTP`、マクロ `{$KUBE.API.URL}` `{$KUBE.API.TOKEN}`（Secret `zabbix-service-account`）`{$KUBE.STATE.ENDPOINT.NAME}=zabbix-kube-state-metrics`） |
+| 入口 | ホスト `litellm-lab-entry`（プロキシ経由）に HTTP agent のアイテム `lab.http[liveliness]` / `lab.http[readiness]`（`https://<ホスト名>/health/*`、1 分、200 以外は値なし）と `nodata(...,180s)=1` のトリガー |
+| 決めた台数 | ホスト `litellm-lab-k8s` のマクロ `{$LAB.NODES.EXPECTED}`（3 ＋ 足す台の数）を `./lab zabbix` が書く。トリガー「Ready のノードが決めた台数（{$LAB.NODES.EXPECTED}）より少ない」（重大）、計算アイテム `lab.k8s.nodes.expected`。前の名前の「3 台未満」は消す。減らした足す台の自動登録のホストは、`./lab` が外すときにインターフェースの IP で探して消す（発見ルールが作った「Kubelet <ノード>」などはテンプレートの既定で、見えなくなった時点で無効になり 7 日後に消える） |
+| 監視の一揃い（`labtool/zabbix_monitors.py`） | ホスト `litellm-lab-k8s` に、kube-state-metrics に従属するアイテム（Ready のノードの数、圧迫・cordon のノードの数、CPU とメモリの要求と割り当て可能な量、Pending の Pod、OOM、LiteLLM の自動増減の現在と上限、litellm-lab の失敗した Job、監査ログの整形の最後の成功と作成時刻）、Kubernetes の API を読む HTTP アイテム（Metrics API、CloudNativePG の Cluster と Backup、cert-manager の Certificate）と従属アイテム、計算アイテム（要求の比、証明書の残り日数）、コンテナの発見ルール（Metrics API。メモリと CPU の使用量・上限・上限比）。トリガーと閾値は `.history/2026-10-31-Zabbixの監視の一揃い/変更仕様書.md` 1 章。差の判定は説明欄の `lab-spec:<ハッシュ>` |
+| 追加の権限 | ClusterRole `litellm-lab-zabbix-extra`（Metrics API、CloudNativePG、cert-manager の読み取り）を ServiceAccount `zabbix-service-account` に付ける（チャートの値の追加の権限は YAML が壊れるので使わない） |
+| 制御部分 | k3s の `/etc/rancher/k3s/config.yaml.d/50-lab-metrics.yaml`（今の 3 台だけ）でコントローラーとスケジューラーを `bind-address=0.0.0.0` にし（変われば k3s を 1 台ずつ再起動）、nftables で全台の間の 10257 / 10259 を通す。テンプレートの発見がコントローラーとスケジューラーのホストを作る |
+| 「Zabbix server」ホスト | 検証のサーバーの既定のホストから `Linux by Zabbix agent` を外す（コンテナの中に agent は居ない）。Zabbix の健全性だけ残る |
+| ダッシュボード | 「litellm-lab」: 深刻度ごとの障害、障害の一覧、ノード数・決めた台数・LiteLLM の上限・Pending・PostgreSQL の台数・証明書の残り日数・要求の比、VM（今の 3 台、足す台、踏み台）の CPU・メモリ・ディスクのグラフ、コンテナのメモリの上限比。宣言のハッシュはグローバルマクロ `{$LAB.DASHBOARD.HASH}` |
+| 障害の知らせ | 検証では送らない（画面だけ）。本番は既存の Zabbix サーバーの通知の設定に任せる |
+| 冪等 | すべて `*.get` → 無ければ `create`、違えば `update`。マクロの更新はこちらが管理する鍵だけ差し替える |
+| 残課題 | LiteLLM の `/metrics`（公式文書では Enterprise）の取り込み（`.history/BACKLOG.md`） |
+
+### 21.12 台の増減と LiteLLM の数（`vm.remove_leaving_workers`、`stages.litellm_max_replicas`）
+
+| 部品 | 内容 |
+|---|---|
+| 台の種類 | 今の 3 台（server、`node-role.kubernetes.io/control-plane=true`）と足す台（agent、`litellm-lab/role=worker`）。`Node.role`、足す台の `Node.index` は 100 ＋ 番号。`Infra.workers`、`Infra.all_nodes()` |
+| 足す台の IP | GCP はサブネットの .30+番号、AWS は 3 つのサブネットを順に使ってそのサブネットの .30+番号（`clouds.worker_plan`）。同じ種類・イメージ、ゾーンは順に |
+| 加える前の確認 | まだ参加していない足す台に SSH で `nproc` と `/proc/meminfo` を読み、CPU − 0.25 が LiteLLM の CPU の予約以上、メモリ − 1 GiB が LiteLLM のメモリの上限以上でなければ止める（`render.worker_capacity_shortage`） |
+| 入口 | Traefik は DaemonSet（`k8s/traefik-config-vm.yaml`。`nodeSelector: litellm-lab/entry=true`）。`./lab cluster` が全台に入口の印を付け、DaemonSet の準備数が台数に届くまで待つ |
+| 減らす | 初期化の前に流す（外す台の IP は前回の nftables に残っているので、外し終わるまで Pod の通信は切れない）。その台の nftables にヘルスチェック（80）を落とす規則を足して 30 秒待つ → 入口の印を外す → cordon と drain（600 秒）→ `kubectl delete node` → SSH で k3s・Zabbix agent・nftables の表を外す → Zabbix のホストを消す → managed は `remove_workers`（ロードバランサの転送先から外して VM を消す）、provided は担当部署への依頼を出す。ヘルスチェックだけを先に落とすのは、Traefik を先に消すと外れるまでの約 10 秒の接続が拒否されるため |
+| DB の置き場所 | VM の環境では描画のときに `render.pin_to_servers` が CloudNativePG の Cluster（`spec.affinity.nodeSelector`）と Valkey・Sentinel の StatefulSet に `node-role.kubernetes.io/control-plane: "true"` を差し込む |
+| LiteLLM の資源 | Helm の上書きの値の `resources`（CPU の予約 250m、メモリは `.env`） |
+| 最大数 | Ready で cordon されていないノードごとに、割り当て可能な量から LiteLLM 以外の Pod（終わった Pod を除く）の予約を引き、`min(floor(CPU の空き ÷ 0.25), floor(メモリの空き ÷ メモリの上限))` を足す（`render.litellm_slots`）。`autoscaling.maxReplicas` に渡す。2 未満なら止めて台ごとの空きを出す。その時点の配置で数えるので、作ったばかりの 1 回目は後の段（Zabbix、監査ログの検索アプリ）の Pod を数える前で 1 つ多くなり、2 回目から落ち着く（最大数だけが変わる Helm の更新では Pod は作り直されない） |
+| 優先度 | PriorityClass `litellm-lab-scalable`（値 −100、`preemptionPolicy: Never`）。チャートに値が無く Helm 4 の後処理はプラグインが要るので、`helm upgrade` の後に Deployment に `priorityClassName` を付ける（違うときだけ。Helm はこの欄を描かないので次の upgrade でも残る） |
+| 版上げ | `vm.upgrade_order`: 今の 3 台（SSH の転送先は 3 台の最後）→ 足す台。足す台は `sh -s - agent` で入れ直す |
+| 障害の試験 | `worker-node`（LiteLLM が載った足す台を 120 秒止める）。足す台があるときだけ `all` に入る |
+
+配備と試験の結果（GCP、2026-10-31、検証の VM は全台 c4a-standard-2）:
+
+| 試験 | 結果 |
+|---|---|
+| 足す台 0 台で `./lab up` | 約 23 分で通過。最大数 11（台ごと 3 / 4 / 4）。2 回目は最大数が 10 に変わり Helm が 1 回流れた（Pod は作り直さない）。3 回目は変化なし |
+| 要求を流しながら 1 台足す | 要求 5,876 件のうち失敗 0 件。Traefik 4 つ、ロードバランサの健全 4 台、最大数 16（足す台に 6）、Zabbix の決めた台数 4、足す台の agent が自動登録 |
+| `test-failover --scenario worker-node` | 要求 6,026 件のうち失敗 92 件（状態 0 と 502）、回復まで 61.9 秒（試験の時点の目安 60 秒。2026-11-01 に GCP は 180 秒に改めた）、失敗が続いた時間 24.3 秒。DB が無いので 503 は出ない（今の 3 台の停止の entry-node は 131.5 秒・82.1 秒）。止めている間に Zabbix が「決めた台数（4）より少ない」（重大） |
+| 要求を流しながらメモリの上限を 1 GiB → 2 GiB | 要求 5,095 件のうち失敗 0 件。1 つずつ入れ替わり、最大数 16 → 9、優先度は残った |
+| メモリの上限 16 GiB | `./lab litellm` が台ごとの空きを出して止まり、Helm は流れない |
+| 要求を流しながら 1 台減らす | 要求 7,247 件のうち失敗 0 件。Zabbix の自動登録のホストを消し、VM を転送先から外して消した。最大数 6、決めた台数 3、障害 0 件。2 回目の `./lab up` は変化なし |
+| 単体テスト | 81 本が通る |

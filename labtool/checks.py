@@ -14,7 +14,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 
 from .core import (
-    KUBE_CONTEXT, NS, ROOT, Env, LabError, helm, http, http_ok, info, json_output, kn, ok, run, step, warn,
+    NS, ROOT, Env, LabError, helm, http, http_ok, info, json_output, kn, kube_context, ok, run, step, warn,
 )
 
 BAD = 'TOOL:shell:{"command":["git","push","origin","--delete","old-branch"]}'
@@ -244,6 +244,8 @@ def snapshot() -> list[str]:
     - ConfigMap / Secret の resourceVersion（CloudNativePG が自分で更新する Secret と、Helm の記録は除く）
     - Deployment / StatefulSet / CronJob と、CloudNativePG・Traefik のリソースの generation
     - オブジェクトストレージのバケットの設定と、利用者と権限"""
+    from .core import Env
+    env = Env.load()   # kube の context を環境に向ける（VM の環境は SSH の転送先）
     lines: list[str] = []
     for ns in (NS, "cert-manager", "cnpg-system"):
         for r in json_output(helm("-n", ns, "list", "-o", "json"), default=[]) or []:
@@ -271,12 +273,14 @@ def snapshot() -> list[str]:
             lines.append(f"{o['kind']} {m['name']} {field}")
     try:
         from . import objectstore
-        from .core import Env, port_forward
-        env = Env.load()
-        with port_forward("svc/rustfs", 9000) as endpoint:
-            lines += objectstore.snapshot(env, endpoint)
+        if env.is_vm:
+            from . import clouds
+            lines += clouds.for_env(env).snapshot(env, env.vm_bucket)
+        else:
+            with objectstore.admin_s3(env) as s3:
+                lines += objectstore.snapshot(env, s3)
     except Exception as e:  # noqa: BLE001 オブジェクトストレージがまだ無い
-        lines.append(f"objectstore unavailable: {type(e).__name__}")
+        lines.append(f"objectstore unavailable: {type(e).__name__}: {str(e)[:120]}")
     return sorted(lines)
 
 
@@ -310,7 +314,7 @@ def load(env: Env, vus: str, duration: str, scenario: str) -> None:
         "-e", f"VUS={vus}", "-e", f"DURATION={duration}", "-e", f"SCENARIO={scenario}",
         "grafana/k6:1.3.0", "run", "-",
     ], input=script, text=True).returncode
-    info(f"試験中の Pod 数の変化は kubectl --context {KUBE_CONTEXT} -n {NS} get hpa,pods -w で見られます")
+    info(f"試験中の Pod 数の変化は kubectl --context {kube_context()} -n {NS} get hpa,pods -w で見られます")
     if rc:
         raise LabError(f"負荷試験が失敗しました（終了コード {rc}）")
 

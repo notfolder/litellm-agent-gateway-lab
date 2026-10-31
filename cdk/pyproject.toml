@@ -1,0 +1,9 @@
+[project]
+name = "litellm-lab-cdk"
+version = "0.1.0"
+description = "litellm-agent-gateway-lab の AWS 環境（EKS Auto Mode、Aurora、ElastiCache、S3）を CloudFormation にする CDK アプリ"
+requires-python = ">=3.12"
+dependencies = [
+  "aws-cdk-lib>=2.274,<3",
+  "constructs>=10.0,<11",
+]

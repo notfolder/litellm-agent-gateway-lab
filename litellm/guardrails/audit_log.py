@@ -228,6 +228,11 @@ class AuditLogger(CustomLogger):
         self.endpoint = os.environ.get("AUDIT_S3_ENDPOINT", "")
         self.region = os.environ.get("AUDIT_S3_REGION", "us-east-1")
         self.bucket = os.environ.get("AUDIT_S3_BUCKET", "audit-raw")
+        # 1 つのバケットのディレクトリに書くときの接頭辞（例 audit-raw/）。記録に残す鍵は接頭辞なしの論理の鍵
+        self.key_prefix = os.environ.get("AUDIT_S3_KEY_PREFIX", "")
+        # 原本のオブジェクト単位の保持（日数が空なら付けない。Mac の RustFS はバケットの既定の保持）
+        self.retention_days = int(os.environ.get("AUDIT_S3_RETENTION_DAYS") or 0)
+        self.retention_mode = os.environ.get("AUDIT_S3_RETENTION_MODE") or "GOVERNANCE"
         self.access_key = os.environ.get("AUDIT_S3_ACCESS_KEY", "")
         self.secret_key = os.environ.get("AUDIT_S3_SECRET_KEY", "")
         self.flush_seconds = float(os.environ.get("AUDIT_FLUSH_SECONDS", "60"))
@@ -235,7 +240,11 @@ class AuditLogger(CustomLogger):
         self.spool = Path(os.environ.get("AUDIT_SPOOL_DIR", "/var/lib/audit-spool"))
         self.spool_limit = int(os.environ.get("AUDIT_SPOOL_LIMIT_BYTES", str(900 * 1024 * 1024)))
         self.pod = os.environ.get("HOSTNAME") or socket.gethostname()
-        self.enabled = bool(self.endpoint and self.access_key and self.secret_key)
+        # 資格情報: 静的キー（Mac の RustFS）か、boto3 の既定の資格情報チェーン（AWS の EKS Pod Identity。
+        # AUDIT_S3_CREDENTIAL_CHAIN=true で明示する）。どちらも無ければ書かない。接続先が空なら AWS S3
+        self.static_keys = bool(self.access_key and self.secret_key)
+        self.credential_chain = os.environ.get("AUDIT_S3_CREDENTIAL_CHAIN", "").lower() == "true"
+        self.enabled = bool(self.bucket) and (self.static_keys or self.credential_chain)
         self.buffer = Buffer(self.pod)
         self.lock = threading.Lock()
         self.upload_lock = threading.Lock()
@@ -290,14 +299,27 @@ class AuditLogger(CustomLogger):
         if self._client is None:
             import boto3
             from botocore.config import Config
-            self._client = boto3.client("s3", endpoint_url=self.endpoint, region_name=self.region,
-                                        aws_access_key_id=self.access_key, aws_secret_access_key=self.secret_key,
-                                        config=Config(s3={"addressing_style": "path"}, retries={"max_attempts": 2},
-                                                      connect_timeout=5, read_timeout=30))
+            kwargs: dict = {"region_name": self.region,
+                            "config": Config(retries={"max_attempts": 2}, connect_timeout=5, read_timeout=30)}
+            if self.endpoint:
+                # S3 互換ストレージ（RustFS など）はパス形式。接続先が無ければ AWS S3 の既定（仮想ホスト形式）
+                kwargs["endpoint_url"] = self.endpoint
+                kwargs["config"] = Config(s3={"addressing_style": "path"}, retries={"max_attempts": 2},
+                                          connect_timeout=5, read_timeout=30)
+            if self.static_keys:
+                kwargs.update(aws_access_key_id=self.access_key, aws_secret_access_key=self.secret_key)
+            self._client = boto3.client("s3", **kwargs)
+            # GCS の XML API も boto3 の x-amz-object-lock-* をそのまま受ける（x-goog-* に写すと ExcessHeaderValues。2026-10-31）
         return self._client
 
+    def _put_args(self) -> dict:
+        if not self.retention_days:
+            return {}
+        until = datetime.now(timezone.utc) + timedelta(days=self.retention_days)
+        return {"ObjectLockMode": self.retention_mode, "ObjectLockRetainUntilDate": until}
+
     def _put(self, key: str, data: bytes) -> None:
-        self.client().put_object(Bucket=self.bucket, Key=key, Body=data)
+        self.client().put_object(Bucket=self.bucket, Key=self.key_prefix + key, Body=data, **self._put_args())
 
     def _spool_size(self) -> int:
         return sum(p.stat().st_size for p in self.spool.glob("*") if p.is_file())

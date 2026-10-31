@@ -23,6 +23,8 @@ spec:
             app: audit-compactor
         spec:
           restartPolicy: OnFailure
+          # AWS では Pod Identity でこの ServiceAccount に IAM ロールが付く（S3 の静的キーは無い）
+          serviceAccountName: audit-compactor
           containers:
             - name: compactor
               image: ${IMAGE}
@@ -32,14 +34,28 @@ spec:
                   value: "${S3_ENDPOINT}"
                 - name: AUDIT_S3_REGION
                   value: "${S3_REGION}"
+                # boto3 1.36 以降の既定（送信時のチェックサム）を S3 互換のストレージが拒むことがある（GCS）。公式の回避策（害は無い）
+                - name: AWS_REQUEST_CHECKSUM_CALCULATION
+                  value: when_required
+                - name: AWS_RESPONSE_CHECKSUM_VALIDATION
+                  value: when_required
+                - name: AUDIT_S3_BUCKET_PREFIX
+                  value: "${S3_BUCKET_PREFIX}"
+                - name: AUDIT_S3_BUCKET
+                  value: "${S3_BUCKET}"
+                - name: AUDIT_ACCESS_RETENTION_DAYS
+                  value: "${ACCESS_RETENTION_DAYS}"
+                - name: AUDIT_RETENTION_MODE
+                  value: "${RETENTION_MODE}"
+                # S3 の静的キー（Mac の RustFS）。AWS では無いので optional
                 - name: AUDIT_S3_ACCESS_KEY
                   valueFrom:
-                    secretKeyRef: { name: audit-compactor-s3, key: AUDIT_S3_ACCESS_KEY }
+                    secretKeyRef: { name: audit-compactor-s3, key: AUDIT_S3_ACCESS_KEY, optional: true }
                 - name: AUDIT_S3_SECRET_KEY
                   valueFrom:
-                    secretKeyRef: { name: audit-compactor-s3, key: AUDIT_S3_SECRET_KEY }
+                    secretKeyRef: { name: audit-compactor-s3, key: AUDIT_S3_SECRET_KEY, optional: true }
                 - name: AUDIT_DUCKDB_MEMORY
                   value: 512MB
               resources:
                 requests: { cpu: 100m, memory: 256Mi }
-                limits: { memory: 1Gi }
+                limits: { memory: 2Gi }   # 1 時間に 10 万件（API キーの総当たり）でも整形できる量（2026-10-30 の実測: 3Gi で 66 秒）

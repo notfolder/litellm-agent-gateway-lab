@@ -80,19 +80,35 @@
 | CNPG のオペレーター | △ オペレーターが止まっていても DB は動く（そのあいだ自動の切り替えは効かない）。オペレーターを上げると DB の Pod が順に再起動されることがあるので、primary の切り替え 1 回分を見込む | 同じ。リリースノートを確かめる |
 | cert-manager、barman-cloud | ○ 利用者の通信には関係しない。そのあいだバックアップが取れないだけ | 同じ |
 | Traefik（入口） | △ 新しい Pod が立ってから古い Pod を止めるが、1 台なので、つながっている接続（長いストリーミング）は切れる | 同じ |
-| k3s（Kubernetes） | × 検証環境の k3d では、事実上クラスタの作り直しになる。本番のマネージドの Kubernetes なら、ノードを 1 台ずつ入れ替えれば無停止にできるが、LiteLLM に PDB が無いので、2 台が同時に追い出されうる | 同じ |
+| Kubernetes（k3s、EKS） | Mac × / AWS ○。**Mac の k3d** には版を上げる命令が無く（`k3d cluster edit` で変えられるのはポートだけ）、ノードを新しい k3s のイメージで作り直すしかない。agent 2 台はそれで無停止にできるが、server が 1 台で、制御部分のデータストア（SQLite）と Traefik・RustFS・cert-manager・CNPG のオペレーターが server に固定されているので、server の作り直しは事実上クラスタの作り直し（`./lab rebuild`）になる。無停止にするなら server 3 台（組み込み etcd）と固定の解除が要る。**AWS の EKS** は制御部分を AWS が入れ替え（API は常に到達可、動いているアプリは影響なし）、Auto Mode がノードを 1 台ずつ新しい版に入れ替える（PDB を守る）。1 マイナー版ずつ、7 日以内なら戻せる。LiteLLM の PDB（`maxUnavailable: 1`）は `litellm/values.yaml` で付けてある | 同じ |
 | Mac 本体、OrbStack の再起動 | × 全体が止まる（ホストは 1 台） | — |
 
 ## 4. 無停止にするための改善案（未実装）
 
 | 項目 | 効果 | 手間 |
 |---|---|---|
-| LiteLLM に PDB（`maxUnavailable: 1`）と、Pod を別のノードに散らす設定（anti-affinity）を付ける | ノードの入れ替えで 2 台が同時に止まるのを防ぐ | 小 |
 | 長いストリーミングの要求（Codex の数分の応答）と、止まる前の猶予 90 秒の関係を試験する | ローリング更新で長い応答が途中で切れるかが分かる | 小（試験だけ） |
 | Valkey の更新を「手で切り替えてから進める」手順にする | primary の再起動が 1 回で済む | 小 |
 | `./lab upgrade` で、増えた移行に互換性の無いものがあるかを事前に調べる | 互換性の無いバージョンアップを事前に見分けられる | 小〜中 |
 | [spec.md](spec.md) 9.3 の無停止のバージョンアップを実際に試験する | この文書の見込みを実測で確かめられる | 中 |
 | 本番では、RustFS を S3 に替え、オペレーター・Traefik・Gmail の MCP を 2 台以上にする | 1 台しかない部品が無くなる | 本番の設計で決める |
+
+## 5. VM 3 台の環境（`LAB_TARGET=aws-ec2` / `gcp-vm`）での違い
+
+| 作業 | やり方 |
+|---|---|
+| 構築ツールの接続 | `./lab` を流すたびに SSH のポート転送（k3s の 6443 → 127.0.0.1:16443）を確かめて張り直す。`kubectl --context litellm-lab-gcp`（`-ec2`）でクラスタに届く |
+| 自作イメージの更新 | `./lab images` が k3s の台の Docker でビルドしてクラスタの中の registry に push する。Mac の Docker は使わない |
+| Kubernetes（k3s）の版上げ | `./lab upgrade-k8s <版> [--measure]`。1 台ずつ、今の 3 台が先で足す台が後。Traefik は全台に 1 つずつで、入口は内部ロードバランサなので IP の移動は無い。drain で台を空ける間だけ失敗が出る。マイナー版は 1 つずつ |
+| 台を足す・減らす（処理量の調整） | 足す台（LiteLLM と入口だけ。DB は持たない）を `.env` で増減して `./lab up`。managed は `LAB_VM_WORKERS` の台数、provided は担当部署が作ってロードバランサに登録した VM を `LAB_VM_WORKER_NODES` に足す・外す（外した後の VM の削除と登録の解除は担当部署に頼む）。足す・減らすとも要求の失敗は 0 件（試験済み）。足す台に LiteLLM を 1 つも置けない（CPU とメモリが足りない）ときは加えずに止まる。合図は Zabbix の「CPU / メモリの要求が 90% を超えた」「LiteLLM の自動増減が上限に 15 分張り付いている」「Pending の Pod が 5 分続いている」 |
+| LiteLLM のメモリを変える | `.env` の `LAB_LITELLM_MEMORY_REQUEST` / `LAB_LITELLM_MEMORY_LIMIT` を変えて `./lab up`（か `./lab litellm`）。1 つずつ入れ替わり（要求の失敗 0 件、試験済み）、自動増減の最大数は台ごとの空き ÷ メモリの上限で数え直す。最低の 2 つを置けない値なら変えずに止まる。合図は Zabbix の「メモリが上限の 90% を超えた」と「OOM で落ちたコンテナがある」 |
+| 管理画面と検索アプリ、DB への接続 | 管理系の経路（`/ui`、`/lab-audit/`）は踏み台からだけ通る。Mac からは `./lab forward` で踏み台経由の転送を張り `https://<LAB_LOCAL_HOSTNAME>:18443/ui`。DB は踏み台から SSH で入り `kubectl port-forward svc/litellm-pg-pooler-rw 5432` |
+| 監視（Zabbix） | `./lab zabbix` がホスト・テンプレート・入口の HTTP 監視を API で揃える（冪等）。web は `http://127.0.0.1:18080/`（踏み台経由の転送。Admin のパスワードは `.env` の `LAB_ZABBIX_ADMIN_PASSWORD`）。VM が増えたら agent 2 の自動登録で入る。本番は既存サーバーの宛先と API トークンを `.env` に |
+| 操作者の回線が変わった | managed は `./lab up`（か `./lab cluster`）で 22 の許可（クラウドと nftables）が直る。provided は踏み台から入るので変更不要 |
+| 既存資源（`LAB_INFRA=provided`）での注意 | 構築ツールはネットワーク・ロードバランサ・権限・バケットの設定を変えない。守りは各 VM の nftables と Traefik の送信元制限と NetworkPolicy で、クラウドのファイアウォールは無くてもよい |
+| 出口プロキシ（Zscaler）の CA の更新 | `.env` の `LAB_EGRESS_CA_FILE` を新しい CA にして `./lab up`。VM の信頼店（SSH で直す）、Pod の ConfigMap、`./lab` 自身の環境変数が揃う |
+| 整形の Job のメモリ | 1 時間の原本の件数に比例する。入口を操作者の IP に絞っていれば 2 GiB で足りる（総当たりを受けた 10 万件/時で 1 GiB を超えた） |
+| 片付け | managed: `./lab down`（全部消す）。provided: `./lab down`（k3s を外す）または `./lab down --all`（VM・浮動 IP・バケットも） |
 
 ## 参考
 

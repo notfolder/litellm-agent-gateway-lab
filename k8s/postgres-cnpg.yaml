@@ -1,7 +1,9 @@
-# LiteLLM 用の PostgreSQL（CloudNativePG、3 台。変更設計書 3 章）。./lab datastores が変数（S3_ENDPOINT）を置き換えて使う。
+# LiteLLM 用の PostgreSQL（CloudNativePG、3 台。変更設計書 3 章）。./lab datastores が変数を置き換えて使う:
+# S3_DEST（s3://<バケット>/<ディレクトリ>litellm-pg。Mac は s3://pg-backup/litellm-pg）、S3_ENDPOINT_LINE（Mac は endpointURL の行、AWS の S3 は空）、
+# S3_REGION。
 # - 3 台を別々のノードに置き、同期複製（どれか 1 台の standby が受け取れば書き込み完了）。切り替えは過半数の合意で行う
 # - LiteLLM は Pooler（PgBouncer、transaction モード）か、直結（litellm-pg-rw）につなぐ（.env の LAB_DB_POOLER）
-# - WAL とバックアップは Barman Cloud Plugin で RustFS（S3 互換）の pg-backup バケットへ送る
+# - WAL とバックアップは Barman Cloud Plugin で S3 互換ストレージ（Mac は RustFS、aws-ec2 は S3）の pg-backup バケットへ送る
 apiVersion: barmancloud.cnpg.io/v1
 kind: ObjectStore
 metadata:
@@ -10,8 +12,8 @@ metadata:
 spec:
   retentionPolicy: "30d"
   configuration:
-    destinationPath: s3://pg-backup/litellm-pg
-    endpointURL: ${S3_ENDPOINT}
+    destinationPath: ${S3_DEST}
+    ${S3_ENDPOINT_LINE}
     s3Credentials:
       accessKeyId: { name: pg-backup-s3, key: ACCESS_KEY_ID }
       secretAccessKey: { name: pg-backup-s3, key: ACCESS_SECRET_KEY }
@@ -20,12 +22,14 @@ spec:
     data:
       compression: gzip
   instanceSidecarConfiguration:
-    # S3 互換のストレージ向けの公式の回避策（付けて害は無い）
     env:
+      # S3 互換のストレージ向けの公式の回避策（付けて害は無い）
       - name: AWS_REQUEST_CHECKSUM_CALCULATION
         value: when_required
       - name: AWS_RESPONSE_CHECKSUM_VALIDATION
         value: when_required
+      - name: AWS_DEFAULT_REGION
+        value: "${S3_REGION}"
 ---
 apiVersion: postgresql.cnpg.io/v1
 kind: Cluster

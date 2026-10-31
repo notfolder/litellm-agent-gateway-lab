@@ -14,6 +14,7 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -30,12 +31,17 @@ ENV_FILE = ROOT / ".env"
 ENV_EXAMPLE = ROOT / ".env.example"
 
 CLUSTER = "litellm"
-KUBE_CONTEXT = f"k3d-{CLUSTER}"
+KUBE_CONTEXT = f"k3d-{CLUSTER}"          # Mac（k3d）。AWS は Env.load() が set_kube_context で差し替える
+AWS_KUBE_CONTEXT = "litellm-lab-aws"      # aws eks update-kubeconfig --alias で付ける名前
+EC2_KUBE_CONTEXT = "litellm-lab-ec2"      # EC2 3 台の k3s（SSH のポート転送の先。labtool/vm.py が書く）
+GCP_KUBE_CONTEXT = "litellm-lab-gcp"      # Compute Engine 3 台の k3s（同上）
+VM_KUBE_CONTEXTS = {"aws-ec2": EC2_KUBE_CONTEXT, "gcp-vm": GCP_KUBE_CONTEXT}
+TARGETS = ("local", "aws", "aws-ec2", "gcp-vm")
 NS = "litellm-lab"
 HELM_RELEASE = "litellm"
 LITELLM_CHART = "oci://ghcr.io/berriai/litellm-helm"
 DEFAULT_LITELLM_VERSION = "v1.104.2"
-K3S_IMAGE = "rancher/k3s:v1.35.5-k3s1"
+K3S_IMAGE = "rancher/k3s:v1.36.5-k3s1"
 
 # イメージの置き場（クラスタとは別に作り、クラスタを消しても残す）
 REGISTRY_NAME = "litellm-registry.localhost"  # 自作イメージを push する
@@ -118,6 +124,12 @@ class Env:
         if not ENV_FILE.exists():
             raise LabError(".env がありません。./lab up（preflight）で作られます")
         env = cls(parse_env(ENV_FILE.read_text()))
+        if env.target not in TARGETS:
+            raise LabError(f"LAB_TARGET は {' / '.join(TARGETS)} のどれかです（{env.target}）")
+        # kubectl / helm が向くクラスタを環境に合わせる（変更仕様書 2026-10-24-AWS構成 2.3 節）
+        set_kube_context({"aws": AWS_KUBE_CONTEXT, **VM_KUBE_CONTEXTS}.get(env.target, f"k3d-{CLUSTER}"))
+        if env.is_vm:
+            env.apply_mac_proxy()   # 操作者の Mac も出口プロキシ（Zscaler）の中にあるとき、./lab 自身の通信を中継に通す
         # 設定は .env だけから読む。コマンドの前に付けた値は効かないので、食い違えば知らせる
         shell = os.environ.get("LAB_NOREVIEW_KEYS", "").strip()
         if shell and shell.lower() != env.get("LAB_NOREVIEW_KEYS", "false").lower():
@@ -143,6 +155,43 @@ class Env:
 
     # ---- 決まる値 ----
     @property
+    def target(self) -> str:
+        """向ける環境: local（Mac の k3d）、aws（EKS 版。変更仕様書 2026-10-24-AWS構成 0.2 節）、
+        aws-ec2（EC2 3 台と S3。変更仕様書 2026-10-25-EC2三台構成 0.2 節）、
+        gcp-vm（Compute Engine 3 台と Cloud Storage。変更仕様書 2026-10-30-VM環境の共通化とGCP追加 0.2 節）。"""
+        return self.get("LAB_TARGET", "local")
+
+    @property
+    def is_aws(self) -> bool:
+        """EKS 版（マネージドサービス）か。"""
+        return self.target == "aws"
+
+    @property
+    def is_aws_ec2(self) -> bool:
+        """EC2 3 台の k3s か（AWS の資格情報の読み方だけに使う。段階の分岐は is_vm）。"""
+        return self.target == "aws-ec2"
+
+    @property
+    def is_gcp_vm(self) -> bool:
+        return self.target == "gcp-vm"
+
+    @property
+    def is_vm(self) -> bool:
+        """VM 3 台の k3s（aws-ec2 と gcp-vm）か。Kubernetes の中は Mac と同じ構成で、基盤と入口とバケットだけがクラウド。
+        クラウドの違いは labtool/clouds/ に閉じ、段階のコードはこの判定だけで分岐する。"""
+        return self.target in VM_KUBE_CONTEXTS
+
+    @property
+    def on_aws(self) -> bool:
+        """AWS のどちらか（boto3 の資格情報、リージョン）。"""
+        return self.is_aws or self.is_aws_ec2
+
+    @property
+    def on_cloud(self) -> bool:
+        """Mac 以外（HTTPS のホスト名、バケット名の接頭辞、Jev を使わない）。"""
+        return self.is_aws or self.is_vm
+
+    @property
     def data_dir(self) -> Path:
         return Path(self.get("LAB_DATA_DIR", "/Volumes/SSD/litellm-lab"))
 
@@ -152,7 +201,291 @@ class Env:
 
     @property
     def base_url(self) -> str:
+        """クライアントとこのツールが使う入口。Mac は http://localhost:<port>、EKS は https://<ホスト名>。
+        VM の環境は、入口が内部ロードバランサ（VPC の内側）なので、操作者の Mac は踏み台経由の SSH の転送口に
+        Mac 用の別名（LAB_LOCAL_HOSTNAME。A レコードは 127.0.0.1、証明書の SAN に入る）で届く
+        （変更設計書 2026-10-31-内部LBとVM側の防御とZabbix 6 章）。別名が無ければ本番のホスト名（内側から呼ぶとき）。"""
+        if self.is_vm and self.local_hostname:
+            return f"https://{self.local_hostname}:{self.vm_local_https_port}"
+        if self.on_cloud:
+            return f"https://{self.hostname}"
         return f"http://localhost:{self.http_port}"
+
+    @property
+    def public_host(self) -> str:
+        """入口のホスト名（ポート付き）。Claude Code の信頼するドメインの記述に使う。"""
+        if self.is_vm and self.local_hostname:
+            return f"{self.local_hostname}:{self.vm_local_https_port}"
+        return self.hostname if self.on_cloud else f"localhost:{self.http_port}"
+
+    @property
+    def local_hostname(self) -> str:
+        """Mac 用の別名（空なら使わない）。"""
+        return self.get("LAB_LOCAL_HOSTNAME", "").strip()
+
+    # ---- クラウド共通（LAB_TARGET が local 以外のときだけ使う） ----
+    @property
+    def hostname(self) -> str:
+        """HTTPS のホスト名（LAB_HOSTNAME。EKS 版・EC2 版の LAB_AWS_HOSTNAME も読む）。"""
+        host = self.get("LAB_HOSTNAME") or self.get("LAB_AWS_HOSTNAME")
+        if not host:
+            raise LabError(f"LAB_TARGET={self.target} には LAB_HOSTNAME（HTTPS のホスト名）が要ります")
+        return host
+
+    @property
+    def aws_hostname(self) -> str:
+        return self.hostname
+
+    # ---- AWS（LAB_TARGET=aws / aws-ec2 のときだけ使う） ----
+
+    @property
+    def aws_region(self) -> str:
+        return self.get("LAB_AWS_REGION", "ap-northeast-1")
+
+    @property
+    def aws_profile(self) -> str:
+        return self.get("LAB_AWS_PROFILE")
+
+    @property
+    def aws_prefix(self) -> str:
+        """CloudFormation のスタック名、Secrets Manager の名前、ECR のリポジトリの接頭辞。"""
+        return self.get("LAB_AWS_STACK_PREFIX", "litellm-lab")
+
+    @property
+    def aws_cluster_name(self) -> str:
+        return f"{self.aws_prefix}-eks"
+
+    # ---- VM 3 台（LAB_TARGET=aws-ec2 / gcp-vm。変更設計書 2026-10-30-VM環境の共通化とGCP追加 2 章、9 章） ----
+    @property
+    def ec2_prefix(self) -> str:
+        """AWS の資源（IAM ユーザー、タグ）の接頭辞（EKS 版の名前と衝突しない）。"""
+        return f"{self.aws_prefix}-ec2"
+
+    @property
+    def gcp_prefix(self) -> str:
+        return self.get("LAB_GCP_PREFIX", "litellm-lab")
+
+    @property
+    def vm_prefix(self) -> str:
+        """クラウドの資源を探す目印（AWS はタグ lab:prefix、GCP はラベル lab-prefix）と名前の接頭辞。"""
+        return self.gcp_prefix if self.is_gcp_vm else self.ec2_prefix
+
+    @property
+    def ec2_instance_type(self) -> str:
+        return self.get("LAB_EC2_INSTANCE_TYPE", "t4g.large")
+
+    @property
+    def gcp_project(self) -> str:
+        project = self.get("LAB_GCP_PROJECT")
+        if not project:
+            raise LabError("LAB_TARGET=gcp-vm には LAB_GCP_PROJECT（プロジェクト ID）が要ります")
+        return project
+
+    @property
+    def gcp_region(self) -> str:
+        return self.get("LAB_GCP_REGION", "asia-northeast1")
+
+    @property
+    def gcp_machine_type(self) -> str:
+        return self.get("LAB_GCP_MACHINE_TYPE", "c4a-standard-2")
+
+    @property
+    def vm_cidr(self) -> str:
+        return self.get("LAB_VM_CIDR", "10.60.0.0/16")
+
+    @property
+    def vm_disk_gib(self) -> int:
+        return int(self.get("LAB_VM_DISK_GIB", "40"))
+
+    @property
+    def vm_local_port(self) -> int:
+        """SSH のポート転送のローカル側（k3s の API 6443 の宛先）。"""
+        return int(self.get("LAB_VM_LOCAL_PORT", "16443"))
+
+    @property
+    def vm_local_https_port(self) -> int:
+        """SSH のポート転送のローカル側（踏み台経由で内部ロードバランサの 443 へ）。"""
+        return int(self.get("LAB_VM_LOCAL_HTTPS_PORT", "18443"))
+
+    @property
+    def vm_bastion_host(self) -> str:
+        """踏み台の SSH の宛先（公開 IP かホスト名。managed は provision が中継の VM の公開 IP を書く）。"""
+        return self.get("LAB_VM_BASTION_HOST", "").strip()
+
+    @property
+    def vm_bastion_ssh_user(self) -> str:
+        """踏み台の SSH の利用者（空なら VM と同じ）。"""
+        return self.get("LAB_VM_BASTION_SSH_USER", "").strip() or self.vm_ssh_user
+
+    @property
+    def vm_bastion_cidr(self) -> str:
+        """踏み台の内部 IP（/32 か CIDR）。nftables の 22 と Traefik の管理系の経路の許可に使う。"""
+        return self.get("LAB_VM_BASTION_CIDR", "").strip()
+
+    # ---- Zabbix（変更設計書 2026-10-31 7 章） ----
+    @property
+    def zabbix_vm(self) -> bool:
+        """managed で踏み台（中継）の VM に Zabbix サーバー（Docker Compose）を立てるか。"""
+        return self.get("LAB_ZABBIX_VM", "false").lower() == "true"
+
+    @property
+    def zabbix_server(self) -> str:
+        """agent 2 と zabbix-proxy が送る宛先（host:10051）。空なら Zabbix を使わない。"""
+        return self.get("LAB_ZABBIX_SERVER", "").strip()
+
+    @property
+    def zabbix_enabled(self) -> bool:
+        return bool(self.zabbix_server) or self.zabbix_vm
+
+    @property
+    def zabbix_local_port(self) -> int:
+        """Zabbix の web（と API）への SSH の転送口（踏み台の 127.0.0.1:8080 → Mac）。"""
+        return int(self.get("LAB_ZABBIX_LOCAL_PORT", "18080"))
+
+    @property
+    def zabbix_api_url(self) -> str:
+        """Zabbix の API。LAB_ZABBIX_VM=true なら転送口、provided は .env の LAB_ZABBIX_API_URL。"""
+        if self.zabbix_vm:
+            return f"http://127.0.0.1:{self.zabbix_local_port}/api_jsonrpc.php"
+        return self.get("LAB_ZABBIX_API_URL", "").strip()
+
+    @property
+    def vm_region(self) -> str:
+        """クラウドのリージョン名（S3 互換の設定に渡す）。"""
+        return self.gcp_region if self.is_gcp_vm else self.aws_region
+
+    # ---- 既存資源からの構築と出口プロキシ（変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 2 章） ----
+    @property
+    def infra_mode(self) -> str:
+        """managed: ツールがクラウドの資源を作る。provided: 既存の VM 3 台とバケット 1 つを .env の識別子で使う。"""
+        mode = self.get("LAB_INFRA", "managed")
+        if mode not in ("managed", "provided"):
+            raise LabError(f"LAB_INFRA は managed / provided のどちらかです（{mode}）")
+        return mode
+
+    @property
+    def is_provided(self) -> bool:
+        return self.infra_mode == "provided"
+
+    @property
+    def vm_nodes(self) -> list[str]:
+        """VM の識別子 3 つ（AWS: インスタンス ID、GCP: <ゾーン>/<名前>）。順番が台の番号 1〜3。"""
+        return [x.strip() for x in self.get("LAB_VM_NODES").split(",") if x.strip()]
+
+    @property
+    def vm_worker_nodes(self) -> list[str]:
+        """足す台（k3s の agent）の識別子。provided は人が書き、managed は ./lab が書く（変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 1 章）。"""
+        return [x.strip() for x in self.get("LAB_VM_WORKER_NODES").split(",") if x.strip()]
+
+    @property
+    def vm_workers(self) -> int:
+        """managed: 足す台の数（既定 0）。"""
+        value = self.get("LAB_VM_WORKERS", "0").strip() or "0"
+        if not value.isdigit():
+            raise LabError(f"LAB_VM_WORKERS は 0 以上の整数です（{value}）")
+        return int(value)
+
+    @property
+    def litellm_memory_request(self) -> str:
+        """LiteLLM 1 つのメモリの予約（Kubernetes の量の形。既定 512Mi）。"""
+        return self.get("LAB_LITELLM_MEMORY_REQUEST", "512Mi").strip() or "512Mi"
+
+    @property
+    def litellm_memory_limit(self) -> str:
+        """LiteLLM 1 つのメモリの上限（既定 1Gi）。最大数の計算はこの値で割る。"""
+        return self.get("LAB_LITELLM_MEMORY_LIMIT", "1Gi").strip() or "1Gi"
+
+    @property
+    def vm_ssh_key(self) -> Path:
+        value = self.get("LAB_VM_SSH_KEY")
+        return Path(value).expanduser() if value else BUILD_DIR / "vm-ssh-key"
+
+    @property
+    def vm_ssh_user(self) -> str:
+        return self.get("LAB_VM_SSH_USER", "ubuntu")
+
+    @property
+    def vm_bucket(self) -> str:
+        """バケット（1 つ）。論理名はこの中のディレクトリ（audit-raw/ など）。"""
+        return self.get("LAB_VM_BUCKET")
+
+    @property
+    def vm_entry_ip_id(self) -> str:
+        """入口（内部ロードバランサ）の識別子（AWS: NLB の ARN、GCP: 転送ルールの名前）。"""
+        return self.get("LAB_VM_ENTRY_IP_ID")
+
+    @property
+    def vm_arch(self) -> str:
+        """自作イメージのアーキテクチャ（arm64 / amd64）。空なら VM から読む。"""
+        return self.get("LAB_VM_ARCH")
+
+    @property
+    def egress_proxy(self) -> str:
+        """VM と Pod が使う出口プロキシの URL（空なら中継なし）。"""
+        return self.get("LAB_EGRESS_PROXY")
+
+    @property
+    def egress_ca_file(self) -> Path | None:
+        value = self.get("LAB_EGRESS_CA_FILE")
+        if not value:
+            return None
+        p = Path(value).expanduser()
+        return p if p.is_absolute() else ROOT / p
+
+    @property
+    def egress_proxy_mac(self) -> str:
+        """./lab 自身（操作者の Mac）が使う中継の URL（空なら Mac は中継を使わない）。"""
+        return self.get("LAB_EGRESS_PROXY_MAC")
+
+    @property
+    def egress_proxy_vm(self) -> bool:
+        """managed で 4 台目の VM に中継（mitmproxy、独自 CA）を作り、3 台の直接の外向き通信を遮断するか。"""
+        return self.get("LAB_EGRESS_PROXY_VM", "false").lower() == "true"
+
+    def drop_mac_proxy(self) -> None:
+        """このプロセスの中継の設定を外す（managed の down で中継の VM を消す前に呼ぶ。消した後のクラウドの API が届かなくなるため）。"""
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy", "REQUESTS_CA_BUNDLE",
+                     "SSL_CERT_FILE", "AWS_CA_BUNDLE", "CURL_CA_BUNDLE", "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "NODE_EXTRA_CA_CERTS"):
+            os.environ.pop(name, None)
+        HELM_EXTRA.clear()
+
+    def apply_mac_proxy(self) -> None:
+        """LAB_EGRESS_PROXY_MAC があれば、このプロセスと子プロセス（helm、kubectl）の環境変数に中継と CA を入れる。
+        kubectl（127.0.0.1 の転送）と ssh は中継を通らない。Go の道具（helm）は macOS で SSL_CERT_FILE を読まないので、
+        helm には --ca-file を足す（core.helm）。"""
+        proxy = self.egress_proxy_mac
+        if not proxy:
+            return
+        ca = self.egress_ca_file
+        if ca is None or not ca.exists():
+            raise LabError("LAB_EGRESS_PROXY_MAC には LAB_EGRESS_CA_FILE（中継の CA の PEM）が要ります")
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            os.environ[name] = proxy
+        # 転送口（127.0.0.1 と Mac 用の別名）は中継を通さない
+        no_proxy = "127.0.0.1,localhost" + (f",{self.local_hostname}" if self.local_hostname else "")
+        os.environ["NO_PROXY"] = os.environ["no_proxy"] = no_proxy
+        # 中継の CA だけを信頼すると、中継を通らない接続（踏み台経由の転送口の Let's Encrypt の証明書）が検証に失敗する。
+        # 公開 CA の束に中継の CA を足した束を使う（配備で判明 2026-10-31）
+        bundle = mac_ca_bundle(ca)
+        for name in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "AWS_CA_BUNDLE", "CURL_CA_BUNDLE",
+                     "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "NODE_EXTRA_CA_CERTS"):
+            os.environ[name] = str(bundle)
+        HELM_EXTRA[:] = ["--ca-file", str(bundle)]
+        # 中継と CA が合っているか確かめる（managed で中継の VM を作り直すと、手元の CA が古いまま最初の API を呼んでしまう）
+        if not MAC_PROXY_CHECK:
+            return
+        try:
+            ctx = ssl.create_default_context(cafile=str(bundle))
+            urllib.request.urlopen("https://storage.googleapis.com/", timeout=15, context=ctx).close()
+        except urllib.error.HTTPError:
+            pass   # 応答が返れば中継と CA は正しい（状態コードは問わない）
+        except Exception as e:  # noqa: BLE001 中継に届かない、CA が合わない
+            if self.is_provided or not self.egress_proxy_vm:
+                raise LabError(f"Mac から中継 {proxy} を通せません（{type(e).__name__}: {str(e)[:120]}）。"
+                               "LAB_EGRESS_PROXY_MAC と LAB_EGRESS_CA_FILE を確かめてください") from e
+            warn(f"Mac から中継 {proxy} を通せないので、この実行は中継を使いません（中継の VM を作り直すと CA を取り直すまで合わない。"
+                 f"{type(e).__name__}）")
+            self.drop_mac_proxy()
 
     @property
     def litellm_version(self) -> str:
@@ -194,6 +527,39 @@ def has_chatgpt_token(path: Path) -> bool:
     return isinstance(data, dict) and bool(data.get("refresh_token") or data.get("access_token"))
 
 
+def public_ca_bundle() -> Path | None:
+    """公開 CA の束（certifi、無ければ botocore の同梱、無ければ OpenSSL の既定）。"""
+    try:
+        import certifi
+        return Path(certifi.where())
+    except ImportError:
+        pass
+    try:
+        import botocore
+        p = Path(botocore.__file__).parent / "cacert.pem"
+        if p.exists():
+            return p
+    except ImportError:
+        pass
+    default = ssl.get_default_verify_paths().cafile
+    return Path(default) if default and Path(default).exists() else None
+
+
+def mac_ca_bundle(proxy_ca: Path) -> Path:
+    """公開 CA の束に中継の CA を足した束を .build/mac-ca-bundle-<CA のハッシュ>.pem に作る（中身が同じなら書かない）。
+    名前に CA のハッシュを入れるのは、単体テストの偽の CA が本物の束を上書きしないため（2026-10-31 に起きた）。"""
+    parts = []
+    public = public_ca_bundle()
+    if public is not None:
+        parts.append(public.read_text())
+    ca_text = proxy_ca.read_text().strip() + "\n"
+    parts.append(ca_text)
+    dest = BUILD_DIR / f"mac-ca-bundle-{hashlib.sha256(ca_text.encode()).hexdigest()[:8]}.pem"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    write_if_changed(dest, "\n".join(parts), mode=0o644)
+    return dest
+
+
 def gen_secret(nbytes: int = 24) -> str:
     return secrets.token_hex(nbytes)
 
@@ -229,10 +595,11 @@ def short_hash(data: str | bytes) -> str:
 
 # ---- 外部コマンド ----
 def run(cmd: list[str], *, check: bool = True, capture: bool = False, quiet: bool = False,
-        input: str | None = None, timeout: float | None = None) -> subprocess.CompletedProcess:
+        input: str | None = None, timeout: float | None = None, cwd: Path | None = None,
+        env_vars: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """外部コマンドを実行する。capture=True なら標準出力を文字列で返す。
-    quiet=True なら出力を捨てる。check=True で失敗したら LabError。"""
-    kwargs: dict = {"text": True, "input": input, "timeout": timeout}
+    quiet=True なら出力を捨てる。check=True で失敗したら LabError。cwd と env_vars は CDK や aws に渡す。"""
+    kwargs: dict = {"text": True, "input": input, "timeout": timeout, "cwd": cwd, "env": env_vars}
     if capture:
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
@@ -292,6 +659,16 @@ def wait_until(timeout: int, desc: str, check) -> None:
 
 
 # ---- Kubernetes ----
+def set_kube_context(name: str) -> None:
+    """kubectl / helm が向く context。Env.load() が環境（local / aws）に合わせて呼ぶ。"""
+    global KUBE_CONTEXT
+    KUBE_CONTEXT = name
+
+
+def kube_context() -> str:
+    return KUBE_CONTEXT
+
+
 def kc(*args: str) -> list[str]:
     return ["kubectl", "--context", KUBE_CONTEXT, *args]
 
@@ -300,8 +677,14 @@ def kn(*args: str) -> list[str]:
     return ["kubectl", "--context", KUBE_CONTEXT, "-n", NS, *args]
 
 
+HELM_EXTRA: list[str] = []   # Mac が出口プロキシの中にあるときの --ca-file（Env.apply_mac_proxy が入れる）
+MAC_PROXY_CHECK = True       # apply_mac_proxy が中継の疎通を確かめるか（単体テストは切る）
+
+
 def helm(*args: str) -> list[str]:
-    return ["helm", "--kube-context", KUBE_CONTEXT, *args]
+    # --ca-file はチャートを取りに行くサブコマンドだけが受ける（get values などに付けると失敗する）
+    extra = HELM_EXTRA if args and args[0] in ("upgrade", "install", "pull", "show", "repo") else []
+    return ["helm", "--kube-context", KUBE_CONTEXT, *args, *extra]
 
 
 def kapply(*, files: list[Path] | None = None, manifest: str | None = None, namespaced: bool = True) -> bool:
@@ -334,13 +717,13 @@ def kapply(*, files: list[Path] | None = None, manifest: str | None = None, name
             tmp.unlink(missing_ok=True)
 
 
-def secret_manifest(name: str, data: dict[str, str], type_: str = "Opaque") -> str:
+def secret_manifest(name: str, data: dict[str, str], type_: str = "Opaque", namespace: str = NS) -> str:
     """Secret のマニフェスト（JSON は YAML として有効）。キーの順を固定して、差分が出ないようにする。
     CloudNativePG の初期化に渡す Secret は type_="kubernetes.io/basic-auth" にする。"""
     return json.dumps({
         "apiVersion": "v1",
         "kind": "Secret",
-        "metadata": {"name": name, "namespace": NS},
+        "metadata": {"name": name, "namespace": namespace},
         "type": type_,
         "data": {k: base64.b64encode(v.encode()).decode() for k, v in sorted(data.items())},
     }, indent=2)

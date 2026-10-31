@@ -9,7 +9,7 @@ LiteLLM を AI エージェント向けゲートウェイとして使うため�
 - **スケール検証**: Mac 1 台の Kubernetes（OrbStack + k3d）で、複数レプリカ構成の LiteLLM を検証する
 - **冗長化と監査ログ**: PostgreSQL（CloudNativePG、3 台）と Valkey（Sentinel）をマネージドサービスを使わずに冗長化し、LLM への入出力を改ざんできない形で 90 日残す。利用者ごとの利用料（概算と按分）と入出力の履歴を検索するアプリ（`/lab-audit/`）付き
 
-仕様は [docs/spec.md](docs/spec.md)、詳細設計は [docs/design.md](docs/design.md) を参照してください。各エージェントが自分の中に持つ LLM 審査（Claude Code の auto mode、Codex の Auto-review、Copilot Studio のリアルタイム保護）と設定方法の調査は [docs/agent-builtin-review.md](docs/agent-builtin-review.md) にあります。変更ごとの経緯（変更仕様書と変更設計書）は `.history/<日付>-<目的>/` にあります。
+全体の構成図は [docs/aws_architecture.md](docs/aws_architecture.md)（Mac と EKS）と [docs/vm_architecture.md](docs/vm_architecture.md)（VM 3 台とバケット 1 つ。AWS と GCP）、仕様は [docs/spec.md](docs/spec.md)、詳細設計は [docs/design.md](docs/design.md) を参照してください。各エージェントが自分の中に持つ LLM 審査（Claude Code の auto mode、Codex の Auto-review、Copilot Studio のリアルタイム保護）と設定方法の調査は [docs/agent-builtin-review.md](docs/agent-builtin-review.md) にあります。変更ごとの経緯（変更仕様書と変更設計書）は `.history/<日付>-<目的>/` にあります。
 
 ## 構築
 
@@ -31,6 +31,39 @@ brew install uv k3d kubectl helm kubectl-cnpg
 | TypeSafe の API キー | [console.typesafe.ai](https://console.typesafe.ai) の Billing でクレジットを追加してから、API Keys でキーを作り、`.env` の `TYPESAFE_API_KEY` に入れる | 審査の一次判定（Jev） |
 | ChatGPT Plus のログイン | 先に ChatGPT の設定 →「セキュリティ」で、デバイスコードによるサインイン（Codex など）を有効にする。その後 `./lab chatgpt-login`、`./lab up` | Codex 用のモデル、2 つの審査の審査官（無いあいだは試験用の偽 LLM） |
 
+## AWS で動かす（`LAB_TARGET=aws`）
+
+同じコードを AWS（EKS Auto Mode、Aurora PostgreSQL、ElastiCache for Valkey、S3、Bedrock）でも動かせます。Mac の構成を置き換えるのではなく、両方を維持します（審査・監査・検索アプリの層は環境を知らず、違いは `./lab` の分岐と `cdk/` だけ。経緯は `.history/2026-10-24-AWS構成/`）。
+
+```bash
+brew install awscli            # kubeconfig の発行に要る。CDK は npx（Node）で動く
+aws configure sso              # プロファイルを作り、aws sso login --profile <名前>
+# .env: LAB_TARGET=aws、LAB_AWS_PROFILE=<名前>、LAB_AWS_HOSTNAME=<HTTPS のホスト名>
+./lab up                       # CDK の配備 → kubeconfig → イメージを ECR へ → Secrets Manager → LiteLLM → ALB
+```
+
+人が行うこと: Bedrock のモデルアクセス（Anthropic の Claude）を有効にする、ACM の検証用 CNAME（配備の途中で表示）と、ホスト名 → ALB の CNAME（`./lab litellm` が表示）を手持ちの DNS に足す。`./lab down` は AWS の有料リソース（EKS、ALB、Aurora、ElastiCache、EFS、NAT、S3 の監査ログ、秘密情報）をすべて消します。残るのは無料のもの（ACM の証明書、Identity Center、DNS の CNAME、CDK の bootstrap）だけです。
+
+## VM 3 台とオブジェクトストレージだけで動かす（`LAB_TARGET=aws-ec2` / `gcp-vm`）
+
+マネージドサービスを使わず、クラウドの部品を計算資源とオブジェクトストレージに限って同じ構成を動かす環境です。AWS は EC2 3 台（別 AZ）と S3 のバケット 1 つ、GCP は Compute Engine 3 台（別ゾーン）と Cloud Storage のバケット 1 つ。どちらも Ubuntu 24.04 LTS の k3s（server 3 台）で、Kubernetes の中は Mac の k3d と同じ（CloudNativePG 3 台、Valkey と Sentinel、Traefik）、RustFS だけがクラウドのバケットのディレクトリ（`audit-raw/` など）に替わり、原本と閲覧記録にはオブジェクト単位の保持を付けます。クラウドの違いは `labtool/clouds/` に閉じ、VM の中（SSH で初期化）と Kubernetes の中は 1 つのコードです。1 台が落ちても処理が続きます。構成図は [docs/vm_architecture.md](docs/vm_architecture.md)、仕様は docs/spec.md 12 章、設計は docs/design.md 21 章（経緯は `.history/2026-10-25-EC2三台構成/`、`.history/2026-10-30-VM環境の共通化とGCP追加/`、`.history/2026-10-30-既存資源からの構築と出口プロキシ/`。GCP で配備と試験済み、AWS は EC2 の vCPU 上限の解除待ち）。
+
+基盤の持ち方は 2 つあります（`.env` の `LAB_INFRA`）。
+
+- `managed`（既定、検証用）: `./lab up` がクラウドの API でネットワーク・バケット・静的キー・VM 3 台・内部ロードバランサ・中継（踏み台、Zabbix サーバー）の VM を作り、識別子を `.env` に書いてから組み立てます。`./lab down` で有料のものがすべて消えます
+- `provided`（本番用）: 既存の VM 3 台、バケット 1 つ、内部ロードバランサ、踏み台を使います。用意する側（VM、ネットワーク、ロードバランサ、踏み台、バケット、役割ごとの静的キー。VM にクラウドの権限は不要。前提は docs/spec.md 12.2、依頼の書き方は [docs/provider-requests.md](docs/provider-requests.md)）から受け取った識別子と静的キー 2 組を `.env` に書き、`./lab up` はその上に組み立てるだけで、ネットワークやバケットの設定は変えません。`./lab down` は k3s を外して保持の無いディレクトリを空にし、`./lab down --all` で VM・ロードバランサ・バケットまで消します
+
+```bash
+brew install kubectl-cnpg awscli            # GCP は brew install --cask google-cloud-sdk、gcloud auth application-default login
+# .env: LAB_TARGET=aws-ec2 か gcp-vm、LAB_HOSTNAME、LAB_CLOUDFLARE_API_TOKEN（Zone / DNS / Edit）、LAB_ACME_EMAIL、
+#       LAB_JUDGE_ANTHROPIC_API_KEY（審査官）。AWS は LAB_AWS_PROFILE、GCP は LAB_GCP_PROJECT。provided は LAB_VM_* の識別子と静的キー
+./lab up   # managed: 基盤を作る → .env に書く → SSH で k3s を起こす → イメージを VM でビルドして中の registry へ → LiteLLM → Let's Encrypt
+```
+
+本番の VM は Zscaler（外向きの通信を独自 CA で中継する装置）の中にある前提です。`.env` の `LAB_EGRESS_PROXY`（中継の URL）と `LAB_EGRESS_CA_FILE`（CA）を書くと、VM・k3s・外へ出る全 Pod がその中継を通り CA を信頼します。`LAB_EGRESS_PROXY_MAC` で `./lab` 自身も中継を通せます。検証では `LAB_EGRESS_PROXY_VM=true` で 4 台目の VM に中継（mitmproxy）を作り、3 台の直接の外向きを遮断した状態で全試験を通しました（`./lab proxy-log` で中継の記録を宛先ごとに数えられます）。
+
+自作イメージ 2 つ（LiteLLM、監査アプリ）は Mac ではなく k3s の台の Docker でビルドします（アーキテクチャは VM のもの。Mac に Docker は要りません）。入口は内部ロードバランサ（AWS: 内部 NLB、GCP: 内部パススルー NLB）の固定の内部 IP で、利用者は VPC の内側からホスト名で呼びます。A レコード（ホスト名 → その IP、Mac 用の別名 `LAB_LOCAL_HOSTNAME` → 127.0.0.1）は `./lab litellm` が Cloudflare の API で作り、HTTPS は cert-manager が Let's Encrypt（DNS-01）で取ります。守りはクラウドのファイアウォールでなく各 VM の nftables、Traefik の送信元制限（管理画面と検索アプリは踏み台からだけ）、Kubernetes の NetworkPolicy です。構築ツールは SSH で VM に届き、HTTPS は踏み台経由の転送口（`https://<別名>:18443`。`./lab forward`）で入口に届きます。監視は Zabbix（agent 2 を全 VM に、公式 Helm チャートを k3s に。検証ではサーバーも踏み台の VM に立て、`./lab zabbix` が API で登録）。Claude Code のモデルは Mac と同じ Claude Max のトークンの転送、2 つの審査官は Anthropic の API キーの Claude Haiku 4.5 です。障害の試験は Mac と同じ場面に `--scenario entry-node`（Traefik の載った台を止める）が加わります。処理量は「足す台」（k3s の agent。LiteLLM と入口だけを動かし DB は持たない）を `.env` で増減して `./lab up` で調整し、LiteLLM の自動増減の最大数は台ごとの CPU とメモリの空きから数え直します。LiteLLM 1 つのメモリの予約と上限も `.env` で運用中に変えられます（経緯は `.history/2026-10-31-台の増減とLiteLLMのメモリ/`）。Kubernetes（k3s）の版は `./lab upgrade-k8s <版>` が 1 台ずつ上げます（経緯は `.history/2026-10-26-k3s版上げ/`）。
+
 ## よく使うコマンド
 
 | コマンド | 内容 |
@@ -39,9 +72,11 @@ brew install uv k3d kubectl helm kubectl-cnpg
 | `./lab rebuild` | クラスタを作り直す（DB と監査ログは消える。`.env`、ChatGPT のトークン、イメージの置き場は残る） |
 | `./lab status` | 状態の表示 |
 | `./lab upgrade v1.x.y` | LiteLLM のローリング更新 |
+| `./lab upgrade-k8s v1.x.y+k3s1 [--measure]` | VM 3 台の k3s（Kubernetes）を 1 台ずつ上げる（`aws-ec2` / `gcp-vm` だけ。マイナー版は 1 つずつ。`--measure` で上げている間の要求の失敗を測る） |
 | `./lab test-unit` / `test-smoke` / `test-idempotency` / `test-load` | 試験 |
 | `./lab test-judge [--context \| --isolated]` | 審査官の事例試験（本物の審査官を呼ぶので ChatGPT の利用枠を使う。指定なしは両方の審査） |
-| `./lab test-failover [--pooler direct]` / `test-restore` | DB と Redis の障害の試験 / バックアップから任意の時点に戻す試験 |
+| `./lab test-failover [--pooler direct]` / `test-restore` | DB と Redis の障害の試験（EKS 版は `--scenario litellm-drain` / `aurora-failover` / `valkey-failover`、VM 3 台は Mac の場面 ＋ `entry-node`、足す台があれば `worker-node`） / バックアップから任意の時点に戻す試験 |
+| `./lab down [--all]` / `./lab proxy-log` / `./lab forward` / `./lab zabbix` | VM 3 台: `down` は managed なら全部消し、provided なら k3s を外す（`--all` で VM・ロードバランサ・バケットも） / 中継（出口プロキシ）の記録の集計 / SSH の転送 3 本を張る / Zabbix の登録 |
 | `./lab test-audit` | 監査ログの試験（記録、整形、検索アプリ、精算、改ざんの防止、退避と再送） |
 | `./lab audit-synth` / `audit-bench` / `audit-compact` | 検索の速さの試験用の合成データ / 速さの試験 / 監査ログの整形を手で流す |
 | `./lab review-log` | 審査の判定ログの集計 |

@@ -1,0 +1,103 @@
+# DB（PostgreSQL、Pooler）と Valkey への接続元を、必要な Pod だけに絞る（VM の環境。変更設計書 2026-10-31 5.2 節）。
+# k3s 同梱のネットワークポリシー制御で動く。入りだけ（出は VM の nftables）。Mac の k3d には入れない。
+# ラベルの実値: PostgreSQL は cnpg.io/cluster=litellm-pg（podRole=instance）、Pooler は cnpg.io/poolerName=litellm-pg-pooler-rw、
+# Valkey は app=valkey / app=valkey-sentinel、LiteLLM は app.kubernetes.io/name=litellm、監査の Job は app=audit-*。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-ingress
+  namespace: litellm-lab
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: litellm-pg
+      cnpg.io/podRole: instance
+  policyTypes: [Ingress]
+  ingress:
+    # 同じクラスタの Pod（レプリケーション、切り替え）と Pooler
+    - from:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: litellm-pg
+    # オペレーター（cnpg-system）: 状態の取得と切り替えの指示（8000）、監視（9187）
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cnpg-system
+    # DB の移行の Job（primary に直結）、直結のとき（LAB_DB_POOLER=direct）の LiteLLM、監査アプリ、復元の試験、整形の Job
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: litellm
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [litellm-migrate, audit-compactor, audit-viewer, audit-oneshot, audit-synth, audit-bench, audit-compact, lab-restore]
+      ports:
+        - port: 5432
+    # 指標の取得（Zabbix、Prometheus）は監視の名前空間から
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9187
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pooler-ingress
+  namespace: litellm-lab
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/poolerName: litellm-pg-pooler-rw
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: litellm
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [audit-compactor, audit-viewer, audit-oneshot, audit-synth, audit-bench, audit-compact, lab-restore, litellm-migrate]
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cnpg-system
+      ports:
+        - port: 5432
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9127
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: valkey-ingress
+  namespace: litellm-lab
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [valkey, valkey-sentinel]
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: litellm
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [valkey, valkey-sentinel]
+      ports:
+        - port: 6379
+        - port: 26379
