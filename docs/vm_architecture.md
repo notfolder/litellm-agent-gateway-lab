@@ -62,7 +62,7 @@ flowchart LR
 | ネットワーク | VPC 10.60.0.0/16、サブネット /24 × 3、IGW、S3 のゲートウェイエンドポイント、セキュリティグループ（通す規則だけ） | VPC（カスタム）、サブネット /24 × 1、ファイアウォール（web / internal / ssh / proxy-in。通す規則だけ） |
 | 入口 | 内部 NLB（各サブネットの .5、クロスゾーン、TCP 443 / 80、ヘルスチェック TCP 80 10 秒 × 2） | 内部パススルー ネットワーク ロードバランサ（静的内部 IP .5、ゾーンごとのインスタンスグループ、TCP 80/443、ヘルスチェック TCP 80 5 秒 × 2） |
 | オブジェクトストレージ | S3 × 1（Object Lock 有効、既定の保持なし、バージョニング） | Cloud Storage × 1（オブジェクト保持ロック、バージョニング、均一なバケットレベルのアクセス） |
-| 静的キー | IAM ユーザー × 5（ディレクトリ単位の権限） | サービスアカウント × 6（操作者を含む）。HMAC キー（registry は GCS ドライバ用の JSON キー）、条件付きバインディングとカスタムロール |
+| 静的キー | IAM ユーザー × 2（原本を書く litellm-writer、それ以外の lab-app。ディレクトリ単位の権限） | サービスアカウント × 2。HMAC キー（lab-app は registry の GCS ドライバ用の JSON キーも）、条件付きバインディングとカスタムロール |
 | VM の権限 | 無し | 無し |
 | 中継・踏み台・Zabbix サーバー（検証だけ） | t3.medium（amd64）、専用のセキュリティグループ | e2-medium（amd64）、タグ `<prefix>-proxy` |
 
@@ -93,7 +93,7 @@ flowchart TB
             end
         end
         S3[("バケット × 1<br/>audit-raw/（保持 90 日）audit-access/（保持 90 日）<br/>audit-derived/ pg-backup/ images/ cluster/")]
-        KEYS["静的キー × 5〜6（.env の LAB_VM_S3_*）"]
+        KEYS["静的キー × 2（.env の LAB_VM_S3_LITELLM_WRITER_* と LAB_VM_S3_LAB_APP_*）"]
     end
     CLI -->|"SSH の転送（踏み台経由）"| PX -->|"443"| LB
     USERS["利用者（VPC の内側）"] -->|"https://ホスト名"| LB --> TR
@@ -151,7 +151,7 @@ flowchart LR
 
 ## 5. バケット 1 つのディレクトリ構成と保持
 
-| ディレクトリ | 中身 | 保持 | 書く利用者 |
+| ディレクトリ | 中身 | 保持 | 書く利用者（鍵は litellm-writer と lab-app の 2 つ。litellm-writer 以外は lab-app の鍵） |
 |---|---|---|---|
 | `audit-raw/` | 監査ログの原本（`raw/meta`、`raw/body`） | オブジェクト単位、90 日（書くときに付ける） | litellm-writer（追記と保持だけ。読めない・消せない） |
 | `audit-access/` | 閲覧と管理操作の記録 | オブジェクト単位、90 日 | audit-viewer |

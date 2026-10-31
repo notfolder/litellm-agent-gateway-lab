@@ -20,8 +20,8 @@ from .. import objectstore as objstore
 from .. import render
 from ..core import Env, LabError, info, ok, warn
 from . import (
-    GCP_DNS_IPS, GCP_HEALTH_CHECK_RANGES, GCP_META_IPS, GCS_ROLE_LISTER, GCS_ROLE_WRITER, NODE_COUNT, OPERATOR_USER, PROXY_PORT,
-    STATIC_KEY_USERS, ZABBIX_SERVER_PORT, Infra, Node, gcs_bindings, network_plan,
+    GCP_DNS_IPS, GCP_HEALTH_CHECK_RANGES, GCP_META_IPS, GCS_ROLE_LISTER, GCS_ROLE_WRITER, KEY_ROLES, LEGACY_KEY_USERS, NODE_COUNT,
+    PROXY_PORT, ZABBIX_SERVER_PORT, Infra, Node, gcs_bindings, network_plan,
 )
 
 LABEL_KEY = "lab-prefix"
@@ -573,7 +573,7 @@ def _set_bucket_iam(env: Env, bucket_name: str, entries: list[dict]) -> None:
     bucket = client.bucket(bucket_name)
     policy = bucket.get_iam_policy(requested_policy_version=3)
     policy.version = 3
-    managed = {f"serviceAccount:{_sa_email(env, f'{env.vm_prefix}-{u}')}" for u in [*STATIC_KEY_USERS, OPERATOR_USER]}
+    managed = {f"serviceAccount:{_sa_email(env, f'{env.vm_prefix}-{u}')}" for u in [*KEY_ROLES, *LEGACY_KEY_USERS]}
     # 操作者の ADC の主体（./lab が Cloud Storage のクライアントで消す・読むため。均一アクセスのバケットでは project の
     # legacy の権限ではオブジェクトに触れない。配備で判明 2026-10-31）
     adc_member = _adc_member(env)
@@ -630,19 +630,19 @@ def ensure_registry_json_key(env: Env, email: str) -> str | None:
 
 
 def ensure_static_keys(env: Env, bucket: str) -> dict[str, tuple[str, str]]:
-    """役割ごとのサービスアカウント（5 つ ＋ 操作者）と HMAC キー（registry は GCS ドライバ用の JSON キー）。権限は毎回そろえ、
-    キーは .env に無い利用者だけ作り直す。戻り値は作ったキー（利用者 → (アクセス ID, シークレット)。registry は ("json", base64)）。"""
+    """鍵の役割ごとのサービスアカウント（2 つ: litellm-writer、lab-app）と HMAC キー。lab-app は registry の GCS ドライバ用の
+    JSON キーも持つ。権限は毎回そろえ、キーは .env に無い役割だけ作り直す。
+    戻り値は作ったキー（役割 → (アクセス ID, シークレット)。JSON キーは ("json", base64)）。"""
     client = _storage(env)
     keys: dict[str, tuple[str, str]] = {}
     for role, (suffix, permissions) in CUSTOM_ROLES.items():
         _ensure_custom_role(env, _custom_role_name(env, role), f"litellm-lab {suffix}", permissions)
-    for user in [*STATIC_KEY_USERS, OPERATOR_USER]:
+    for user in KEY_ROLES:
         email = _ensure_service_account(env, f"{env.vm_prefix}-{user}", f"litellm-lab {user} (S3 互換の静的キー)")
-        if user == "registry":
+        if user == "lab-app":
             json_key = ensure_registry_json_key(env, email)
             if json_key:
-                keys[user] = ("json", json_key)
-            continue
+                keys["registry-json"] = ("json", json_key)
         key_name, secret_name = render.s3_env_names(user, env)
         if env.get(key_name) and env.get(secret_name):
             continue
@@ -942,7 +942,7 @@ def destroy(env: Env) -> None:
     _delete_bucket(env, names["bucket"])
     client = _storage(env)
     iam = iam_admin_v1.IAMClient()
-    for user in [*STATIC_KEY_USERS, OPERATOR_USER, "node"]:
+    for user in [*KEY_ROLES, *LEGACY_KEY_USERS, "node"]:   # 前の版の名前（5 役割 ＋ 操作者 ＋ VM）も残っていれば消す
         email = _sa_email(env, f"{env.vm_prefix}-{user}")
         with contextlib.suppress(_NotFound()):
             for meta in client.list_hmac_keys(service_account_email=email):

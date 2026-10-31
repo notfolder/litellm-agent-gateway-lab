@@ -1460,16 +1460,18 @@ flowchart TB
 
 保持の付け方: S3 は `put_object(ObjectLockMode, ObjectLockRetainUntilDate)`。GCS（`storage.googleapis.com`）は boto3 の `before-call.s3.PutObject` で `x-amz-object-lock-*` を `x-goog-object-lock-*` に写す（`gcs_object_lock_headers`）。
 
-権限（`clouds.s3_user_policies` / `clouds.gcs_bindings`）:
+権限（`clouds.s3_user_policies` / `clouds.gcs_bindings`。静的キーは 2 つ。2026-10-31 の決定。`.history/2026-10-31-静的キーを2つに/`）:
 
-| 利用者 | S3（IAM ユーザー） | GCS（サービスアカウント。条件付きバインディング） |
-|---|---|---|
-| litellm-writer | `PutObject` ＋ `PutObjectRetention` on `audit-raw/raw/*` | カスタムロール writer（`objects.create` ＋ `objects.setRetention`）on `audit-raw/raw/` |
-| audit-compactor | `ListBucket`、`GetObject` on `audit-raw/*` `audit-derived/*`、`PutObject` on `audit-derived/*` | lister（`objects.list`、`buckets.get`）、objectViewer on `audit-raw/` `audit-derived/`、objectUser on `audit-derived/` |
-| audit-viewer | `ListBucket`、`GetObject` on 原本・閲覧記録・整形済み、`PutObject` ＋ `PutObjectRetention` on `audit-access/*`、`PutObject` on `audit-derived/billing/contracts/*` `fx_rates/*` | lister、objectViewer、writer on `audit-access/`、objectUser on `audit-derived/billing/…` |
-| pg-backup / registry | `s3:*` on `pg-backup/*` / `images/*`、`ListBucket` | objectAdmin on `pg-backup/` / `images/`、lister |
-| 操作者 | 自分の資格情報（AWS）/ HMAC キー（GCP） | objectAdmin（条件なし） |
-| 全員（Deny） | `DeleteObjectVersion`、`BypassGovernanceRetention`、`PutObjectLegalHold` on `audit-raw/*` `audit-access/*`。`DeleteBucket`、`PutBucketObjectLockConfiguration`、`PutLifecycleConfiguration`、`PutBucketVersioning` | （明示的な拒否は無い。保持ロックが守る） |
+論理の利用者（Mac の RustFS と同じ litellm-writer、audit-compactor、audit-viewer、pg-backup ＋ registry ＋ 操作者）はコードに残し、VM の環境では
+`render.VM_KEY_ROLE_OF` で 2 つの鍵の役割に写す。鍵の役割ごとに論理の利用者の権限を合併する（`clouds.role_policies`）。
+
+| 鍵の役割 | 使う Pod | S3（IAM ユーザー） | GCS（サービスアカウント。条件付きバインディング） |
+|---|---|---|---|
+| litellm-writer | LiteLLM | `PutObject` ＋ `PutObjectRetention` on `audit-raw/raw/*` | カスタムロール writer（`objects.create` ＋ `objects.setRetention`）on `audit-raw/raw/` |
+| lab-app | 整形の定期処理、検索アプリ、Barman、registry、構築ツール（操作者） | `ListBucket`・`ListBucketVersions`・バケットの設定の読み取り、`GetObject` on 原本・閲覧記録・整形済み、`PutObject` on `audit-derived/*`、`PutObject` ＋ `PutObjectRetention` on `audit-access/*`、`DeleteObject(Version)` on `audit-derived/*`、`s3:*` on `pg-backup/*` `images/*` `cluster/*` | lister（`objects.list`、`buckets.get`）、objectViewer on `audit-raw/` `audit-access/` `audit-derived/`、writer on `audit-access/`、objectUser on `audit-derived/`、objectAdmin on `pg-backup/` `images/` `cluster/`。JSON キーも持つ（registry の GCS ドライバ） |
+| 両方（Deny） | `DeleteObjectVersion`、`BypassGovernanceRetention`、`PutObjectLegalHold` on `audit-raw/*` `audit-access/*`。`DeleteBucket`、`PutBucketObjectLockConfiguration`、`PutLifecycleConfiguration`、`PutBucketVersioning` | （明示的な拒否は無い。保持ロックが守る。無条件の objectAdmin は誰にも付けない） |
+
+`./lab provider-requirements` が、`.env` のバケット名を埋めた IAM ポリシーの JSON、ライフサイクルの規則、GCS のバインディングを出す（[provider-requests.md](provider-requests.md)）。
 
 ### 21.6 VM 上のビルド（`vm.build_and_push_on_node`）
 

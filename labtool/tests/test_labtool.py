@@ -701,11 +701,17 @@ class VmTargetTest(unittest.TestCase):
         self.assertEqual((aenvs["REGISTRY_STORAGE"], aenvs["REGISTRY_STORAGE_S3_BUCKET"], aenvs["REGISTRY_STORAGE_S3_ROOTDIRECTORY"]),
                          ("s3", "lab-bucket", "/images/registry"))
         # 静的キーは .env の LAB_VM_S3_*（Mac の S3_* とは別の名前。同じ .env で切り替えても混ざらない）
-        secret = render.vm_registry_secret(self.vm(LAB_VM_S3_REGISTRY_KEY="AKIAREG", LAB_VM_S3_REGISTRY_SECRET="sr",
+        secret = render.vm_registry_secret(self.vm(LAB_VM_S3_LAB_APP_KEY="AKIAREG", LAB_VM_S3_LAB_APP_SECRET="sr",
                                                    S3_REGISTRY_KEY="mac", LAB_REGISTRY_HTTP_SECRET="h"))
         self.assertEqual(render.vm_registry_secret(self.vm("gcp-vm", LAB_REGISTRY_HTTP_SECRET="h")), {"REGISTRY_HTTP_SECRET": "h"})
         self.assertEqual(render.s3_env_names("litellm-writer", env()), ("S3_LITELLM_WRITER_KEY", "S3_LITELLM_WRITER_SECRET"))
         self.assertEqual(render.s3_env_names("litellm-writer", self.vm()), ("LAB_VM_S3_LITELLM_WRITER_KEY", "LAB_VM_S3_LITELLM_WRITER_SECRET"))
+        # VM の環境の鍵は 2 つ（2026-10-31）: 原本を書く以外は lab-app に写す。Mac の RustFS は 4 利用者のまま
+        for user in ("audit-compactor", "audit-viewer", "pg-backup", "registry", "operator"):
+            self.assertEqual(render.s3_env_names(user, self.vm()), ("LAB_VM_S3_LAB_APP_KEY", "LAB_VM_S3_LAB_APP_SECRET"), user)
+        self.assertEqual(render.s3_env_names("audit-viewer", env()), ("S3_AUDIT_VIEWER_KEY", "S3_AUDIT_VIEWER_SECRET"))
+        with self.assertRaises(ValueError):
+            render.s3_env_names("someone", self.vm())
         self.assertEqual(secret, {"REGISTRY_STORAGE_S3_ACCESSKEY": "AKIAREG", "REGISTRY_STORAGE_S3_SECRETKEY": "sr",
                                   "REGISTRY_HTTP_SECRET": "h"})
 
@@ -764,13 +770,13 @@ class VmTargetTest(unittest.TestCase):
         for key in ("LAB_HOSTNAME", "LAB_LOCAL_HOSTNAME", "LAB_VM_CIDR", "LAB_VM_LOCAL_HTTPS_PORT", "LAB_SSH_ALLOW_CIDR",
                     "LAB_JUDGE_ANTHROPIC_API_KEY", "LAB_GCP_PROJECT", "LAB_GCP_MACHINE_TYPE", "LAB_INFRA", "LAB_VM_NODES",
                     "LAB_VM_BUCKET", "LAB_VM_ENTRY_IP_ID", "LAB_VM_BASTION_HOST", "LAB_VM_BASTION_CIDR",
-                    "LAB_VM_SSH_KEY", "LAB_VM_S3_LITELLM_WRITER_KEY", "LAB_EGRESS_PROXY", "LAB_EGRESS_CA_FILE",
+                    "LAB_VM_SSH_KEY", "LAB_VM_S3_LITELLM_WRITER_KEY", "LAB_VM_S3_LAB_APP_KEY", "LAB_EGRESS_PROXY", "LAB_EGRESS_CA_FILE",
                     "LAB_EGRESS_PROXY_MAC", "LAB_EGRESS_PROXY_VM", "LAB_VM_ARCH", "LAB_ZABBIX_VM", "LAB_ZABBIX_SERVER",
                     "LAB_ZABBIX_API_URL", "LAB_ZABBIX_API_TOKEN", "LAB_ZABBIX_LOCAL_PORT"):
             self.assertIn(f"\n{key}=", text)
         # 浮動 IP と公開の入口は無くなった（2026-10-31）
         for old in ("LAB_EC2_VPC_CIDR", "LAB_EC2_DISK_GIB", "LAB_EC2_LOCAL_PORT", "LAB_EC2_KEEP_EIP", "LAB_AWS_HOSTNAME=",
-                    "LAB_VM_KEEP_ENTRY_IP", "LAB_WEB_ALLOW_CIDR"):
+                    "LAB_VM_KEEP_ENTRY_IP", "LAB_WEB_ALLOW_CIDR", "LAB_VM_S3_AUDIT_VIEWER_KEY", "LAB_VM_S3_OPERATOR_KEY", "LAB_VM_S3_REGISTRY_KEY"):
             self.assertNotIn(old, text)
 
 
@@ -786,10 +792,11 @@ class CloudLayerTest(unittest.TestCase):
         with self.assertRaises(LabError) as cm:
             vm.require_provided_env(e)
         self.assertIn("LAB_VM_S3_LITELLM_WRITER_KEY", str(cm.exception))
-        self.assertIn("LAB_VM_S3_OPERATOR_KEY", str(cm.exception))   # GCP は操作者の HMAC キーも必須
-        self.assertIn(render.GCS_REGISTRY_KEY_ENV, str(cm.exception))   # GCP の registry は JSON キー
+        self.assertIn("LAB_VM_S3_LAB_APP_KEY", str(cm.exception))   # 鍵は 2 つ（2026-10-31）
+        self.assertNotIn("LAB_VM_S3_OPERATOR_KEY", str(cm.exception))
+        self.assertIn(render.GCS_REGISTRY_KEY_ENV, str(cm.exception))   # GCP の registry は lab-app の JSON キー
         self.assertIn("LAB_VM_BASTION_HOST", str(cm.exception))   # 踏み台（管理系の経路と Mac の転送）も必須（2026-10-31）
-        for user in ("litellm-writer", "audit-compactor", "audit-viewer", "pg-backup", "operator"):
+        for user in ("litellm-writer", "lab-app"):
             for name in render.s3_env_names(user, e):
                 e.values[name] = "x"
         e.values[render.GCS_REGISTRY_KEY_ENV] = "e30="
@@ -902,31 +909,47 @@ class CloudLayerTest(unittest.TestCase):
         self.assertEqual(rules["pg-backup-versions"]["NoncurrentVersionExpiration"], {"NoncurrentDays": 1})
         self.assertNotIn("Expiration", rules["images-versions"])
         self.assertEqual((aws_ec2.s3_endpoint(e), gcp.s3_endpoint(e)), ("", "https://storage.googleapis.com"))
-        # AWS: 1 バケットのディレクトリの ARN。一覧はバケット全体。保持を付けて書く利用者に PutObjectRetention。全員に明示的な拒否
+        # AWS: IAM ユーザーは 2 つ（2026-10-31）。1 バケットのディレクトリの ARN。一覧はバケット全体。両方に明示的な拒否
         pol = clouds.s3_user_policies(e, "lab-bucket")
-        self.assertEqual(set(pol), set(clouds.STATIC_KEY_USERS))
+        self.assertEqual(set(pol), {"litellm-writer", "lab-app"})
         writer = pol["litellm-writer"]["Statement"]
         self.assertEqual(writer[0]["Resource"], ["arn:aws:s3:::lab-bucket/audit-raw/raw/*"])
         self.assertIn({"Effect": "Allow", "Action": ["s3:PutObjectRetention"], "Resource": ["arn:aws:s3:::lab-bucket/audit-raw/raw/*"]}, writer)
         self.assertFalse(any("s3:ListBucket" in st["Action"] for st in writer if st["Effect"] == "Allow"))
-        compactor = pol["audit-compactor"]["Statement"]
-        self.assertTrue(any(st["Action"][0] == "s3:ListBucket" and st["Resource"] == ["arn:aws:s3:::lab-bucket"] for st in compactor))
-        self.assertEqual(pol["registry"]["Statement"][0]["Resource"], ["arn:aws:s3:::lab-bucket/images/*"])
-        denies = [st for st in pol["pg-backup"]["Statement"] if st["Effect"] == "Deny"]
-        self.assertEqual(len(denies), 2)
-        self.assertIn("arn:aws:s3:::lab-bucket/audit-raw/*", denies[0]["Resource"])
-        self.assertIn("s3:BypassGovernanceRetention", denies[0]["Action"])
-        self.assertIn("s3:PutBucketObjectLockConfiguration", denies[1]["Action"])
-        # GCP: 条件付きバインディング。原本と閲覧記録は追記＋保持の writer、上書きのあるディレクトリは objectUser、一覧は lister
+        self.assertFalse(any("s3:GetObject" in st["Action"] for st in writer if st["Effect"] == "Allow"))   # 書き込み用は読めない
+        app = pol["lab-app"]["Statement"]
+        allow = [st for st in app if st["Effect"] == "Allow"]
+        def allowed(action, resource):
+            return any(action in st["Action"] and resource in st["Resource"] for st in allow)
+        self.assertTrue(allowed("s3:GetObject", "arn:aws:s3:::lab-bucket/audit-raw/*"))
+        self.assertTrue(allowed("s3:PutObject", "arn:aws:s3:::lab-bucket/audit-access/*"))
+        self.assertTrue(allowed("s3:PutObjectRetention", "arn:aws:s3:::lab-bucket/audit-access/*"))
+        self.assertTrue(allowed("s3:*", "arn:aws:s3:::lab-bucket/images/*"))
+        self.assertTrue(allowed("s3:*", "arn:aws:s3:::lab-bucket/pg-backup/*"))
+        self.assertTrue(allowed("s3:*", "arn:aws:s3:::lab-bucket/cluster/*"))
+        self.assertTrue(allowed("s3:DeleteObjectVersion", "arn:aws:s3:::lab-bucket/audit-derived/*"))
+        self.assertFalse(allowed("s3:PutObject", "arn:aws:s3:::lab-bucket/audit-raw/raw/*"))   # 原本は書けない
+        bucket_st = next(st for st in allow if st["Resource"] == ["arn:aws:s3:::lab-bucket"])
+        for a in ("s3:ListBucket", "s3:ListBucketVersions", "s3:GetBucketVersioning", "s3:GetBucketObjectLockConfiguration", "s3:GetLifecycleConfiguration"):
+            self.assertIn(a, bucket_st["Action"])
+        for role in pol.values():
+            denies = [st for st in role["Statement"] if st["Effect"] == "Deny"]
+            self.assertEqual(len(denies), 2)
+            self.assertIn("arn:aws:s3:::lab-bucket/audit-raw/*", denies[0]["Resource"])
+            self.assertIn("s3:BypassGovernanceRetention", denies[0]["Action"])
+            self.assertIn("s3:PutBucketObjectLockConfiguration", denies[1]["Action"])
+        # GCP: 条件付きバインディング（2 サービスアカウント）。原本と閲覧記録は追記＋保持の writer、上書きのあるディレクトリは objectUser、一覧は lister
         b = clouds.gcs_bindings(e, "lab-bucket")
+        self.assertEqual({x["user"] for x in b}, {"litellm-writer", "lab-app"})
         self.assertIn({"user": "litellm-writer", "role": clouds.GCS_ROLE_WRITER, "prefix": "audit-raw/raw/"}, b)
-        self.assertIn({"user": "audit-viewer", "role": clouds.GCS_ROLE_WRITER, "prefix": "audit-access/"}, b)
-        self.assertIn({"user": "audit-compactor", "role": "roles/storage.objectUser", "prefix": "audit-derived/"}, b)
-        self.assertIn({"user": "audit-compactor", "role": clouds.GCS_ROLE_LISTER, "prefix": ""}, b)
-        self.assertIn({"user": "audit-viewer", "role": "roles/storage.objectViewer", "prefix": "audit-raw/"}, b)
-        self.assertIn({"user": "pg-backup", "role": "roles/storage.objectAdmin", "prefix": "pg-backup/"}, b)
-        self.assertIn({"user": "registry", "role": "roles/storage.objectAdmin", "prefix": "images/"}, b)
-        self.assertIn({"user": "operator", "role": "roles/storage.objectAdmin", "prefix": ""}, b)
+        self.assertIn({"user": "lab-app", "role": clouds.GCS_ROLE_WRITER, "prefix": "audit-access/"}, b)
+        self.assertIn({"user": "lab-app", "role": "roles/storage.objectUser", "prefix": "audit-derived/"}, b)
+        self.assertIn({"user": "lab-app", "role": clouds.GCS_ROLE_LISTER, "prefix": ""}, b)
+        self.assertIn({"user": "lab-app", "role": "roles/storage.objectViewer", "prefix": "audit-raw/"}, b)
+        self.assertIn({"user": "lab-app", "role": "roles/storage.objectAdmin", "prefix": "pg-backup/"}, b)
+        self.assertIn({"user": "lab-app", "role": "roles/storage.objectAdmin", "prefix": "images/"}, b)
+        self.assertIn({"user": "lab-app", "role": "roles/storage.objectAdmin", "prefix": "cluster/"}, b)
+        self.assertFalse(any(x["user"] == "lab-app" and x["prefix"] == "" and x["role"] == "roles/storage.objectAdmin" for x in b))   # 無条件の objectAdmin は無い
         self.assertFalse(any(x["user"] == "litellm-writer" and x["role"] != clouds.GCS_ROLE_WRITER for x in b))   # 書き込み用は読めない
         self.assertEqual(gcp._custom_role_name(e, clouds.GCS_ROLE_WRITER), "projects/my-project/roles/litellm_lab_ec2_writer")
         gr = gcp._lifecycle_rules([rules["audit-raw-all"]])

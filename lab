@@ -97,6 +97,8 @@ COMMANDS: dict[str, tuple[str, object]] = {
     # 手作業・保守
     "chatgpt-login": ("ChatGPT Plus にデバイスコードでログインする（手作業。初回だけ）", stage(stages.chatgpt_login)),
     "forward": ("aws-ec2 / gcp-vm: SSH のポート転送（k3s の 6443、入口の 443、Zabbix の web）を確かめて張る", loaded),
+    "provider-requirements": ("担当部署への依頼に添える IAM ポリシーの JSON とライフサイクルの規則を出す（docs/provider-requests.md）",
+                              lambda: ops.provider_requirements(Env.load())),
     "upgrade": ("LiteLLM を別の版でローリング更新する（例: ./lab upgrade v1.104.3）", None),
     "upgrade-k8s": ("aws-ec2 / gcp-vm: k3s（Kubernetes）を 1 台ずつ上げる（例: ./lab upgrade-k8s v1.36.1+k3s1。マイナー版は 1 つずつ）", None),
     "clean-all": ("クラスタ、生成したクライアント設定、ビルドしたイメージを消す（.env とトークンは残す）", None),

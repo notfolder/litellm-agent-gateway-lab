@@ -498,6 +498,20 @@ def client_files(env: Env, claude_key: str, codex_key: str, codex_home: Path,
 # ---- オブジェクトストレージ（変更設計書 2 章） ----
 AUDIT_RAW, AUDIT_ACCESS, AUDIT_DERIVED, PG_BACKUP = "audit-raw", "audit-access", "audit-derived", "pg-backup"
 S3_USERS = ["litellm-writer", "audit-compactor", "audit-viewer", "pg-backup"]
+# VM の環境（aws-ec2 / gcp-vm）の静的キーは 2 つ: 原本を書く litellm-writer と、それ以外の lab-app（整形、検索アプリ、バックアップ、
+# イメージ置き場、k3s の設定、操作者）。論理の利用者は Mac の RustFS と同じまま残し、鍵の役割に写す（変更設計書 2026-10-31-静的キーを2つに）
+VM_KEY_ROLES = ["litellm-writer", "lab-app"]
+VM_KEY_ROLE_OF = {"litellm-writer": "litellm-writer", "audit-compactor": "lab-app", "audit-viewer": "lab-app",
+                  "pg-backup": "lab-app", "registry": "lab-app", "operator": "lab-app", "lab-app": "lab-app"}
+# 前の版（5 役割 ＋ 操作者）の名前。down で残りを消すとき、provided の検査で古い項目を見分けるときに使う
+LEGACY_KEY_USERS = ["litellm-writer", "audit-compactor", "audit-viewer", "pg-backup", "registry", "operator"]
+
+
+def vm_key_role(user: str) -> str:
+    try:
+        return VM_KEY_ROLE_OF[user]
+    except KeyError:
+        raise ValueError(f"知らない利用者です: {user}") from None
 # VM の環境の 1 バケットのディレクトリ（Mac の 4 つ ＋ イメージ置き場 ＋ k3s のトークンと版）と、保持を付けるもの
 VM_STORES = [AUDIT_RAW, AUDIT_ACCESS, AUDIT_DERIVED, PG_BACKUP, "images", "cluster"]
 RETAINED_STORES = (AUDIT_RAW, AUDIT_ACCESS)
@@ -507,7 +521,11 @@ def s3_env_names(user: str, env: Env | None = None) -> tuple[str, str]:
     """利用者のアクセスキーとシークレットを置く .env の名前。Mac は S3_LITELLM_WRITER_KEY / _SECRET、
     VM の環境（aws-ec2 / gcp-vm）は LAB_VM_S3_LITELLM_WRITER_KEY / _SECRET（用意する側が発行したキー、または provision が書いたキー。
     Mac の RustFS の値と名前が違うので、同じ .env で両方を切り替えても混ざらない。変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 2 章）。"""
-    base = ("LAB_VM_S3_" if env is not None and env.is_vm else "S3_") + user.upper().replace("-", "_")
+    if env is not None and env.is_vm:
+        user = vm_key_role(user)   # VM の環境は鍵の役割（2 つ）の名前
+        base = "LAB_VM_S3_" + user.upper().replace("-", "_")
+    else:
+        base = "S3_" + user.upper().replace("-", "_")
     return base + "_KEY", base + "_SECRET"
 
 

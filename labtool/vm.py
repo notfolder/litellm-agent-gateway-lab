@@ -247,15 +247,12 @@ def require_provided_env(env: Env) -> None:
             missing.append(f"{key}（{what}）")
     if env.zabbix_server and not env.zabbix_vm and not (env.get("LAB_ZABBIX_API_URL") and env.get("LAB_ZABBIX_API_TOKEN")):
         missing.append("LAB_ZABBIX_API_URL / LAB_ZABBIX_API_TOKEN（LAB_ZABBIX_SERVER があるとき。ホストの登録に使う）")
-    users = [*clouds.STATIC_KEY_USERS] + ([clouds.OPERATOR_USER] if env.is_gcp_vm else [])
-    for user in users:
-        if user == "registry" and env.is_gcp_vm:
-            if not env.get(render.GCS_REGISTRY_KEY_ENV):
-                missing.append(f"{render.GCS_REGISTRY_KEY_ENV}（registry のサービスアカウントの JSON キーを base64 で。GCS ドライバ用）")
-            continue
+    for user in clouds.KEY_ROLES:   # 静的キーは 2 つ（litellm-writer、lab-app）
         key_name, secret_name = render.s3_env_names(user, env)
         if not (env.get(key_name) and env.get(secret_name)):
             missing.append(f"{key_name} / {secret_name}（{user} の静的キー）")
+    if env.is_gcp_vm and not env.get(render.GCS_REGISTRY_KEY_ENV):
+        missing.append(f"{render.GCS_REGISTRY_KEY_ENV}（lab-app のサービスアカウントの JSON キーを base64 で。registry の GCS ドライバ用）")
     if env.egress_proxy and (env.egress_ca_file is None or not env.egress_ca_file.exists()):
         missing.append("LAB_EGRESS_CA_FILE（中継の CA の PEM。LAB_EGRESS_PROXY があるとき必須）")
     if missing:

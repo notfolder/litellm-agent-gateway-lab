@@ -21,7 +21,7 @@ from .. import objectstore as objstore
 from .. import render
 from ..core import Env, LabError, info, ok, warn
 from . import (
-    AWS_DNS_IPS, AWS_META_IPS, NODE_COUNT, PROXY_PORT, STATIC_KEY_USERS, ZABBIX_SERVER_PORT, Infra, Node, network_plan,
+    AWS_DNS_IPS, AWS_META_IPS, KEY_ROLES, LEGACY_KEY_USERS, NODE_COUNT, PROXY_PORT, ZABBIX_SERVER_PORT, Infra, Node, network_plan,
     s3_user_policies,
 )
 
@@ -602,7 +602,7 @@ def destroy(env: Env) -> None:
     iam = aws.client(env, "iam")
     names = _names(env)
     _delete_bucket(env, _bucket_name(env, identity(env)))
-    for user in STATIC_KEY_USERS:
+    for user in [*KEY_ROLES, *LEGACY_KEY_USERS]:   # 前の版の名前も残っていれば消す
         name = _iam_user_name(env, user)
         with contextlib.suppress(iam.exceptions.NoSuchEntityException):
             for k in iam.list_access_keys(UserName=name)["AccessKeyMetadata"]:

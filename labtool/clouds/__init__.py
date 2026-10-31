@@ -26,8 +26,11 @@ TOKEN_KEY = "cluster/k3s/token"
 VERSION_KEY = "cluster/k3s/version"
 # バケットの静的キーの利用者（Mac の RustFS と同じ 4 つ ＋ イメージ置き場）と、操作者（GCP で必須）
 REGISTRY_USER = "registry"
-STATIC_KEY_USERS = ["litellm-writer", "audit-compactor", "audit-viewer", "pg-backup", REGISTRY_USER]
+STATIC_KEY_USERS = ["litellm-writer", "audit-compactor", "audit-viewer", "pg-backup", REGISTRY_USER]   # 論理の利用者
 OPERATOR_USER = "operator"
+# 実際に作る静的キー（IAM ユーザー／サービスアカウント）は 2 つ（render.VM_KEY_ROLES）。論理の利用者の権限を役割ごとに合併する
+KEY_ROLES = render.VM_KEY_ROLES
+LEGACY_KEY_USERS = render.LEGACY_KEY_USERS
 # 中継（出口プロキシ。検証では踏み台と Zabbix サーバーも兼ねる）の VM が聞くポートと、サブネットの中の位置（.20）
 PROXY_PORT = 3128
 PROXY_HOST_INDEX = 19
@@ -128,16 +131,35 @@ def network_plan(cidr: str, subnets_per_node: bool) -> dict:
 
 
 def static_key_policies(env: Env) -> dict[str, dict]:
-    """利用者ごとの権限（論理名。S3 の IAM の形）。Mac の RustFS と同じ 4 利用者 ＋ registry（images）。
+    """論理の利用者ごとの権限（論理名。S3 の IAM の形）。Mac の RustFS と同じ 4 利用者 ＋ registry（images）＋ 操作者
+    （k3s のトークンと版の cluster/、片付けで消す audit-derived/、バケットの設定の読み取り）。
     原本と閲覧記録に保持を付けて書く利用者には PutObjectRetention を足す（S3 は保持を付けて書くときに要る）。"""
-    policies = dict(render.s3_policies())
+    policies = {u: {"Version": d["Version"], "Statement": [dict(s) for s in d["Statement"]]} for u, d in render.s3_policies().items()}
     policies[REGISTRY_USER] = {"Version": "2012-10-17", "Statement": [
         {"Effect": "Allow", "Action": ["s3:*"], "Resource": ["arn:aws:s3:::images", "arn:aws:s3:::images/*"]}]}
+    policies[OPERATOR_USER] = {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["s3:*"], "Resource": ["arn:aws:s3:::cluster", "arn:aws:s3:::cluster/*"]},
+        {"Effect": "Allow", "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"], "Resource": [f"arn:aws:s3:::{render.AUDIT_DERIVED}/*"]},
+        {"Effect": "Allow", "Action": ["s3:ListBucket", "s3:ListBucketVersions", "s3:GetBucketVersioning", "s3:GetBucketObjectLockConfiguration",
+                                       "s3:GetBucketPublicAccessBlock", "s3:GetLifecycleConfiguration"],
+         "Resource": [f"arn:aws:s3:::{render.AUDIT_RAW}", f"arn:aws:s3:::{render.AUDIT_ACCESS}", f"arn:aws:s3:::{render.AUDIT_DERIVED}"]},
+    ]}
     policies["litellm-writer"]["Statement"].append(
         {"Effect": "Allow", "Action": ["s3:PutObjectRetention"], "Resource": [f"arn:aws:s3:::{render.AUDIT_RAW}/raw/*"]})
     policies["audit-viewer"]["Statement"].append(
         {"Effect": "Allow", "Action": ["s3:PutObjectRetention"], "Resource": [f"arn:aws:s3:::{render.AUDIT_ACCESS}/*"]})
     return policies
+
+
+def role_policies(env: Env) -> dict[str, list[dict]]:
+    """鍵の役割（2 つ）ごとに、論理の利用者の文を合併する（同じ文は 1 つに）。"""
+    out: dict[str, list[dict]] = {role: [] for role in KEY_ROLES}
+    for user, doc in static_key_policies(env).items():
+        role = render.vm_key_role(user)
+        for st in doc["Statement"]:
+            if st not in out[role]:
+                out[role].append(st)
+    return out
 
 
 def _split_logical_arn(arn: str) -> tuple[str, str | None]:
@@ -148,8 +170,8 @@ def _split_logical_arn(arn: str) -> tuple[str, str | None]:
 
 
 def s3_user_policies(env: Env, bucket: str) -> dict[str, dict]:
-    """IAM ユーザーごとの権限を 1 バケットのディレクトリに写す（変更設計書 4.3 節）。
-    一覧（ListBucket、ListBucketMultipartUploads）はバケット全体。全員に原本と閲覧記録の版の削除・保持の回避、
+    """鍵の役割（IAM ユーザー 2 つ）ごとの権限を 1 バケットのディレクトリに写す（変更設計書 4.3 節、2026-10-31-静的キーを2つに）。
+    一覧（ListBucket、ListBucketMultipartUploads）はバケット全体。両方に原本と閲覧記録の版の削除・保持の回避、
     バケットの設定変更の明示的な拒否を付ける。"""
     out = {}
     deny = {"Effect": "Deny", "Action": ["s3:DeleteObjectVersion", "s3:BypassGovernanceRetention", "s3:PutObjectLegalHold"],
@@ -157,24 +179,29 @@ def s3_user_policies(env: Env, bucket: str) -> dict[str, dict]:
     deny_bucket = {"Effect": "Deny", "Action": ["s3:DeleteBucket", "s3:PutBucketObjectLockConfiguration",
                                                  "s3:PutLifecycleConfiguration", "s3:PutBucketVersioning"],
                    "Resource": [f"arn:aws:s3:::{bucket}"]}
-    for user, doc in static_key_policies(env).items():
-        statements = []
-        for st in doc["Statement"]:
-            bucket_level = [a for a in st["Action"] if a in ("s3:ListBucket", "s3:*")]
+    bucket_actions = {"s3:ListBucket", "s3:*", "s3:ListBucketVersions", "s3:GetBucketVersioning", "s3:GetBucketObjectLockConfiguration",
+                      "s3:GetBucketPublicAccessBlock", "s3:GetLifecycleConfiguration"}
+    for role, role_statements in role_policies(env).items():
+        statements: list[dict] = []
+        bucket_level: set[str] = set()
+        for st in role_statements:
+            bucket_level |= {a for a in st["Action"] if a in bucket_actions}
             resources = []
             for arn in st["Resource"]:
                 logical, obj = _split_logical_arn(arn)
                 if obj is None:
                     continue
                 resources.append(f"arn:aws:s3:::{bucket}/{logical}/{obj}")
-            if resources:
-                statements.append({"Effect": "Allow", "Action": [a for a in st["Action"] if a != "s3:ListBucket"],
-                                   "Resource": resources})
-            if bucket_level:
-                statements.append({"Effect": "Allow", "Action": ["s3:ListBucket", "s3:ListBucketMultipartUploads",
-                                                                 "s3:GetBucketLocation"],
-                                   "Resource": [f"arn:aws:s3:::{bucket}"]})
-        out[user] = {"Version": "2012-10-17", "Statement": statements + [deny, deny_bucket]}
+            actions = [a for a in st["Action"] if a not in bucket_actions or a == "s3:*"]
+            if resources and actions:
+                new = {"Effect": "Allow", "Action": actions, "Resource": resources}
+                if new not in statements:
+                    statements.append(new)
+        if bucket_level:
+            actions = sorted({"s3:ListBucket", "s3:ListBucketMultipartUploads", "s3:GetBucketLocation"}
+                             | (bucket_level - {"s3:*", "s3:ListBucket"}))
+            statements.append({"Effect": "Allow", "Action": actions, "Resource": [f"arn:aws:s3:::{bucket}"]})
+        out[role] = {"Version": "2012-10-17", "Statement": statements + [deny, deny_bucket]}
     return out
 
 
@@ -185,9 +212,9 @@ GCS_ROLE_FOR_ACTION = {"s3:GetObject": "roles/storage.objectViewer", "s3:*": "ro
 
 
 def gcs_bindings(env: Env, bucket: str) -> list[dict]:
-    """利用者ごとの権限を GCS の条件付きバインディング（{user, role, prefix}。prefix は鍵の接頭辞。空なら条件なし）に写す。
-    S3 の PutObject は、接頭辞限定（原本、閲覧記録）なら writer（追記 ＋ 保持）、ディレクトリ全体なら objectUser
-    （上書きには delete が要る）。一覧は lister（条件なし。一覧だけ）。操作者は objectAdmin（条件なし）。"""
+    """鍵の役割（サービスアカウント 2 つ）ごとの権限を GCS の条件付きバインディング（{user, role, prefix}。prefix は鍵の接頭辞。
+    空なら条件なし）に写す。S3 の PutObject は、接頭辞限定（原本、閲覧記録）なら writer（追記 ＋ 保持）、ディレクトリ全体なら
+    objectUser（上書きと削除ができる）。一覧とバケットの設定の読み取りは lister（条件なし）。s3:* は objectAdmin（接頭辞付き）。"""
     out: list[dict] = []
 
     def add(user: str, role: str, prefix: str) -> None:
@@ -195,24 +222,27 @@ def gcs_bindings(env: Env, bucket: str) -> list[dict]:
         if entry not in out:
             out.append(entry)
 
-    for user, doc in static_key_policies(env).items():
-        for st in doc["Statement"]:
+    bucket_reads = {"s3:ListBucket", "s3:ListBucketVersions", "s3:GetBucketVersioning", "s3:GetBucketObjectLockConfiguration",
+                    "s3:GetBucketPublicAccessBlock", "s3:GetLifecycleConfiguration"}
+    for key_role, statements in role_policies(env).items():
+        for st in statements:
             for arn in st["Resource"]:
                 logical, obj = _split_logical_arn(arn)
                 for action in st["Action"]:
-                    if action == "s3:ListBucket":
-                        add(user, GCS_ROLE_LISTER, "")
+                    if action in bucket_reads:
+                        add(key_role, GCS_ROLE_LISTER, "")
                     elif action == "s3:PutObjectRetention":
                         continue   # writer のロールに含める
                     elif obj is None:
                         if action == "s3:*":
-                            add(user, GCS_ROLE_LISTER, "")
+                            add(key_role, GCS_ROLE_LISTER, "")
                         continue
                     elif action == "s3:PutObject":
                         # 保持を付けるディレクトリ（原本、閲覧記録）は追記と保持だけの writer。それ以外は上書きがあるので objectUser
                         role = GCS_ROLE_WRITER if logical in render.RETAINED_STORES else "roles/storage.objectUser"
-                        add(user, role, f"{logical}/{obj.rstrip('*')}")
+                        add(key_role, role, f"{logical}/{obj.rstrip('*')}")
+                    elif action in ("s3:DeleteObject", "s3:DeleteObjectVersion"):
+                        add(key_role, "roles/storage.objectUser", f"{logical}/{obj.rstrip('*')}")
                     else:
-                        add(user, GCS_ROLE_FOR_ACTION[action], f"{logical}/{obj.rstrip('*')}")
-    add(OPERATOR_USER, "roles/storage.objectAdmin", "")
+                        add(key_role, GCS_ROLE_FOR_ACTION[action], f"{logical}/{obj.rstrip('*')}")
     return out

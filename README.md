@@ -51,7 +51,7 @@ aws configure sso              # プロファイルを作り、aws sso login --p
 基盤の持ち方は 2 つあります（`.env` の `LAB_INFRA`）。
 
 - `managed`（既定、検証用）: `./lab up` がクラウドの API でネットワーク・バケット・静的キー・VM 3 台・内部ロードバランサ・中継（踏み台、Zabbix サーバー）の VM を作り、識別子を `.env` に書いてから組み立てます。`./lab down` で有料のものがすべて消えます
-- `provided`（本番用）: 既存の VM 3 台、バケット 1 つ、内部ロードバランサ、踏み台を使います。用意する側（VM、ネットワーク、ロードバランサ、踏み台、バケット、役割ごとの静的キー。VM にクラウドの権限は不要。前提は docs/spec.md 12.2）から受け取った識別子と静的キーを `.env` に書き、`./lab up` はその上に組み立てるだけで、ネットワークやバケットの設定は変えません。`./lab down` は k3s を外して保持の無いディレクトリを空にし、`./lab down --all` で VM・ロードバランサ・バケットまで消します
+- `provided`（本番用）: 既存の VM 3 台、バケット 1 つ、内部ロードバランサ、踏み台を使います。用意する側（VM、ネットワーク、ロードバランサ、踏み台、バケット、役割ごとの静的キー。VM にクラウドの権限は不要。前提は docs/spec.md 12.2、依頼の書き方は [docs/provider-requests.md](docs/provider-requests.md)）から受け取った識別子と静的キー 2 組を `.env` に書き、`./lab up` はその上に組み立てるだけで、ネットワークやバケットの設定は変えません。`./lab down` は k3s を外して保持の無いディレクトリを空にし、`./lab down --all` で VM・ロードバランサ・バケットまで消します
 
 ```bash
 brew install kubectl-cnpg awscli            # GCP は brew install --cask google-cloud-sdk、gcloud auth application-default login

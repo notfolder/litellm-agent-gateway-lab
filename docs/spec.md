@@ -987,7 +987,7 @@ Mac の検証環境（8 章）と同じ中身を、マネージドサービス�
 | DNS | Cloudflare の API トークン（ホスト名 → ロードバランサの内部 IP、別名 → 127.0.0.1 の A レコード） |
 | Zabbix（任意） | サーバーの宛先（`LAB_ZABBIX_SERVER`、10051）、API の URL とトークン（`LAB_ZABBIX_API_URL` / `LAB_ZABBIX_API_TOKEN`。ホスト・プロキシ・アクションの作成と更新の権限） |
 | バケット | 1 つ。S3: Object Lock 有効（既定の保持なし）、バージョニング有効、パブリックアクセスの遮断。GCS: オブジェクト保持ロック有効（作成時）、バージョニング有効、公開アクセスの防止、均一なバケットレベルのアクセス（ディレクトリ単位の権限に要る） |
-| 静的キー | 役割ごとに 5 組（GCP は操作者を含めて 6 組。GCP の registry は HMAC でなくサービスアカウントの JSON キー）。権限は design 21.5 節 |
+| 静的キー | **2 組**: 原本を書く（litellm-writer）と、それ以外（lab-app: 整形、検索アプリ、バックアップ、イメージ置き場、k3s の設定、構築ツールの操作者）。GCP は lab-app のサービスアカウントの JSON キーも（registry の GCS ドライバ）。権限は design 21.5 節、依頼の書き方は [provider-requests.md](provider-requests.md) |
 | 中継 | URL と CA（PEM） |
 
 ### 12.3 検証項目

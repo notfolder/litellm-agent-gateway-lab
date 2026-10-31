@@ -7,7 +7,6 @@ import subprocess
 import sys
 
 from . import stages
-from . import render
 from .core import (
     BUILD_DIR, CLUSTER, NS, ROOT, Env, LabError, cluster_exists, helm, http_ok,
     info, kn, ok, output, run, step, succeeds, warn,
@@ -65,8 +64,9 @@ def down(everything: bool = False) -> None:
             for key in vm.PROVISIONED_ENV_KEYS:
                 if env.get(key):
                     env.set(key, "")
-            for user in [*clouds.STATIC_KEY_USERS, clouds.OPERATOR_USER]:
-                for name in render.s3_env_names(user, env):
+            for user in [*clouds.KEY_ROLES, *clouds.LEGACY_KEY_USERS]:   # 前の版の項目も残っていれば消す
+                base = "LAB_VM_S3_" + user.upper().replace("-", "_")
+                for name in (base + "_KEY", base + "_SECRET"):
                     if env.get(name):
                         env.set(name, "")
             ok(f"{env.target} の有料リソースを削除しました（VM、ディスク、バケット、静的キー、中継（踏み台）、内部ロードバランサ）。"
@@ -228,6 +228,25 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
         warn(f"core.py の K3S_IMAGE を rancher/k3s:{target.replace('+k3s', '-k3s')} に変えてコミットしてください"
              "（変えないと、次の ./lab up が版の食い違いで止まります。Mac の k3d も同じ版になります）")
     return result
+
+
+def provider_requirements(env: Env) -> None:
+    """担当部署への依頼に添える物を出す（docs/provider-requests.md）: IAM ユーザー 2 つのポリシー（JSON。バケット名は .env の
+    LAB_VM_BUCKET、無ければ <バケット名>）と、バケットのライフサイクルの規則（S3 の形）。VM の環境以外でも出せる。"""
+    import json as _json
+    from . import clouds, objectstore, render
+    bucket = env.vm_bucket or "<バケット名>"
+    print(f"# IAM ユーザーのポリシー（バケット {bucket}。docs/provider-requests.md 6 章）")
+    for role, doc in clouds.s3_user_policies(env, bucket).items():
+        print(f"\n## {role}\n")
+        print(_json.dumps(doc, indent=2, ensure_ascii=False))
+    print("\n# ライフサイクルの規則（S3 の PutBucketLifecycleConfiguration の Rules。docs/provider-requests.md 5 章）\n")
+    print(_json.dumps({"Rules": objectstore.vm_lifecycle_rules(env)}, indent=2, ensure_ascii=False))
+    print("\n# GCP のバインディング（サービスアカウント → ロール → 接頭辞。docs/provider-requests.md 末尾）\n")
+    for b in clouds.gcs_bindings(env, bucket):
+        print(f"{b['user']:16} {b['role']:40} {b['prefix'] or '(バケット全体)'}")
+    print(f"\n保持: 原本 {render.s3_buckets(env)[render.AUDIT_RAW]['lock']['Days']} 日、"
+          f"閲覧記録 {render.s3_buckets(env)[render.AUDIT_ACCESS]['lock']['Days']} 日、モード {render.s3_buckets(env)[render.AUDIT_RAW]['lock']['Mode']}")
 
 
 def clean_all(assume_yes: bool) -> None:

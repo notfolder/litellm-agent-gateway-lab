@@ -55,7 +55,7 @@ def cloud_user_client(env: Env, user: str):
 @contextlib.contextmanager
 def admin_s3(env: Env):
     """管理者としてバケットに触る S3 クライアント。Mac は RustFS に port-forward、EKS 版は操作者の資格情報で S3 に直接。
-    VM の環境は操作者の静的キー（LAB_VM_S3_OPERATOR_*。GCP は HMAC キーで必須、AWS は無ければ操作者の資格情報）。"""
+    VM の環境は lab-app の静的キー（LAB_VM_S3_LAB_APP_*。操作者も同じ鍵。GCP は必須、AWS は無ければ操作者の資格情報）。"""
     if env.is_vm and (env.is_gcp_vm or user_credentials(env, "operator")[0]):
         yield cloud_user_client(env, "operator")
         return
