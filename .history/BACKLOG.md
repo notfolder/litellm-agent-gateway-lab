@@ -58,6 +58,7 @@
 ## VM 3 台構成（`LAB_TARGET=aws-ec2` / `gcp-vm`）
 概要: .history/2026-10-31-1220-内部LBとVM側の防御とZabbix/summary.md（ブランチ `feature/aws-ec2-pair`。ワークツリー `~/orca/workspaces/litellm-agent-gateway-lab/feature-aws-target-2`）
 
+- [ ] orca の作業ツリー `~/orca/workspaces/litellm-agent-gateway-lab/feature-aws-target-2` とローカルブランチ `feature/aws-ec2-pair` を消す（PR #6 で main に取り込み済み、未コミットの変更なし）。11/1 時点でそこで Claude のセッションが動いているので、ユーザーがそのセッションを閉じて「消して」と伝えてから消す（`git worktree remove` → `git branch -d`）（追加 2026-11-01、重要 低）
 - [x] (2026-11-01) 障害の試験の `entry-node`（Traefik の載った台を止める）と `worker-node`（足す台を止める）の目安を決めて反映する — ほかの台を止める場面と同じ 120 秒、GCP 180 秒（ユーザーの判断 1A）。（GCP の実測: entry-node 131.5 秒、worker-node 61.9 秒。どちらも目安 60 秒。案: 台の停止と同じ 120 / 180 秒、primary を先に移す手順、そのまま。`labtool/failover.py` の `LIMITS`、変更仕様書 2026-10-31 R22、変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 7 章）（追加 2026-10-31、重要 高）
 - [ ] Mac の k3d を `core.K3S_IMAGE` v1.36.5-k3s1 で作り直して試験が通ることを確かめる（GCP の版上げの計測の後に上げた。k3d では未確認）（追加 2026-10-31、重要 低）
 
