@@ -26,7 +26,6 @@
 ## 検証環境
 概要: .history/2026-10-12-0737-文脈独立審査の実装/summary.md
 
-- [ ] 作業ツリー `~/orca/workspaces/litellm-agent-gateway-lab/コンテキスト独立tool引数監査` を片付ける（中に `.env` のコピーがある）（追加 2026-10-12、重要 高）
 - [ ] spec 9.1 の未確認: 7 日後の再サインイン、Claude Code の auto mode で MCP 呼び出しがブロックされないこと（追加 2026-10-12、重要 低）
 - [ ] spec 9.3 の未確認: OAuth のコールバックが別 Pod でも成功する、chatgpt/ のトークン共有の競合、入口のタイムアウト、無停止のバージョンアップ、Jev 有無の遅延と負荷時の挙動（追加 2026-10-12、重要 低）
 
@@ -47,9 +46,8 @@
 - [ ] 配備の後、AWS の試験の結果と費用の実測を変更設計書に書き足し、変更仕様書 12 章・変更設計書 12 章の表に従って `docs/spec.md` と `docs/design.md` に反映する（追加 2026-10-24、重要 中）
 
 ## VM 3 台構成（`LAB_TARGET=aws-ec2` / `gcp-vm`）
-概要: .history/2026-10-31-1220-内部LBとVM側の防御とZabbix/summary.md（ブランチ `feature/aws-ec2-pair`。ワークツリー `~/orca/workspaces/litellm-agent-gateway-lab/feature-aws-target-2`）
+概要: .history/2026-10-31-1220-内部LBとVM側の防御とZabbix/summary.md（PR #6 で main に取り込み済み）
 
-- [ ] orca の作業ツリー `~/orca/workspaces/litellm-agent-gateway-lab/feature-aws-target-2` とローカルブランチ `feature/aws-ec2-pair` を消す（PR #6 で main に取り込み済み、未コミットの変更なし）。11/1 時点でそこで Claude のセッションが動いているので、ユーザーがそのセッションを閉じて「消して」と伝えてから消す（`git worktree remove` → `git branch -d`）（追加 2026-11-01、重要 低）
 - [ ] Mac の k3d を `core.K3S_IMAGE` v1.36.5-k3s1 で作り直して試験が通ることを確かめる（GCP の版上げの計測の後に上げた。k3d では未確認）（追加 2026-10-31、重要 低）
 
 - [ ] k3s の版上げの試験の残り（`.history/2026-10-26-k3s版上げ/変更仕様書.md` 4 章）: パッチの更新、飛ばす・下げる指示、途中で止めて再実行、上げた後の `./lab up`、1 台の作り直し、足す台がある構成（agent の入れ直し。2026-10-31 に実装、未計測）。GCP の v1.35.5 → v1.36.5 の `--measure`（3 台 235 秒、失敗 593/4,680 件、幅 88.3 秒）と Traefik のチャート 40 への対処は 2026-10-31 に済み（変更設計書 2026-10-31 15.1 節）（追加 2026-10-26、重要 高）

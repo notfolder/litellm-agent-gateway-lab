@@ -26,6 +26,10 @@
 - [x] (2026-10-24) 変更設計書 `.history/2026-10-24-AWS構成/変更設計書.md` を書く
 - [x] (2026-10-24) 実装: `LAB_TARGET` の切り替え、`labtool/aws.py`、`cdk/`、S3 の資格情報チェーンとバケット名の接頭辞、ESO、ALB の Ingress、Bedrock のモデル登録、障害試験の AWS の場面。単体テスト（labtool 52、監査 19、監査ログ 12）と CDK の synth が通り、Mac の `./lab up` を流し直して確認
 
+## 検証環境
+
+- [x] (2026-11-01) 作業ツリー `~/orca/workspaces/litellm-agent-gateway-lab/コンテキスト独立tool引数監査` の片付け（ユーザーが orca 側で整理。`git worktree list` に無く、ディレクトリも残っていないことを確認）
+
 ## VM 3 台構成（`LAB_TARGET=aws-ec2` / `gcp-vm`）
 
 - [x] (2026-10-25) 4 回目のヒアリング（1A 無料の IAM・CloudFormation・Session Manager と従量の Bedrock は使ってよい、2 クラスタの中に registry を立てて保存先を S3 に、3A `chatgpt/` を置かない、4A `t4g.large` × 3）で前提を確定し 0.2 に移した
@@ -41,3 +45,4 @@
 - [x] (2026-10-31) 配備と試験の後の文書の反映: `docs/spec.md`・`docs/design.md`・`docs/maintenance.md` に VM 2 クラウドの構成（入口の送信元の制限、A レコードの自動化、整形のメモリ、GCS の違い）と k3s の版上げ（`.history/2026-10-26-k3s版上げ/`）を反映し、`docs/ec2_architecture.md` を VM 2 クラウドの構成図に書き直す（変更設計書 15 章）（追加 2026-10-30、重要 中） → docs/spec.md 12 章、docs/design.md 21 章、docs/maintenance.md 5 章、docs/vm_architecture.md
 - [x] (2026-10-31) Zabbix の「Kubernetes nodes by HTTP」テンプレートの扱い — ノード名のホストが VM のホストとぶつかるので使わず、kube-state-metrics の自前のアイテム（Ready・圧迫・cordon・要求の比）で代えた（`.history/2026-10-31-Zabbixの監視の一揃い/`）
 - [x] (2026-11-01) 障害の試験の `entry-node`（Traefik の載った台を止める）と `worker-node`（足す台を止める）の目安を決めて反映する — ほかの台を止める場面と同じ 120 秒、GCP 180 秒（ユーザーの判断 1A）。（GCP の実測: entry-node 131.5 秒、worker-node 61.9 秒。どちらも目安 60 秒。案: 台の停止と同じ 120 / 180 秒、primary を先に移す手順、そのまま。`labtool/failover.py` の `LIMITS`、変更仕様書 2026-10-31 R22、変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 7 章）（追加 2026-10-31、重要 高）
+- [x] (2026-11-01) orca の作業ツリー `feature-aws-target-2` とローカルブランチ `feature/aws-ec2-pair` の削除（ユーザーが orca 側で整理。`git worktree list` は main だけ、ブランチも無いことを確認）
