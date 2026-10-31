@@ -518,13 +518,15 @@ def public_ca_bundle() -> Path | None:
 
 
 def mac_ca_bundle(proxy_ca: Path) -> Path:
-    """公開 CA の束に中継の CA を足した束を .build/mac-ca-bundle.pem に作る（中身が同じなら書かない）。"""
+    """公開 CA の束に中継の CA を足した束を .build/mac-ca-bundle-<CA のハッシュ>.pem に作る（中身が同じなら書かない）。
+    名前に CA のハッシュを入れるのは、単体テストの偽の CA が本物の束を上書きしないため（2026-10-31 に起きた）。"""
     parts = []
     public = public_ca_bundle()
     if public is not None:
         parts.append(public.read_text())
-    parts.append(proxy_ca.read_text().strip() + "\n")
-    dest = BUILD_DIR / "mac-ca-bundle.pem"
+    ca_text = proxy_ca.read_text().strip() + "\n"
+    parts.append(ca_text)
+    dest = BUILD_DIR / f"mac-ca-bundle-{hashlib.sha256(ca_text.encode()).hexdigest()[:8]}.pem"
     dest.parent.mkdir(parents=True, exist_ok=True)
     write_if_changed(dest, "\n".join(parts), mode=0o644)
     return dest

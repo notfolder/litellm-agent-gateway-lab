@@ -377,7 +377,10 @@ def ensure_forward(env: Env, infra: Infra, avoid: str | None = None) -> None:
     nodes = [n for n in infra.nodes if n.id != avoid and n.public_ip and _port_open(n.public_ip, 22) and _ssh_ok(env, n)]
     if not nodes:
         raise LabError("SSH で届くノードがありません（./lab cluster で作るか、起動を待ってください）")
-    stop_forward()
+    # 止めるのは 6443 の転送だけ（入口と Zabbix の転送は踏み台経由で別。障害の試験で台を止めるたびに入口の転送まで
+    # 止めてしまい、要求が全部失敗した。2026-10-31）
+    FORWARD_TARGET_FILE.unlink(missing_ok=True)
+    _kill_pidfile(FORWARD_PID_FILE)
     fetch_kubeconfig(env, nodes[0])
     port = env.vm_local_port
     if _port_open("127.0.0.1", port):

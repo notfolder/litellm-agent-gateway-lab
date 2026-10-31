@@ -99,8 +99,11 @@
 |---|---|
 | 構築ツールの接続 | `./lab` を流すたびに SSH のポート転送（k3s の 6443 → 127.0.0.1:16443）を確かめて張り直す。`kubectl --context litellm-lab-gcp`（`-ec2`）でクラスタに届く |
 | 自作イメージの更新 | `./lab images` が k3s の台の Docker でビルドしてクラスタの中の registry に push する。Mac の Docker は使わない |
-| Kubernetes（k3s）の版上げ | `./lab upgrade-k8s <版> [--measure]`。1 台ずつ、浮動 IP の台は最後。マイナー版は 1 つずつ |
-| 既存資源（`LAB_INFRA=provided`）での注意 | 構築ツールはネットワーク・浮動 IP・権限・バケットの設定を変えない。操作者の回線が変わったら 22 と 80/443 の開け直しを用意する側に頼む |
+| Kubernetes（k3s）の版上げ | `./lab upgrade-k8s <版> [--measure]`。1 台ずつ、Traefik（入口）の Pod が載る台は最後。入口は内部ロードバランサなので IP の移動は無く、drain で Traefik が移る間だけ失敗が出る。マイナー版は 1 つずつ |
+| 管理画面と検索アプリ、DB への接続 | 管理系の経路（`/ui`、`/lab-audit/`）は踏み台からだけ通る。Mac からは `./lab forward` で踏み台経由の転送を張り `https://<LAB_LOCAL_HOSTNAME>:18443/ui`。DB は踏み台から SSH で入り `kubectl port-forward svc/litellm-pg-pooler-rw 5432` |
+| 監視（Zabbix） | `./lab zabbix` がホスト・テンプレート・入口の HTTP 監視を API で揃える（冪等）。web は `http://127.0.0.1:18080/`（踏み台経由の転送。Admin のパスワードは `.env` の `LAB_ZABBIX_ADMIN_PASSWORD`）。VM が増えたら agent 2 の自動登録で入る。本番は既存サーバーの宛先と API トークンを `.env` に |
+| 操作者の回線が変わった | managed は `./lab up`（か `./lab cluster`）で 22 の許可（クラウドと nftables）が直る。provided は踏み台から入るので変更不要 |
+| 既存資源（`LAB_INFRA=provided`）での注意 | 構築ツールはネットワーク・ロードバランサ・権限・バケットの設定を変えない。守りは各 VM の nftables と Traefik の送信元制限と NetworkPolicy で、クラウドのファイアウォールは無くてもよい |
 | 出口プロキシ（Zscaler）の CA の更新 | `.env` の `LAB_EGRESS_CA_FILE` を新しい CA にして `./lab up`。VM の信頼店（SSH で直す）、Pod の ConfigMap、`./lab` 自身の環境変数が揃う |
 | 整形の Job のメモリ | 1 時間の原本の件数に比例する。入口を操作者の IP に絞っていれば 2 GiB で足りる（総当たりを受けた 10 万件/時で 1 GiB を超えた） |
 | 片付け | managed: `./lab down`（全部消す）。provided: `./lab down`（k3s を外す）または `./lab down --all`（VM・浮動 IP・バケットも） |

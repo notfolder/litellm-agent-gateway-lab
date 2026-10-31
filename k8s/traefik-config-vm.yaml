@@ -17,7 +17,13 @@ spec:
     deployment:
       replicas: 2
     service:
+      # チャートの版で鍵が違う（k3s 1.35 の 39 は service.type、1.36 の 40 は service.spec.type）ので両方書く。
+      # k3s の ServiceLB は注釈でも止める（LoadBalancer のままでも svclb を作らせない。版上げで判明 2026-10-31）
       type: ClusterIP
+      spec:
+        type: ClusterIP
+      annotations:
+        svccontroller.k3s.cattle.io/enablelb: "false"
     ports:
       web:
         hostPort: 80

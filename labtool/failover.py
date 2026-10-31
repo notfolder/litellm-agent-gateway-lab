@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 import urllib.error
@@ -98,12 +97,17 @@ class Load:
 
     def run(self) -> None:
         interval = 1.0 / self.rate
-        with ThreadPoolExecutor(max_workers=self.rate * 4) as pool:
+        pool = ThreadPoolExecutor(max_workers=self.rate * 4)
+        try:
             nxt = time.monotonic()
             while not self._stop.is_set():
                 pool.submit(self._one, time.time())
                 nxt += interval
                 time.sleep(max(0.0, nxt - time.monotonic()))
+        finally:
+            # 入口が長く落ちていると、15 秒待ちの要求が溜まる。止めるときは溜まった分を捨て、動いている分だけ待つ
+            # （版上げの計測で、終わった後に何分も待ち続けた。2026-10-31）
+            pool.shutdown(wait=True, cancel_futures=True)
 
     def __enter__(self) -> "Load":
         self._thread = threading.Thread(target=self.run, daemon=True)

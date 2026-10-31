@@ -50,8 +50,8 @@ aws configure sso              # プロファイルを作り、aws sso login --p
 
 基盤の持ち方は 2 つあります（`.env` の `LAB_INFRA`）。
 
-- `managed`（既定、検証用）: `./lab up` がクラウドの API でネットワーク・浮動 IP・バケット・静的キー・VM 3 台を作り、識別子を `.env` に書いてから組み立てます。`./lab down` で有料のものがすべて消えます
-- `provided`（本番用）: 既存の VM 3 台とバケット 1 つを使います。用意する側（VM、ネットワーク、浮動 IP と VM の権限、バケット、役割ごとの静的キー。前提は docs/spec.md 12.2）から受け取った識別子と静的キーを `.env` に書き、`./lab up` はその上に組み立てるだけで、ネットワークやバケットの設定は変えません。`./lab down` は k3s を外して保持の無いディレクトリを空にし、`./lab down --all` で VM・浮動 IP・バケットまで消します
+- `managed`（既定、検証用）: `./lab up` がクラウドの API でネットワーク・バケット・静的キー・VM 3 台・内部ロードバランサ・中継（踏み台、Zabbix サーバー）の VM を作り、識別子を `.env` に書いてから組み立てます。`./lab down` で有料のものがすべて消えます
+- `provided`（本番用）: 既存の VM 3 台、バケット 1 つ、内部ロードバランサ、踏み台を使います。用意する側（VM、ネットワーク、ロードバランサ、踏み台、バケット、役割ごとの静的キー。VM にクラウドの権限は不要。前提は docs/spec.md 12.2）から受け取った識別子と静的キーを `.env` に書き、`./lab up` はその上に組み立てるだけで、ネットワークやバケットの設定は変えません。`./lab down` は k3s を外して保持の無いディレクトリを空にし、`./lab down --all` で VM・ロードバランサ・バケットまで消します
 
 ```bash
 brew install kubectl-cnpg awscli            # GCP は brew install --cask google-cloud-sdk、gcloud auth application-default login
@@ -62,7 +62,7 @@ brew install kubectl-cnpg awscli            # GCP は brew install --cask google
 
 本番の VM は Zscaler（外向きの通信を独自 CA で中継する装置）の中にある前提です。`.env` の `LAB_EGRESS_PROXY`（中継の URL）と `LAB_EGRESS_CA_FILE`（CA）を書くと、VM・k3s・外へ出る全 Pod がその中継を通り CA を信頼します。`LAB_EGRESS_PROXY_MAC` で `./lab` 自身も中継を通せます。検証では `LAB_EGRESS_PROXY_VM=true` で 4 台目の VM に中継（mitmproxy）を作り、3 台の直接の外向きを遮断した状態で全試験を通しました（`./lab proxy-log` で中継の記録を宛先ごとに数えられます）。
 
-自作イメージ 2 つ（LiteLLM、監査アプリ）は Mac ではなく k3s の台の Docker でビルドします（アーキテクチャは VM のもの。Mac に Docker は要りません）。A レコード（ホスト名 → 浮動 IP）は `./lab litellm` が Cloudflare の API で作ります。入口は keepalived が浮動 IP を 3 台の間で移し、HTTPS は cert-manager が Let's Encrypt（DNS-01）で取ります。構築ツールは SSH で VM に届き、managed では 22 と 80/443 を `./lab` を流すたびに操作者の今の IP だけに開け直します（6443 は開けず、SSH のポート転送で届く）。Claude Code のモデルは Mac と同じ Claude Max のトークンの転送、2 つの審査官は Anthropic の API キーの Claude Haiku 4.5 です。障害の試験は Mac と同じ場面に `--scenario entry-node`（入口の台を止める）が加わります。Kubernetes（k3s）の版は `./lab upgrade-k8s <版>` が 1 台ずつ上げます（経緯は `.history/2026-10-26-k3s版上げ/`）。
+自作イメージ 2 つ（LiteLLM、監査アプリ）は Mac ではなく k3s の台の Docker でビルドします（アーキテクチャは VM のもの。Mac に Docker は要りません）。入口は内部ロードバランサ（AWS: 内部 NLB、GCP: 内部パススルー NLB）の固定の内部 IP で、利用者は VPC の内側からホスト名で呼びます。A レコード（ホスト名 → その IP、Mac 用の別名 `LAB_LOCAL_HOSTNAME` → 127.0.0.1）は `./lab litellm` が Cloudflare の API で作り、HTTPS は cert-manager が Let's Encrypt（DNS-01）で取ります。守りはクラウドのファイアウォールでなく各 VM の nftables、Traefik の送信元制限（管理画面と検索アプリは踏み台からだけ）、Kubernetes の NetworkPolicy です。構築ツールは SSH で VM に届き、HTTPS は踏み台経由の転送口（`https://<別名>:18443`。`./lab forward`）で入口に届きます。監視は Zabbix（agent 2 を全 VM に、公式 Helm チャートを k3s に。検証ではサーバーも踏み台の VM に立て、`./lab zabbix` が API で登録）。Claude Code のモデルは Mac と同じ Claude Max のトークンの転送、2 つの審査官は Anthropic の API キーの Claude Haiku 4.5 です。障害の試験は Mac と同じ場面に `--scenario entry-node`（Traefik の載った台を止める）が加わります。Kubernetes（k3s）の版は `./lab upgrade-k8s <版>` が 1 台ずつ上げます（経緯は `.history/2026-10-26-k3s版上げ/`）。
 
 ## よく使うコマンド
 
@@ -76,7 +76,7 @@ brew install kubectl-cnpg awscli            # GCP は brew install --cask google
 | `./lab test-unit` / `test-smoke` / `test-idempotency` / `test-load` | 試験 |
 | `./lab test-judge [--context \| --isolated]` | 審査官の事例試験（本物の審査官を呼ぶので ChatGPT の利用枠を使う。指定なしは両方の審査） |
 | `./lab test-failover [--pooler direct]` / `test-restore` | DB と Redis の障害の試験（EKS 版は `--scenario litellm-drain` / `aurora-failover` / `valkey-failover`、VM 3 台は Mac の場面 ＋ `entry-node`） / バックアップから任意の時点に戻す試験 |
-| `./lab down [--all]` / `./lab proxy-log` | VM 3 台: `down` は managed なら全部消し、provided なら k3s を外す（`--all` で VM・浮動 IP・バケットも） / 中継（出口プロキシ）の記録の集計 |
+| `./lab down [--all]` / `./lab proxy-log` / `./lab forward` / `./lab zabbix` | VM 3 台: `down` は managed なら全部消し、provided なら k3s を外す（`--all` で VM・ロードバランサ・バケットも） / 中継（出口プロキシ）の記録の集計 / SSH の転送 3 本を張る / Zabbix の登録 |
 | `./lab test-audit` | 監査ログの試験（記録、整形、検索アプリ、精算、改ざんの防止、退避と再送） |
 | `./lab audit-synth` / `audit-bench` / `audit-compact` | 検索の速さの試験用の合成データ / 速さの試験 / 監査ログの整形を手で流す |
 | `./lab review-log` | 審査の判定ログの集計 |

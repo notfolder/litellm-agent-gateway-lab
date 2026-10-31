@@ -1242,7 +1242,7 @@ class CloudLayerTest(unittest.TestCase):
             # 中継の CA だけでなく公開 CA も含む束（中継を通らない転送口の Let's Encrypt の証明書も検証できる）
             bundle = os.environ["REQUESTS_CA_BUNDLE"]
             self.assertEqual(os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"], bundle)
-            self.assertTrue(bundle.endswith("mac-ca-bundle.pem"))
+            self.assertRegex(Path(bundle).name, r"^mac-ca-bundle-[0-9a-f]{8}\.pem$")   # 偽の CA の束は本物と別の名前
             text = Path(bundle).read_text()
             self.assertIn("Q0E=", text)
             self.assertGreater(text.count("BEGIN CERTIFICATE"), 10)
