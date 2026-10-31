@@ -16,6 +16,8 @@
 - 既存文書の反映: `docs/spec.md` 12 章、`docs/design.md` 21 章（21.10 結果、21.11 Zabbix）、`docs/vm_architecture.md`（書き直し）、`docs/maintenance.md` 5 章、README、`.env.example`、バックログ。`~/.claude/estimate-log.md` に 1 行。
 - 意図的に残したもの: `core.K3S_IMAGE` を v1.36.5-k3s1 に上げた（Mac の k3d も同じ版になる。k3d での動作は未確認）。`entry-node` の目安は 60 秒のまま（確認待ち）。
 
+- 追記（同日 13:10 以降、同じセッション）: 閲覧と管理操作の記録の保持を 90 日に。バケットの静的キーを 5 つから 2 つ（litellm-writer、lab-app）に変えて GCP で配備・試験・片付け（`.history/2026-10-31-静的キーを2つに/`）。担当部署への依頼事項を `docs/provider-requests.md` に。`./lab provider-requirements` を追加。
+
 ## 決定事項
 - 入口の台の切り替え（中継経由で 140〜227 秒）は受け入れ、中継なしの再計測はしない（本番は AWS で、計測の意味が薄い）。
 - 本番では利用者は VPC の内側から LiteLLM を呼ぶ。Zscaler は外向きだけ。公開の入口は要らない。
