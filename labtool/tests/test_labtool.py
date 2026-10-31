@@ -1029,13 +1029,16 @@ class CloudLayerTest(unittest.TestCase):
                     result = "7.0.17"
                 elif method == "user.login":
                     if params["password"] != state["admin_pw"]:
-                        return self._err(body, "Login name or password is incorrect.")
-                    result = "session-1"
+                        return self._err(body, "Incorrect user name or password or account is temporarily blocked.")   # 7.0 の文言
+                    result = "session-2" if state.get("session_dead") else "session-1"
                 elif method == "user.get":
                     result = [{"userid": "1", "username": "Admin"}]
                 elif method == "user.update":
                     state["admin_pw"] = params["passwd"]
+                    state["session_dead"] = True   # 7.0: パスワードを変えるとセッションが切れる
                     result = {"userids": ["1"]}
+                elif state.get("session_dead") and auth == "Bearer session-1":
+                    return self._err(body, "Session terminated, re-login, please.")
                 elif method == "token.get":
                     result = []
                 elif method == "token.create":
@@ -1215,6 +1218,9 @@ class CloudLayerTest(unittest.TestCase):
         self.assertEqual(render.add_egress([{"kind": "Deployment", "spec": {"template": {"spec": {"containers": [{"name": "a"}]}}}}], plain),
                          [{"kind": "Deployment", "spec": {"template": {"spec": {"containers": [{"name": "a"}]}}}}])
         self.assertEqual(render.cert_manager_egress_values(plain), {})
+        # DNS-01 の伝搬確認はクラウドの再帰リゾルバに聞く（Pod から外の 53 へは出られない）
+        self.assertEqual(render.cert_manager_egress_values(plain, ["169.254.169.254"]),
+                         {"dns01RecursiveNameservers": "169.254.169.254:53", "dns01RecursiveNameserversOnly": True})
         cm = render.cert_manager_egress_values(e)
         self.assertEqual((cm["https_proxy"], cm["extraEnv"][0]["name"]), ("http://10.60.0.20:3128", "SSL_CERT_FILE"))
         ca_docs = list(yaml.safe_load_all(render.egress_ca_manifests(e, ["litellm-lab", "cert-manager"])))
@@ -1233,8 +1239,14 @@ class CloudLayerTest(unittest.TestCase):
             m = VmTargetTest().vm("gcp-vm", LAB_EGRESS_PROXY_MAC="http://203.0.113.20:3128", LAB_EGRESS_CA_FILE=ca)
             m.apply_mac_proxy()
             self.assertEqual((os.environ["HTTPS_PROXY"], os.environ["NO_PROXY"]), ("http://203.0.113.20:3128", "127.0.0.1,localhost"))
-            self.assertEqual((os.environ["REQUESTS_CA_BUNDLE"], os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"]), (ca, ca))
-            self.assertEqual(helm("upgrade", "--install", "x", "y")[-2:], ["--ca-file", ca])
+            # 中継の CA だけでなく公開 CA も含む束（中継を通らない転送口の Let's Encrypt の証明書も検証できる）
+            bundle = os.environ["REQUESTS_CA_BUNDLE"]
+            self.assertEqual(os.environ["GRPC_DEFAULT_SSL_ROOTS_FILE_PATH"], bundle)
+            self.assertTrue(bundle.endswith("mac-ca-bundle.pem"))
+            text = Path(bundle).read_text()
+            self.assertIn("Q0E=", text)
+            self.assertGreater(text.count("BEGIN CERTIFICATE"), 10)
+            self.assertEqual(helm("upgrade", "--install", "x", "y")[-2:], ["--ca-file", bundle])
             self.assertNotIn("--ca-file", helm("-n", "ns", "get", "values", "x"))
         finally:
             os.environ.clear()

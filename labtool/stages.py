@@ -344,7 +344,7 @@ def operators(replicas: int = 1, env: Env | None = None) -> None:
         "webhook": {"nodeSelector": CONTROL_PLANE, "replicaCount": replicas},
         "cainjector": {"nodeSelector": CONTROL_PLANE, "replicaCount": replicas},
         "startupapicheck": {"nodeSelector": CONTROL_PLANE},
-        **(render.cert_manager_egress_values(env) if env is not None else {})})
+        **(render.cert_manager_egress_values(env, clouds.for_env(env).dns_ips(env) if env.is_vm else None) if env is not None else {})})
     wait_until(300, "cert-manager の準備", kc("-n", "cert-manager", "wait", "--for=condition=Available",
                                               "deploy", "--all", "--timeout=5s"))
     _ensure_chart("cnpg", "cnpg-system", CNPG, {"nodeSelector": CONTROL_PLANE, "replicaCount": replicas})

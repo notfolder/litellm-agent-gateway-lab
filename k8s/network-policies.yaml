@@ -24,13 +24,16 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: cnpg-system
-    # 監査アプリ（請求の照合など LiteLLM の DB を直接読むもの）と復元の試験、整形の Job
+    # DB の移行の Job（primary に直結）、直結のとき（LAB_DB_POOLER=direct）の LiteLLM、監査アプリ、復元の試験、整形の Job
     - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: litellm
         - podSelector:
             matchExpressions:
               - key: app
                 operator: In
-                values: [audit-compactor, audit-viewer, audit-oneshot, audit-synth, audit-bench, audit-compact, lab-restore]
+                values: [litellm-migrate, audit-compactor, audit-viewer, audit-oneshot, audit-synth, audit-bench, audit-compact, lab-restore]
       ports:
         - port: 5432
     # 指標の取得（Zabbix、Prometheus）は監視の名前空間から

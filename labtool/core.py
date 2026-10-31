@@ -436,15 +436,18 @@ class Env:
         # 転送口（127.0.0.1 と Mac 用の別名）は中継を通さない
         no_proxy = "127.0.0.1,localhost" + (f",{self.local_hostname}" if self.local_hostname else "")
         os.environ["NO_PROXY"] = os.environ["no_proxy"] = no_proxy
+        # 中継の CA だけを信頼すると、中継を通らない接続（踏み台経由の転送口の Let's Encrypt の証明書）が検証に失敗する。
+        # 公開 CA の束に中継の CA を足した束を使う（配備で判明 2026-10-31）
+        bundle = mac_ca_bundle(ca)
         for name in ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "AWS_CA_BUNDLE", "CURL_CA_BUNDLE",
                      "GRPC_DEFAULT_SSL_ROOTS_FILE_PATH", "NODE_EXTRA_CA_CERTS"):
-            os.environ[name] = str(ca)
-        HELM_EXTRA[:] = ["--ca-file", str(ca)]
+            os.environ[name] = str(bundle)
+        HELM_EXTRA[:] = ["--ca-file", str(bundle)]
         # 中継と CA が合っているか確かめる（managed で中継の VM を作り直すと、手元の CA が古いまま最初の API を呼んでしまう）
         if not MAC_PROXY_CHECK:
             return
         try:
-            ctx = ssl.create_default_context(cafile=str(ca))
+            ctx = ssl.create_default_context(cafile=str(bundle))
             urllib.request.urlopen("https://storage.googleapis.com/", timeout=15, context=ctx).close()
         except urllib.error.HTTPError:
             pass   # 応答が返れば中継と CA は正しい（状態コードは問わない）
@@ -494,6 +497,37 @@ def has_chatgpt_token(path: Path) -> bool:
     except (OSError, ValueError):
         return False
     return isinstance(data, dict) and bool(data.get("refresh_token") or data.get("access_token"))
+
+
+def public_ca_bundle() -> Path | None:
+    """公開 CA の束（certifi、無ければ botocore の同梱、無ければ OpenSSL の既定）。"""
+    try:
+        import certifi
+        return Path(certifi.where())
+    except ImportError:
+        pass
+    try:
+        import botocore
+        p = Path(botocore.__file__).parent / "cacert.pem"
+        if p.exists():
+            return p
+    except ImportError:
+        pass
+    default = ssl.get_default_verify_paths().cafile
+    return Path(default) if default and Path(default).exists() else None
+
+
+def mac_ca_bundle(proxy_ca: Path) -> Path:
+    """公開 CA の束に中継の CA を足した束を .build/mac-ca-bundle.pem に作る（中身が同じなら書かない）。"""
+    parts = []
+    public = public_ca_bundle()
+    if public is not None:
+        parts.append(public.read_text())
+    parts.append(proxy_ca.read_text().strip() + "\n")
+    dest = BUILD_DIR / "mac-ca-bundle.pem"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    write_if_changed(dest, "\n".join(parts), mode=0o644)
+    return dest
 
 
 def gen_secret(nbytes: int = 24) -> str:

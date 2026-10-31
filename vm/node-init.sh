@@ -124,7 +124,7 @@ table inet lab {
     # DNAT の前（priority -150）。入りの許可はここだけで決める
     type filter hook prerouting priority -150; policy accept;
     iif lo accept
-    iifname { "cni0", "flannel.1" } accept
+    iifname { "cni0", "flannel.1", "docker0" } accept
     ct state established,related accept
     ct state invalid drop
     ip protocol icmp accept
@@ -139,20 +139,20 @@ table inet lab {
     counter drop
   }
   chain forward {
-    # Pod の外向き（中継と内側だけ）と、DNAT された入り
+    # Pod と Docker のビルド（docker0。イメージのビルドの pip など）の外向き（中継と内側だけ）と、DNAT された入り
     type filter hook forward priority 0; policy drop;
     ct state established,related accept
-    oifname { "cni0", "flannel.1" } accept
-    iifname { "cni0", "flannel.1" } ip daddr @internal accept
-    iifname { "cni0", "flannel.1" } ip daddr @egress_ok accept
-    iifname { "cni0", "flannel.1" } ip daddr @nodes accept
+    oifname { "cni0", "flannel.1", "docker0" } accept
+    iifname { "cni0", "flannel.1", "docker0" } ip daddr @internal accept
+    iifname { "cni0", "flannel.1", "docker0" } ip daddr @egress_ok accept
+    iifname { "cni0", "flannel.1", "docker0" } ip daddr @nodes accept
     counter drop
   }
   chain output {
     # この台の外向き（中継と内側だけ）
     type filter hook output priority 0; policy drop;
     oif lo accept
-    oifname { "cni0", "flannel.1" } accept
+    oifname { "cni0", "flannel.1", "docker0" } accept
     ct state established,related accept
     ip protocol icmp accept
     udp dport 67 accept
@@ -171,6 +171,13 @@ echo "nftables applied (egress: ${EGRESS_ELEMS})"
 # ---- Zabbix agent 2（能動で送る。サーバーが無ければ入れない） ----
 if [ -n "$ZABBIX_SERVER" ]; then
   if ! command -v zabbix_agent2 >/dev/null 2>&1; then
+    # Zabbix の公式リポジトリは arm64 が別（ubuntu-arm64/。配備で判明 2026-10-31）。違う方が入っていれば入れ替える
+    if [ "$(dpkg --print-architecture)" = "arm64" ]; then
+      ZABBIX_RELEASE_URL="$(echo "$ZABBIX_RELEASE_URL" | sed 's#/ubuntu/#/ubuntu-arm64/#')"
+      if dpkg -s zabbix-release >/dev/null 2>&1 && ! grep -rqs "ubuntu-arm64" /etc/apt/sources.list.d/; then
+        apt-get purge -y -q zabbix-release >/dev/null; rm -f /etc/apt/sources.list.d/zabbix*
+      fi
+    fi
     if ! dpkg -s zabbix-release >/dev/null 2>&1; then
       curl -sfL -o /tmp/zabbix-release.deb "$ZABBIX_RELEASE_URL"
       dpkg -i /tmp/zabbix-release.deb >/dev/null
@@ -179,11 +186,12 @@ if [ -n "$ZABBIX_SERVER" ]; then
     apt-get update -q
     apt-get install -y -q zabbix-agent2
   fi
-  sed -i -e "s/^Server=.*/Server=${ZABBIX_SERVER_IP}${POD_CIDR:+,$POD_CIDR}/" \
-         -e "s/^ServerActive=.*/ServerActive=${ZABBIX_SERVER}/" \
-         -e "s/^Hostname=.*/Hostname=${ZABBIX_HOSTNAME}/" \
-         -e "s/^# HostMetadata=.*/HostMetadata=${ZABBIX_METADATA}/" \
-         -e "s/^HostMetadata=.*/HostMetadata=${ZABBIX_METADATA}/" /etc/zabbix/zabbix_agent2.conf
+  # 値に / が入る（Pod 網の CIDR）ので区切りは |
+  sed -i -e "s|^Server=.*|Server=${ZABBIX_SERVER_IP}${POD_CIDR:+,$POD_CIDR}|" \
+         -e "s|^ServerActive=.*|ServerActive=${ZABBIX_SERVER}|" \
+         -e "s|^Hostname=.*|Hostname=${ZABBIX_HOSTNAME}|" \
+         -e "s|^# HostMetadata=.*|HostMetadata=${ZABBIX_METADATA}|" \
+         -e "s|^HostMetadata=.*|HostMetadata=${ZABBIX_METADATA}|" /etc/zabbix/zabbix_agent2.conf
   grep -q "^HostMetadata=" /etc/zabbix/zabbix_agent2.conf || echo "HostMetadata=${ZABBIX_METADATA}" >> /etc/zabbix/zabbix_agent2.conf
   systemctl enable zabbix-agent2 >/dev/null 2>&1 || true
   systemctl restart zabbix-agent2

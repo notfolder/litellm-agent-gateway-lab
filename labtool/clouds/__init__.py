@@ -42,12 +42,15 @@ GCP_HEALTH_CHECK_RANGES = ["35.191.0.0/16", "130.211.0.0/22"]
 # VM が中継を通さず直接届く必要があるクラウドの内部アドレス（メタデータ、DNS、NTP）
 GCP_META_IPS = ["169.254.169.254"]
 AWS_META_IPS = ["169.254.169.254", "169.254.169.253", "169.254.169.123"]
+# クラウドの DNS（cert-manager の DNS-01 の伝搬確認に使う再帰リゾルバ。Pod から外の権威サーバーへは届かないため）
+GCP_DNS_IPS = ["169.254.169.254"]
+AWS_DNS_IPS = ["169.254.169.253"]
 
 # 両方の実装が持つ公開関数（単体試験が名前と引き数の一致を確かめる）
 FUNCTIONS = [
     # 共通
     "identity", "ensure_apis", "s3_endpoint", "describe_nodes", "describe_entry_ip", "lb_targets_healthy",
-    "health_check_ranges", "meta_ips", "stop_node", "start_node", "check_bucket", "snapshot", "empty_bucket",
+    "health_check_ranges", "meta_ips", "dns_ips", "stop_node", "start_node", "check_bucket", "snapshot", "empty_bucket",
     # provision（managed だけ）
     "provision", "destroy", "allow_ssh_from", "allow_proxy_from", "recreate_node",
     # provided の全削除

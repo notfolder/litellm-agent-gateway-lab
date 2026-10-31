@@ -21,7 +21,7 @@ from .. import objectstore as objstore
 from .. import render
 from ..core import Env, LabError, info, ok, warn
 from . import (
-    AWS_META_IPS, NODE_COUNT, PROXY_PORT, STATIC_KEY_USERS, ZABBIX_SERVER_PORT, Infra, Node, network_plan,
+    AWS_DNS_IPS, AWS_META_IPS, NODE_COUNT, PROXY_PORT, STATIC_KEY_USERS, ZABBIX_SERVER_PORT, Infra, Node, network_plan,
     s3_user_policies,
 )
 
@@ -245,6 +245,11 @@ def health_check_ranges(env: Env) -> list[str]:
 def meta_ips(env: Env) -> list[str]:
     """VM が中継を通さず直接届く必要があるアドレス（IMDS、Route 53 Resolver、Amazon Time Sync）。"""
     return list(AWS_META_IPS)
+
+
+def dns_ips(env: Env) -> list[str]:
+    """クラウドの再帰リゾルバ（Route 53 Resolver。cert-manager の DNS-01 の伝搬確認）。"""
+    return list(AWS_DNS_IPS)
 
 
 # ---- 内部ロードバランサ（内部 NLB。変更設計書 2026-10-31 3.3 節） ----

@@ -1204,10 +1204,15 @@ def add_egress_text(manifest: str, env: Env) -> str:
     return yaml.safe_dump_all(add_egress(yaml.safe_load_all(manifest), env), sort_keys=False)
 
 
-def cert_manager_egress_values(env: Env) -> dict:
-    """cert-manager の Helm の値に重ねる、中継と CA（ACME と Cloudflare の API が中継を通る）。"""
+def cert_manager_egress_values(env: Env, dns_ips: list[str] | None = None) -> dict:
+    """cert-manager の Helm の値に重ねる、中継と CA（ACME と Cloudflare の API が中継を通る）と、DNS-01 の伝搬確認に使う
+    再帰リゾルバ（dns_ips。Pod から外の権威サーバー（53）へは nftables が通さないので、クラウドの DNS に聞く。配備で判明 2026-10-31）。"""
+    out: dict = {}
+    if dns_ips:
+        out.update({"dns01RecursiveNameservers": ",".join(f"{ip}:53" for ip in dns_ips), "dns01RecursiveNameserversOnly": True})
     if not env.egress_proxy:
-        return {}
-    return {"http_proxy": env.egress_proxy, "https_proxy": env.egress_proxy, "no_proxy": POD_NO_PROXY,
-            "extraEnv": [{"name": "SSL_CERT_FILE", "value": EGRESS_CA_PATH}],
-            "volumes": [egress_volume()], "volumeMounts": [egress_mount()]}
+        return out
+    out.update({"http_proxy": env.egress_proxy, "https_proxy": env.egress_proxy, "no_proxy": POD_NO_PROXY,
+                "extraEnv": [{"name": "SSL_CERT_FILE", "value": EGRESS_CA_PATH}],
+                "volumes": [egress_volume()], "volumeMounts": [egress_mount()]})
+    return out

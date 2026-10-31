@@ -101,7 +101,7 @@ COMMANDS: dict[str, tuple[str, object]] = {
     "upgrade-k8s": ("aws-ec2 / gcp-vm: k3s（Kubernetes）を 1 台ずつ上げる（例: ./lab upgrade-k8s v1.36.1+k3s1。マイナー版は 1 つずつ）", None),
     "clean-all": ("クラスタ、生成したクライアント設定、ビルドしたイメージを消す（.env とトークンは残す）", None),
     # 試験
-    "test-unit": ("単体テスト（構築ツールと、LiteLLM のイメージの中でガードレール）", stage(ops.test_unit)),
+    "test-unit": ("単体テスト（構築ツールと、LiteLLM のイメージの中でガードレール）", lambda: ops.test_unit(Env.load())),   # クラスタに届かなくてよい
     "test-smoke": ("疎通確認（入口、パススルーの遮断、審査の差し替え、機密の持ち出しの拒否）", stage(checks.smoke)),
     "test-idempotency": ("./lab up を 2 回流し、2 回目で何も変わらないことを確かめる", checks.idempotency),
     "test-load": ("偽 LLM を相手にした負荷試験（k6、Docker で実行）", None),

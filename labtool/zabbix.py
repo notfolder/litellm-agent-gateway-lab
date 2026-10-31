@@ -18,7 +18,6 @@ from . import render, vm
 from .core import NS, Env, LabError, gen_secret, helm, info, kc, ok, output, run, succeeds, wait_until, warn
 
 CHART_REPO = "https://cdn.zabbix.com/zabbix/integrations/kubernetes-helm/7.0"
-CHART_REPO_NAME = "zabbix-chart-7.0"
 CHART = "zabbix-helm-chrt"
 CHART_VERSION = "1.2.4"
 RELEASE = "zabbix"
@@ -108,25 +107,39 @@ def api(env: Env, infra=None) -> ZabbixApi:
 def _bootstrap_token(env: Env, url: str) -> ZabbixApi:
     """初回: Admin の初期パスワードでログインしてパスワードを変え、API トークンを作る（サーバーの DB の初期化を待つ）。"""
     client = ZabbixApi(url)
-    password = env.get("LAB_ZABBIX_ADMIN_PASSWORD") or gen_secret(18)
+    known = env.get("LAB_ZABBIX_ADMIN_PASSWORD")
+    password = known or gen_secret(18)
+    # 試すのは「.env に保存したパスワード」と「初期パスワード」だけ。失敗を繰り返すと Zabbix が Admin を一時的にブロックする
+    # （5 回で 30 秒）ので、パスワードが違うと分かったら待たずに止める（配備で判明 2026-10-31）
+    candidates = [c for c in (known, DEFAULT_ADMIN[1]) if c]
+    state: dict = {}
 
     def login() -> bool:
-        for candidate in (password, DEFAULT_ADMIN[1]):
+        wrong = 0
+        for candidate in candidates:
             try:
                 client.token = client.call("user.login", {"username": DEFAULT_ADMIN[0], "password": candidate}, auth=False)
-                client._logged_in_with = candidate   # noqa: SLF001
+                state["used"] = candidate
                 return True
             except LabError as e:
-                if "Login name or password is incorrect" in str(e) or "incorrect" in str(e):
+                msg = str(e).lower()
+                if "blocked" in msg and "incorrect" in msg:
+                    wrong += 1
                     continue
                 return False   # DB の初期化の途中など。待つ
+        if wrong == len(candidates):
+            raise LabError("Zabbix の Admin にサインインできません（初期パスワードでも .env の LAB_ZABBIX_ADMIN_PASSWORD でも違う。"
+                           "一時的なブロックなら 30 秒待つ。踏み台で docker compose down -v してサーバーを作り直すか、正しいパスワードを .env に書く）")
         return False
 
     wait_until(900, "Zabbix サーバーの初期化（Admin でのサインイン）", login)
-    if client._logged_in_with == DEFAULT_ADMIN[1]:   # noqa: SLF001
+    if state.get("used") == DEFAULT_ADMIN[1]:
         admin = client.get_one("user", username=DEFAULT_ADMIN[0])
         client.call("user.update", {"userid": admin["userid"], "passwd": password, "current_passwd": DEFAULT_ADMIN[1]})
+        env.set("LAB_ZABBIX_ADMIN_PASSWORD", password)
         info("Zabbix の Admin の初期パスワードを変えました（.env の LAB_ZABBIX_ADMIN_PASSWORD）")
+        # パスワードを変えるとセッションが切れる（Session terminated）ので、新しいパスワードで入り直す
+        client.token = client.call("user.login", {"username": DEFAULT_ADMIN[0], "password": password}, auth=False)
     env.set("LAB_ZABBIX_ADMIN_PASSWORD", password)
     admin = client.get_one("user", username=DEFAULT_ADMIN[0])
     for old in client.call("token.get", {"filter": {"name": TOKEN_NAME}, "output": ["tokenid"]}):
@@ -271,11 +284,8 @@ def ensure_chart(env: Env, server: str) -> None:
     if current.get("labValuesHash") == values_hash:
         ok(f"Zabbix の Helm のリリースは最新です（値のハッシュ {values_hash}）")
         return
-    repos = output(helm("repo", "list", "-o", "json"), check=False)
-    if CHART_REPO_NAME not in repos:
-        run(helm("repo", "add", CHART_REPO_NAME, CHART_REPO), quiet=True)
-    run(helm("repo", "update", CHART_REPO_NAME), quiet=True)
-    run(helm("upgrade", "--install", RELEASE, f"{CHART_REPO_NAME}/{CHART}", "--version", CHART_VERSION,
+    # リポジトリは登録せず --repo で直接取る（helm repo update は --ca-file を受けない。stages._ensure_chart と同じ形）
+    run(helm("upgrade", "--install", RELEASE, CHART, "--repo", CHART_REPO, "--version", CHART_VERSION,
              "-n", NAMESPACE, "--create-namespace", "-f", str(values_file), "--set-string", f"labValuesHash={values_hash}",
              "--wait", "--timeout", "10m"))
     ok("Zabbix の Helm チャート（zabbix-proxy、kube-state-metrics）を入れました")
@@ -330,10 +340,7 @@ def summary(env: Env) -> list[str]:
                                          "groupids": list(ensure_groups(client).values())})
         lines = []
         for h in sorted(hosts, key=lambda x: x["host"]):
-            items = client.call("item.get", {"hostids": h["hostid"], "output": ["lastclock"], "filter": {"status": 0},
-                                             "sortfield": "lastclock", "sortorder": "DESC", "limit": 1})
-            last = int(items[0]["lastclock"]) if items and items[0].get("lastclock") else 0
-            lines.append(f"  {h['host']}: " + ("最新値あり" if last else "値なし"))
+            lines.append(f"  {h['host']}: " + ("最新値あり" if latest_clock(client, h["hostid"]) else "値なし"))
         return [f"Zabbix:          {len(hosts)} ホスト（{env.zabbix_api_url}）", *lines]
     except LabError as e:
         return [f"Zabbix:          届きません（{e}）"]
@@ -346,12 +353,13 @@ def ready_hosts(env: Env, expected: int) -> bool:
     hosts = client.call("host.get", {"output": ["hostid", "host"], "groupids": list(groups.values())})
     if len(hosts) < expected:
         return False
-    for h in hosts:
-        items = client.call("item.get", {"hostids": h["hostid"], "output": ["lastclock"], "filter": {"status": 0},
-                                         "sortfield": "lastclock", "sortorder": "DESC", "limit": 1})
-        if not items or not int(items[0].get("lastclock") or 0):
-            return False
-    return True
+    return all(latest_clock(client, h["hostid"]) for h in hosts)
+
+
+def latest_clock(client: ZabbixApi, hostid: str) -> int:
+    """そのホストの有効なアイテムの最新の時刻（無ければ 0）。item.get は lastclock で並べられないので手元で最大を取る。"""
+    items = client.call("item.get", {"hostids": hostid, "output": ["lastclock"], "monitored": True, "limit": 5000})
+    return max((int(i.get("lastclock") or 0) for i in items), default=0)
 
 
 __all__ = ["ZabbixApi", "api", "setup", "summary", "ready_hosts", "chart_values", "NS", "render", "succeeds"]

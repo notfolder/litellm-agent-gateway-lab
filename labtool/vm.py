@@ -16,6 +16,7 @@ import io
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -167,8 +168,10 @@ def ssh_base(env: Env, node: Node, *extra: str) -> list[str]:
     if not node.public_ip:
         raise LabError(f"ノード {node.id} に公開 IP がありません（起動を待つか、外向きの IP を確かめてください）")
     # known_hosts は IP でなく台の識別子で引く（GCP は浮動 IP を取った台の公開 IP が静的 IP に入れ替わり、障害で別の台に移る）
+    # 相手が黙って消えたときに待ち続けないよう、生存確認を入れる（nftables を入れた直後に切断を検知できなかった。2026-10-31）
     return ["ssh", "-i", str(env.vm_ssh_key), "-o", f"UserKnownHostsFile={KNOWN_HOSTS}", "-o", "StrictHostKeyChecking=accept-new",
             "-o", f"HostKeyAlias={host_alias(node)}", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
             *extra, f"{env.vm_ssh_user}@{node.public_ip}"]
 
 
@@ -829,6 +832,19 @@ def ensure_a_record(env: Env, ip: str, host: str | None = None) -> None:
         info(f"余分な A レコードを消しました: {host} → {extra['content']}")
 
 
+def resolve_a(host: str) -> set[str]:
+    """A レコードを引く。dig があれば dig（macOS の mDNSResponder のキャッシュを通さず、設定の DNS サーバーに直接聞く。
+    古い答えが TTL を超えて残ることがあった。配備で判明 2026-10-31）、無ければ getaddrinfo。"""
+    if shutil.which("dig"):
+        out = subprocess.run(["dig", "+short", "+time=3", "+tries=1", "A", host], capture_output=True, text=True)
+        if out.returncode == 0:
+            return {line.strip() for line in out.stdout.splitlines() if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", line.strip())}
+    try:
+        return {a[4][0] for a in socket.getaddrinfo(host, 443, socket.AF_INET)}
+    except socket.gaierror:
+        return set()
+
+
 def wait_for_a_record(env: Env, ip: str, host: str | None = None) -> None:
     """手持ちの DNS の A レコード（ホスト名 → IP）が引けるまで待つ。引けない間は手順を知らせる。"""
     import sys
@@ -836,10 +852,7 @@ def wait_for_a_record(env: Env, ip: str, host: str | None = None) -> None:
     start = time.monotonic()
     told = False
     while True:
-        try:
-            got = {a[4][0] for a in socket.getaddrinfo(host, 443, socket.AF_INET)}
-        except socket.gaierror:
-            got = set()
+        got = resolve_a(host)
         if ip in got:
             ok(f"{host} が {ip} に解決できました")
             return

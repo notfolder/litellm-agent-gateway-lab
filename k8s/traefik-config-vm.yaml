@@ -3,6 +3,10 @@
 # - replica 2。3 台とも server ノードなので「server ノードに置く」では 1 台に寄らず、入口の Pod が載った台が
 #   止まっても Service の宛先が残るように 2 つにする
 # - web（80）は websecure（443）へ転送する。経路（IngressRoute）は websecure 側に TLS 付きで置く（render.tls_ingressroutes）
+# - 入口は内部ロードバランサ → 各台の 80/443 → Traefik の hostPort。ServiceLB（svclb）は使わない（Service は ClusterIP）。
+#   svclb は送信元を自分の Pod の IP に書き換える（MASQUERADE。externalTrafficPolicy: Local でも）ので、Traefik に利用者の IP
+#   （踏み台か VPC の中）が届かず、管理系の経路の IPAllowList が効かない（配備で判明 2026-10-31）。hostPort（CNI の portmap）は
+#   DNAT だけで送信元を保つ。Traefik の Pod が無い台は内部ロードバランサのヘルスチェック（TCP 80）に落ち、転送先から外れる
 apiVersion: helm.cattle.io/v1
 kind: HelmChartConfig
 metadata:
@@ -12,8 +16,11 @@ spec:
   valuesContent: |-
     deployment:
       replicas: 2
+    service:
+      type: ClusterIP
     ports:
       web:
+        hostPort: 80
         redirections:
           entryPoint:
             to: websecure
@@ -25,6 +32,7 @@ spec:
             writeTimeout: 600s
             idleTimeout: 600s
       websecure:
+        hostPort: 443
         transport:
           respondingTimeouts:
             readTimeout: 600s

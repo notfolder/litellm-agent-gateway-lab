@@ -53,7 +53,7 @@ EOT
 fi
 systemctl is-active --quiet lab-proxy.service || systemctl restart lab-proxy.service
 
-# ---- nftables（踏み台の守り）: 22 は操作者、3128 と 10051 は VPC の中、Zabbix の web は 127.0.0.1 だけ。外向きは全部通す ----
+# ---- nftables（踏み台の守り）: 22 と 3128 は操作者と VPC の中、10051 は VPC の中、Zabbix の web は 127.0.0.1 だけ。外向きは全部通す ----
 set_elems() { local v="${1//,/, }"; [ -n "$v" ] && echo "$v" || echo "127.0.0.255/32"; }
 apt-get install -y -q nftables >/dev/null 2>&1 || { apt-get update -q && apt-get install -y -q nftables; }
 cat > /etc/nftables.conf <<EOT
@@ -74,6 +74,7 @@ table inet lab {
     tcp dport 22 ip saddr @admins accept
     tcp dport 22 ip saddr @internal accept
     tcp dport { ${PORT}, 10051 } ip saddr @internal accept
+    tcp dport ${PORT} ip saddr @admins accept    # 操作者の Mac も中継を通す（LAB_EGRESS_PROXY_MAC）
     counter drop
   }
   chain forward {

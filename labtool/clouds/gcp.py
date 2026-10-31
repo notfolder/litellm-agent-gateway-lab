@@ -20,7 +20,7 @@ from .. import objectstore as objstore
 from .. import render
 from ..core import Env, LabError, info, ok, warn
 from . import (
-    GCP_HEALTH_CHECK_RANGES, GCP_META_IPS, GCS_ROLE_LISTER, GCS_ROLE_WRITER, NODE_COUNT, OPERATOR_USER, PROXY_PORT,
+    GCP_DNS_IPS, GCP_HEALTH_CHECK_RANGES, GCP_META_IPS, GCS_ROLE_LISTER, GCS_ROLE_WRITER, NODE_COUNT, OPERATOR_USER, PROXY_PORT,
     STATIC_KEY_USERS, ZABBIX_SERVER_PORT, Infra, Node, gcs_bindings, network_plan,
 )
 
@@ -271,6 +271,11 @@ def health_check_ranges(env: Env) -> list[str]:
 def meta_ips(env: Env) -> list[str]:
     """VM が中継を通さず直接届く必要があるクラウドの内部アドレス（メタデータサーバーが DNS と NTP も兼ねる）。"""
     return list(GCP_META_IPS)
+
+
+def dns_ips(env: Env) -> list[str]:
+    """クラウドの再帰リゾルバ（cert-manager の DNS-01 の伝搬確認）。"""
+    return list(GCP_DNS_IPS)
 
 
 # ---- 内部ロードバランサ（内部パススルー ネットワーク ロードバランサ。変更設計書 2026-10-31 3.2 節） ----
