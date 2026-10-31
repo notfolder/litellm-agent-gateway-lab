@@ -159,6 +159,20 @@ def destroy(env: Env, stacks: list[str]) -> None:
 
 
 # ---- ./lab down の後始末（スタックを消しても残るもの） ----
+def empty_bucket(s3, bucket: str) -> int:
+    """バケットの全オブジェクトの全版（削除マーカーも）を消す。GOVERNANCE の Object Lock は保持を越えて消す
+    （操作者に s3:BypassGovernanceRetention が要る）。消した版の数を返す。aws-ec2 の削除（labtool/clouds/aws_ec2.py）も使う。"""
+    n = 0
+    for page in s3.get_paginator("list_object_versions").paginate(Bucket=bucket):
+        objs = [{"Key": o["Key"], "VersionId": o["VersionId"]}
+                for k in ("Versions", "DeleteMarkers") for o in page.get(k, [])]
+        for i in range(0, len(objs), 1000):
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": objs[i:i + 1000], "Quiet": True},
+                              BypassGovernanceRetention=True)
+            n += len(objs[i:i + 1000])
+    return n
+
+
 def retained_bucket_names(env: Env, account: str) -> list[str]:
     """data スタックを消しても残る S3 のバケット（RETAIN。Object Lock のため CloudFormation が空にできない）。"""
     prefix = render.bucket_prefix(env, account)
@@ -180,15 +194,7 @@ def purge_retained(env: Env) -> None:
         if lock_mode == "COMPLIANCE" and bucket.endswith((render.AUDIT_RAW, render.AUDIT_ACCESS)):
             warn(f"バケット {bucket} は Object Lock（COMPLIANCE）のため消せません。保持期間が切れるまで残ります")
             continue
-        n = 0
-        paginator = s3.get_paginator("list_object_versions")
-        for page in paginator.paginate(Bucket=bucket):
-            objs = [{"Key": o["Key"], "VersionId": o["VersionId"]}
-                    for k in ("Versions", "DeleteMarkers") for o in page.get(k, [])]
-            for i in range(0, len(objs), 1000):
-                s3.delete_objects(Bucket=bucket, Delete={"Objects": objs[i:i + 1000], "Quiet": True},
-                                  BypassGovernanceRetention=True)
-                n += len(objs[i:i + 1000])
+        n = empty_bucket(s3, bucket)
         s3.delete_bucket(Bucket=bucket)
         info(f"バケット {bucket} を消しました（{n} 版）")
     sm = client(env, "secretsmanager")

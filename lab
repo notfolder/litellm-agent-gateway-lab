@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script --quiet
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["pyyaml>=6.0", "boto3>=1.35"]
+# dependencies = ["pyyaml>=6.0", "boto3>=1.35", "google-cloud-compute>=1.20", "google-cloud-storage>=2.18", "google-cloud-iam>=2.15", "google-cloud-resource-manager>=1.12"]
 # ///
 """検証環境の構築ツール。どのコマンドも何度実行しても同じ結果になる（docs/design.md 17 章）。
 
@@ -22,12 +22,14 @@ from labtool.core import Env, LabError, ok
 def up() -> None:
     env = stages.preflight()
     stages.cluster(env)
+    stages.ensure_access(env)
     stages.images(env)
     stages.secrets_(env)
     stages.objectstore(env)
     stages.datastores(env)
     stages.mcp(env)
     stages.litellm(env)
+    stages.zabbix(env)
     stages.bootstrap(env)
     stages.audit(env)
     stages.clients(env)
@@ -44,6 +46,7 @@ def rebuild() -> None:
 def test_failover(pooler: str | None, scenario: str) -> None:
     """障害の試験。--pooler を付けたら、その接続先に切り替えて試し、終わったら元に戻す。"""
     env = Env.load()
+    stages.ensure_access(env)
     scenarios = failover.scenarios_for(env) if scenario == "all" else [scenario]
     original = env.get("LAB_DB_POOLER", "pooler")
     switch = pooler is not None and pooler != original and not env.is_aws
@@ -58,34 +61,49 @@ def test_failover(pooler: str | None, scenario: str) -> None:
             stages.litellm(env)
 
 
+def loaded() -> Env:
+    """.env を読み、Kubernetes の API に届く状態にする（VM の環境は 22 の許可の更新と SSH のポート転送）。"""
+    env = Env.load()
+    stages.ensure_access(env)
+    return env
+
+
 def stage(fn):
     """段階を単独で流す（.env を読んでから呼ぶ）。"""
-    return lambda: fn(Env.load())
+    return lambda: fn(loaded())
 
 
 COMMANDS: dict[str, tuple[str, object]] = {
     "up": ("全段階を順に流す（何度でも可）", up),
-    "down": ("クラスタを削除する（Mac: k3d。AWS: 有料のものをすべて消す。残るのは無料の証明書と CDK の bootstrap）", ops.down),
+    "down": ("クラスタを削除する（Mac: k3d。aws: 有料のものをすべて消す。aws-ec2 / gcp-vm: managed は全部消す、"
+             "provided は k3s を外して保持の無いディレクトリを空にする。--all で VM・浮動 IP・バケットも消す）", None),
     "rebuild": ("クラスタを削除して作り直す（所要時間を表示）", rebuild),
     "status": ("状態を表示する", stage(ops.status)),
     # 段階ごと
     "preflight": ("[段階] 前提の確認", stages.preflight),
-    "cluster": ("[段階] Mac: イメージの置き場、k3d、Traefik。AWS: CDK の配備、kubeconfig、ESO", stage(stages.cluster)),
+    "cluster": ("[段階] Mac: イメージの置き場、k3d、Traefik。aws: CDK の配備、kubeconfig、ESO。"
+                "aws-ec2 / gcp-vm: 基盤（API を直接呼ぶ）、k3s、SSH のポート転送、registry、Let's Encrypt", stage(stages.cluster)),
     "images": ("[段階] 検証用 LiteLLM イメージのビルドと push", stage(stages.images)),
-    "secrets": ("[段階] 秘密情報（Mac: .env → Secret。AWS: Secrets Manager → External Secrets）", stage(stages.secrets_)),
-    "objectstore": ("[段階] オブジェクトストレージ（Mac: RustFS を作る。AWS: S3 の検査）", stage(stages.objectstore)),
-    "datastores": ("[段階] PostgreSQL と Redis（AWS: Aurora と ElastiCache の確認）", stage(stages.datastores)),
+    "secrets": ("[段階] 秘密情報（Mac・VM の環境: .env → Secret。aws: Secrets Manager → External Secrets）", stage(stages.secrets_)),
+    "objectstore": ("[段階] オブジェクトストレージ（Mac: RustFS を作る。クラウド: バケットの検査）", stage(stages.objectstore)),
+    "datastores": ("[段階] PostgreSQL と Redis（aws: Aurora と ElastiCache の確認）", stage(stages.datastores)),
     "mcp": ("[段階] 試験用の偽 LLM と google_workspace_mcp", stage(stages.mcp)),
     "litellm": ("[段階] プロキシ設定、LiteLLM（Helm）、入口", stage(stages.litellm)),
+    "zabbix": ("[段階] aws-ec2 / gcp-vm: Zabbix による監視（検証はサーバーも踏み台の VM に。ホストとテンプレートを API で登録）",
+               stage(stages.zabbix)),
     "bootstrap": ("[段階] 検証ユーザーと固定値のキー", stage(stages.bootstrap)),
     "audit": ("[段階] 監査ログの整形（CronJob）と検索アプリ", stage(stages.audit)),
     "clients": ("[段階] Claude Code と Codex の設定", stage(stages.clients)),
     # 手作業・保守
     "chatgpt-login": ("ChatGPT Plus にデバイスコードでログインする（手作業。初回だけ）", stage(stages.chatgpt_login)),
+    "forward": ("aws-ec2 / gcp-vm: SSH のポート転送（k3s の 6443、入口の 443、Zabbix の web）を確かめて張る", loaded),
+    "provider-requirements": ("担当部署への依頼に添える IAM ポリシーの JSON とライフサイクルの規則を出す（docs/provider-requests.md）",
+                              lambda: ops.provider_requirements(Env.load())),
     "upgrade": ("LiteLLM を別の版でローリング更新する（例: ./lab upgrade v1.104.3）", None),
+    "upgrade-k8s": ("aws-ec2 / gcp-vm: k3s（Kubernetes）を 1 台ずつ上げる（例: ./lab upgrade-k8s v1.36.1+k3s1。マイナー版は 1 つずつ）", None),
     "clean-all": ("クラスタ、生成したクライアント設定、ビルドしたイメージを消す（.env とトークンは残す）", None),
     # 試験
-    "test-unit": ("単体テスト（構築ツールと、LiteLLM のイメージの中でガードレール）", stage(ops.test_unit)),
+    "test-unit": ("単体テスト（構築ツールと、LiteLLM のイメージの中でガードレール）", lambda: ops.test_unit(Env.load())),   # クラスタに届かなくてよい
     "test-smoke": ("疎通確認（入口、パススルーの遮断、審査の差し替え、機密の持ち出しの拒否）", stage(checks.smoke)),
     "test-idempotency": ("./lab up を 2 回流し、2 回目で何も変わらないことを確かめる", checks.idempotency),
     "test-load": ("偽 LLM を相手にした負荷試験（k6、Docker で実行）", None),
@@ -97,6 +115,7 @@ COMMANDS: dict[str, tuple[str, object]] = {
     "audit-bench": ("検索の速さの試験（合成データと実際の記録で、目標の操作の時間を測る）", None),
     "audit-compact": ("監査ログの整形を手で流す", None),
     "review-log": ("審査の判定ログを集計する", None),
+    "proxy-log": ("aws-ec2 / gcp-vm: 中継（出口プロキシ）の記録から宛先ホストごとの件数を出す（LAB_EGRESS_PROXY_VM=true のとき）", None),
 }
 
 
@@ -106,7 +125,13 @@ def main(argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="command", metavar="<コマンド>", required=True)
     parsers = {name: sub.add_parser(name, help=desc, description=desc) for name, (desc, _) in COMMANDS.items()}
     parsers["upgrade"].add_argument("version", help="LiteLLM の版（例: v1.104.3）")
+    parsers["upgrade-k8s"].add_argument("version", help="k3s の版（例: v1.36.1+k3s1）")
+    parsers["upgrade-k8s"].add_argument("--measure", action="store_true",
+                                        help="上げている間、偽 LLM への要求を流し続けて失敗の数と時間を測る（test-failover と同じ測り方）")
     parsers["clean-all"].add_argument("-y", "--yes", action="store_true", help="確認を出さずに消す")
+    parsers["down"].add_argument("--all", action="store_true", dest="everything",
+                                 help="LAB_INFRA=provided でも VM・浮動 IP・バケットまで消す（静的キーとネットワークは残る）")
+    parsers["proxy-log"].add_argument("--since", default="1 hour ago", help="journalctl の --since（既定 '1 hour ago'）")
     parsers["test-load"].add_argument("--vus", default="20", help="同時接続数（既定 20）")
     parsers["test-load"].add_argument("--duration", default="2m", help="時間（既定 2m）")
     parsers["test-load"].add_argument("--scenario", default="chat", choices=["chat", "review"])
@@ -117,8 +142,9 @@ def main(argv: list[str]) -> int:
     parsers["test-failover"].add_argument("--pooler", choices=["pooler", "direct"],
                                           help="この接続先に切り替えて試す（終わったら元に戻す）")
     parsers["test-failover"].add_argument("--scenario", default="all",
-                                          choices=["all", *failover.SCENARIOS, *failover.SCENARIOS_AWS],
-                                          help="場面（Mac: pg-*, valkey-*。AWS: litellm-drain, aurora-failover, valkey-failover）")
+                                          choices=["all", *failover.SCENARIOS_VM, *failover.SCENARIO_ALIASES, *failover.SCENARIOS_AWS],
+                                          help="場面（Mac: pg-*, valkey-*。aws-ec2 / gcp-vm: 同じ ＋ entry-node（eip-node でも可）。"
+                                               "aws: litellm-drain, aurora-failover, valkey-failover）")
     parsers["audit-synth"].add_argument("--days", type=int, default=7)
     parsers["audit-synth"].add_argument("--per-day", type=int, default=1_000_000)
     parsers["audit-compact"].add_argument("--hour", help="日本時間の時間（YYYY-MM-DDTHH）。省くと締まった時間をすべて")
@@ -128,29 +154,37 @@ def main(argv: list[str]) -> int:
 
     try:
         match args.command:
+            case "down":
+                ops.down(everything=args.everything)
+            case "proxy-log":
+                from labtool import vm
+                for host, n in vm.proxy_log(loaded(), args.since).items():
+                    print(f"{n:7d}  {host}")
             case "upgrade":
-                ops.upgrade(Env.load(), args.version)
+                ops.upgrade(loaded(), args.version)
+            case "upgrade-k8s":
+                ops.upgrade_k8s(loaded(), args.version, args.measure)
             case "clean-all":
                 ops.clean_all(args.yes)
             case "test-load":
-                checks.load(Env.load(), args.vus, args.duration, args.scenario)
+                checks.load(loaded(), args.vus, args.duration, args.scenario)
             case "test-judge":
-                checks.judge_eval(Env.load(), args.repeat,
+                checks.judge_eval(loaded(), args.repeat,
                                   "context" if args.context else "isolated" if args.isolated else "both")
             case "test-failover":
                 test_failover(args.pooler, args.scenario)
             case "audit-synth":
-                print(audit_test.run_audit_job(Env.load(), "audit-synth", [
+                print(audit_test.run_audit_job(loaded(), "audit-synth", [
                     "python", "-m", "audit.synth", "--days", str(args.days), "--per-day", str(args.per_day)],
                     "audit-compactor-s3", memory="1Gi", timeout=3600))
             case "audit-bench":
-                env = Env.load()
+                env = loaded()
                 for prefix in ("synth/", ""):
                     print(audit_test.run_audit_job(env, "audit-bench", ["python", "-m", "audit.bench", "--prefix", prefix],
                                                    "audit-viewer-s3", memory="512Mi").strip().splitlines()[-1])
             case "audit-compact":
                 cmd = ["python", "-m", "audit.compactor"] + (["--hour", args.hour] if args.hour else [])
-                print(audit_test.run_audit_job(Env.load(), "audit-compact", cmd, "audit-compactor-s3"))
+                print(audit_test.run_audit_job(loaded(), "audit-compact", cmd, "audit-compactor-s3"))
             case "review-log":
                 checks.review_log(args.since, args.raw)
             case name:

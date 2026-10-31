@@ -154,7 +154,7 @@ class Compactor:
     # ---- 状態 ----
     def load_state(self) -> dict:
         try:
-            return json.loads(self.s3.get_object(Bucket=DERIVED, Key=self.prefix + STATE_KEY)["Body"].read())
+            return json.loads(self.s3.get_object(**DERIVED.ref(self.prefix + STATE_KEY))["Body"].read())
         except Exception:  # noqa: BLE001 初回
             return {"hours": {}, "days": {}, "contracts_version": None, "fx_version": None, "runs": []}
 
@@ -179,7 +179,7 @@ class Compactor:
         flat = flatten(rows)
         dest = self.tmp / f"meta-{dt}-{hour}.parquet"
         write_parquet(self.con, flat, dest, META_COLUMNS, "user_email NULLS FIRST, ts_start")
-        self.s3.upload_file(str(dest), DERIVED, f"{self.prefix}meta/dt={dt}/hour={hour}/part-0.parquet")
+        self.s3.upload_file(str(dest), DERIVED.bucket, DERIVED.key(f"{self.prefix}meta/dt={dt}/hour={hour}/part-0.parquet"))
         dest.unlink(missing_ok=True)
         return len(flat)
 
@@ -189,7 +189,7 @@ class Compactor:
         local = []
         for i, key in enumerate(files):
             p = self.tmp / f"day-{day}-{i}.parquet"
-            self.s3.download_file(DERIVED, key, str(p))
+            self.s3.download_file(DERIVED.bucket, DERIVED.key(key), str(p))
             local.append(str(p))
         dest = self.tmp / f"usage-{day}.parquet"
         if local:
@@ -199,7 +199,7 @@ class Compactor:
             src_all = parquet_source(self.con, local)
             self.con.execute(f"COPY (SELECT * FROM {src_all} ORDER BY user_email NULLS FIRST, ts_start) TO '{day_file}' "
                              f"(FORMAT parquet, COMPRESSION zstd, ROW_GROUP_SIZE 100000)")
-            self.s3.upload_file(str(day_file), DERIVED, f"{self.prefix}meta_day/dt={day}/part-0.parquet")
+            self.s3.upload_file(str(day_file), DERIVED.bucket, DERIVED.key(f"{self.prefix}meta_day/dt={day}/part-0.parquet"))
             day_file.unlink(missing_ok=True)
             src = src_all
             self.con.execute(f"COPY ({usage_daily_select(day, src)}\n) TO '{dest}' (FORMAT parquet, COMPRESSION zstd)")
@@ -209,7 +209,7 @@ class Compactor:
                 NULL::VARCHAR AS category, 0::BIGINT AS requests, 0::HUGEINT AS tokens_in, 0::HUGEINT AS tokens_out,
                 0::HUGEINT AS tokens_cache_read, 0::HUGEINT AS tokens_cache_write, 0::DOUBLE AS cost_usd WHERE false)
                 TO '{dest}' (FORMAT parquet)""")
-        self.s3.upload_file(str(dest), DERIVED, f"{self.prefix}usage_daily/dt={day}/part-0.parquet")
+        self.s3.upload_file(str(dest), DERIVED.bucket, DERIVED.key(f"{self.prefix}usage_daily/dt={day}/part-0.parquet"))
         for p in local + [str(dest)]:
             Path(p).unlink(missing_ok=True)
 
@@ -219,7 +219,7 @@ class Compactor:
         rows: list[dict] = []
         for i, key in enumerate(files):
             p = self.tmp / f"u-{i}.parquet"
-            self.s3.download_file(DERIVED, key, str(p))
+            self.s3.download_file(DERIVED.bucket, DERIVED.key(key), str(p))
             # 利用者 × モデル × 種類に集計してから持ち込む（日次の集計の行をそのまま持ち込むと、メモリを使いすぎる）
             cur = self.con.execute(f"SELECT user_id, any_value(user_email) AS user_email, model_group, model, category, "
                                    f"sum(cost_usd) AS cost_usd FROM read_parquet('{p}') GROUP BY ALL")
@@ -244,7 +244,7 @@ class Compactor:
                              f"(FORMAT parquet)")
         else:
             self.con.execute(f"COPY (SELECT NULL::VARCHAR AS month WHERE false) TO '{out}' (FORMAT parquet)")
-        self.s3.upload_file(str(out), DERIVED, f"{self.prefix}billing/settlement/month={month}/part-0.parquet")
+        self.s3.upload_file(str(out), DERIVED.bucket, DERIVED.key(f"{self.prefix}billing/settlement/month={month}/part-0.parquet"))
         dest.unlink(missing_ok=True)
         out.unlink(missing_ok=True)
         return len(rows)

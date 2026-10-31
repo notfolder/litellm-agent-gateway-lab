@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import json
-import os
 import threading
 import time
 import urllib.error
@@ -23,16 +22,33 @@ from .core import (
 SERVER_NODE = "k3d-litellm-server-0"
 PG_CLUSTER = "litellm-pg"
 SCENARIOS = ["pg-switchover", "pg-pod", "pg-node", "valkey-pod", "valkey-node"]
-# AWS の場面（変更仕様書 2026-10-24-AWS構成 7.2 節）: LiteLLM のノードの drain、Aurora と ElastiCache のフェイルオーバー
+# AWS（EKS 版）の場面（変更仕様書 2026-10-24-AWS構成 7.2 節）: LiteLLM のノードの drain、Aurora と ElastiCache のフェイルオーバー
 SCENARIOS_AWS = ["litellm-drain", "aurora-failover", "valkey-failover"]
+# VM 3 台の場面: Mac と同じ場面（ノードの停止は VM の停止）＋ 入口（Traefik の Pod が載る台）の停止。内部ロードバランサが
+# その台を外し、Traefik が別の台に移るまで（変更仕様書 2026-10-31 R22。前は浮動 IP を持つ台の停止）
+SCENARIOS_VM = [*SCENARIOS, "entry-node", "worker-node"]   # worker-node: LiteLLM が載った足す台の停止（足す台があるときだけ）
+SCENARIO_ALIASES = {"eip-node": "entry-node"}   # EC2 版の名前
 # 回復までの時間の合格の目安（秒）。ノードを止める場面は長め（変更仕様書 9.3 節）
 LIMITS = {"pg-switchover": 60, "pg-pod": 60, "pg-node": 120, "valkey-pod": 60, "valkey-node": 120,
-          "litellm-drain": 60, "aurora-failover": 90, "valkey-failover": 90}
+          "litellm-drain": 60, "aurora-failover": 90, "valkey-failover": 90, "entry-node": 120, "worker-node": 120}
 # 直結（比較用）のときだけ、PostgreSQL の primary の切り替えと Pod の削除は 90 秒にする。Pooler は切り替えの間の要求を
 # 待たせて吸収する（2026-10-12 の実測で、どちらも失敗 0 件）が、直結では新しい primary が立つまでの 15〜50 秒が
 # そのまま失敗になり、最後の失敗まで 54〜77 秒だった（変更仕様書 9.3 節の目安を、1 回目の結果を見て見直した）
 DIRECT_LIMITS = {"pg-switchover": 90, "pg-pod": 90}
+# GCP の VM 3 台: 台を止める場面の目安を広げる（ユーザーの判断 2026-10-30: 2A）。入口の台（entry-node）と足す台（worker-node）を
+# 止める場面も、ほかの台を止める場面と同じ目安にする（120 秒、GCP は 180 秒。ユーザーの判断 2026-11-01: 1A）
+GCP_LIMITS = {"pg-node": 180, "valkey-node": 180, "entry-node": 180, "worker-node": 180}
 NODE_DOWN_SECONDS = 120
+
+
+def limit_for(env: Env, scenario: str) -> int:
+    """場面ごとの回復までの目安（秒）。直結（比較用）は PostgreSQL の 2 場面を 90 秒に、GCP の VM は台を止める場面を広げる。"""
+    limit = LIMITS[scenario]
+    if env.get("LAB_DB_POOLER", "pooler") == "direct" and not env.is_aws:
+        limit = DIRECT_LIMITS.get(scenario, limit)
+    if env.is_gcp_vm:
+        limit = GCP_LIMITS.get(scenario, limit)
+    return limit
 
 
 def cnpg(*args: str) -> list[str]:
@@ -56,6 +72,7 @@ class Load:
     env: Env
     rate: int = 20
     cleanup: object = None     # 場面の後片付け（AWS の drain の uncordon など）
+    eip_moved: bool = False    # entry-node の場面: ロードバランサが止めた台を外し、戻った後に 3 台とも健全になったか
     samples: list[Sample] = field(default_factory=list)
     _stop: threading.Event = field(default_factory=threading.Event)
     _lock: threading.Lock = field(default_factory=threading.Lock)
@@ -80,12 +97,17 @@ class Load:
 
     def run(self) -> None:
         interval = 1.0 / self.rate
-        with ThreadPoolExecutor(max_workers=self.rate * 4) as pool:
+        pool = ThreadPoolExecutor(max_workers=self.rate * 4)
+        try:
             nxt = time.monotonic()
             while not self._stop.is_set():
                 pool.submit(self._one, time.time())
                 nxt += interval
                 time.sleep(max(0.0, nxt - time.monotonic()))
+        finally:
+            # 入口が長く落ちていると、15 秒待ちの要求が溜まる。止めるときは溜まった分を捨て、動いている分だけ待つ
+            # （版上げの計測で、終わった後に何分も待ち続けた。2026-10-31）
+            pool.shutdown(wait=True, cancel_futures=True)
 
     def __enter__(self) -> "Load":
         self._thread = threading.Thread(target=self.run, daemon=True)
@@ -165,6 +187,26 @@ def wait_healthy(env: Env, timeout: int = 600) -> None:
     run(kn("rollout", "status", "deploy/litellm", "--timeout=300s"), quiet=True)
 
 
+def _stop_vm_node(env: Env, node: str, load: Load) -> None:
+    """VM の環境: Pod が載ったノードの VM を止め、NODE_DOWN_SECONDS 後に起こす（クラウド固有層の stop_node / start_node）。"""
+    from . import clouds, vm
+    cloud = clouds.for_env(env)
+    infra = vm.load_infra(env)
+    target = vm.node_for_k8s_name(infra, node)
+    vm.ensure_forward(env, infra, avoid=target.id)   # SSH の転送がその台に張ってあれば別の台へ（止めると kubectl が届かなくなる）
+    info(f"ノード {node}（{target.id}）を {NODE_DOWN_SECONDS} 秒止めます")
+    cloud.stop_node(env, target)
+    try:
+        time.sleep(NODE_DOWN_SECONDS)
+    finally:
+        cloud.start_node(env, target)
+        info(f"ノード {node}（{target.id}）を起動しました")
+    # 止めている間に浮動 IP が転送先の台へ移ると、その台の公開 IP が入れ替わって SSH の転送が切れる（GCP。配備で判明 2026-10-30）。
+    # 公開 IP を引き直し、切れていれば張り直してから kubectl を使う
+    vm.ensure_forward(env, infra)
+    wait_until(600, f"{node} の Ready", kc("wait", "--for=condition=Ready", f"node/{node}", "--timeout=5s"))
+
+
 # ---- 場面 ----
 def _move_pg_primary_off_server() -> None:
     primary = pg_primary()
@@ -191,7 +233,10 @@ def _move_valkey_primary_off_server(env: Env) -> None:
     raise LabError("Valkey の primary を agent ノードへ移せませんでした")
 
 
-def _stop_node(node: str, load: Load) -> None:
+def _stop_node(node: str, load: Load, env: Env | None = None) -> None:
+    if env is not None and env.is_vm:
+        _stop_vm_node(env, node, load)
+        return
     if node == SERVER_NODE:
         raise LabError("server ノードは止めません（Kubernetes の制御部分と RustFS が載っている）")
     info(f"ノード {node} を {NODE_DOWN_SECONDS} 秒止めます")
@@ -230,7 +275,7 @@ def trigger(env: Env, scenario: str, load: Load) -> str:
     if scenario == "pg-node":
         primary = pg_primary()
         node = pod_node(primary)
-        _stop_node(node, load)
+        _stop_node(node, load, env)
         return f"PostgreSQL の primary（{primary}）が載ったノード {node} を停止"
     if scenario == "valkey-pod":
         primary = valkey_primary(env)
@@ -239,18 +284,45 @@ def trigger(env: Env, scenario: str, load: Load) -> str:
     if scenario == "valkey-node":
         primary = valkey_primary(env)
         node = pod_node(primary)
-        _stop_node(node, load)
+        _stop_node(node, load, env)
         return f"Valkey の primary（{primary}）が載ったノード {node} を停止"
+    if scenario == "entry-node":
+        # 入口（Traefik の Pod が載る台）を止める。内部ロードバランサがヘルスチェックでその台を外し、Traefik は別の台に移る
+        from . import clouds, vm
+        cloud = clouds.for_env(env)
+        infra = vm.load_infra(env)
+        traefik = vm.traefik_nodes()
+        if not traefik:
+            raise LabError("Traefik の Pod が見つかりません")
+        node = traefik[0]
+        target = vm.node_for_k8s_name(infra, node)
+        _stop_node(node, load, env)
+        health = cloud.lb_targets_healthy(env, infra)
+        load.eip_moved = bool(health) and all(health.values())
+        return (f"Traefik の載ったノード {node}（{target.id}）を停止（戻った後のロードバランサの健全性: "
+                f"{sum(health.values())}/{len(health)} 台）")
+    if scenario == "worker-node":
+        # LiteLLM が載った足す台を止める（変更仕様書 2026-10-31-台の増減とLiteLLMのメモリ N13）
+        from . import render
+        workers = output(kc("get", "nodes", "-l", f"{render.WORKER_LABEL}=worker", "-o", "name"), check=False).split()
+        if not workers:
+            raise LabError("足す台がありません（LAB_VM_WORKERS か LAB_VM_WORKER_NODES で足してから流してください）")
+        names = [w.split("/", 1)[1] for w in workers]
+        pods = json_output(kn("get", "pods", "-l", "app.kubernetes.io/name=litellm", "-o", "json"), default={}) or {}
+        on = [p["spec"].get("nodeName") for p in pods.get("items", [])]
+        node = next((n for n in names if n in on), names[0])
+        _stop_node(node, load, env)
+        return f"足す台 {node}（LiteLLM {on.count(node)} つ）を停止"
     raise LabError(f"知らない場面です: {scenario}")
 
 
 def run_scenario(env: Env, scenario: str) -> dict:
     step(f"test-failover {scenario}")
     wait_healthy(env)
-    if scenario == "pg-node":
+    if scenario == "pg-node" and not env.is_vm:
         _move_pg_primary_off_server()
         wait_healthy(env)
-    if scenario == "valkey-node":
+    if scenario == "valkey-node" and not env.is_vm:
         _move_valkey_primary_off_server(env)
     restarts_before = litellm_restarts()
     with Load(env) as load:
@@ -292,11 +364,14 @@ def run_scenario(env: Env, scenario: str) -> dict:
         "call_ids": [s.call_id for s in samples if s.status == 200 and s.call_id],
         "t0": t0,
     }
-    limit = (DIRECT_LIMITS.get(scenario, LIMITS[scenario]) if env.get("LAB_DB_POOLER", "pooler") == "direct"
-             and not env.is_aws else LIMITS[scenario])
+    limit = limit_for(env, scenario)
     result["limit_seconds"] = limit
     result["passed"] = (recovery <= limit and not repeated and result["valkey_masters"] == 1
                         and baseline_fail == 0)
+    if scenario == "entry-node":
+        # 止めた台が戻ったあと、ロードバランサが 3 台とも健全と見ていること（trigger が確かめた値）
+        result["eip_moved"] = bool(getattr(load, "eip_moved", False))
+        result["passed"] = result["passed"] and result["eip_moved"]
     (ok if result["passed"] else warn)(
         f"{scenario}: 要求 {result['requests']} 件のうち失敗 {result['failed']} 件"
         f"（状態 {result['statuses']}）、回復まで {result['recovery_seconds']} 秒（目安 {limit} 秒以内）、"
@@ -305,16 +380,24 @@ def run_scenario(env: Env, scenario: str) -> dict:
 
 
 def scenarios_for(env: Env) -> list[str]:
-    return SCENARIOS_AWS if env.is_aws else SCENARIOS
+    if env.is_aws:
+        return SCENARIOS_AWS
+    if env.is_vm:
+        # 足す台の停止は、足す台があるときだけ「all」に入れる
+        return SCENARIOS_VM if env.vm_worker_nodes else [x for x in SCENARIOS_VM if x != "worker-node"]
+    return SCENARIOS
 
 
 def failover(env: Env, scenarios: list[str], audit_check=None) -> None:
     """障害の試験。audit_check(results) を渡すと、監査ログの欠けも照合する。"""
-    bad = [x for x in scenarios if x not in scenarios_for(env)]
+    scenarios = [SCENARIO_ALIASES.get(x, x) for x in scenarios]   # eip-node（EC2 版の名前）→ entry-node
+    allowed = SCENARIOS_VM if env.is_vm else scenarios_for(env)
+    bad = [x for x in scenarios if x not in allowed]
     if bad:
         raise LabError(f"LAB_TARGET={env.target} では使えない場面です: {', '.join(bad)}"
-                       f"（使える場面: {', '.join(scenarios_for(env))}）")
-    where = "AWS: Aurora に直結" if env.is_aws else f"DB の接続先: {env.get('LAB_DB_POOLER', 'pooler')}"
+                       f"（使える場面: {', '.join(allowed)}）")
+    where = "AWS: Aurora に直結" if env.is_aws else f"DB の接続先: {env.get('LAB_DB_POOLER', 'pooler')}" + (
+        f"、{env.target} の VM 3 台" if env.is_vm else "")
     step(f"test-failover 障害の試験（{where}）")
     results = [run_scenario(env, s) for s in scenarios]
     if audit_check is not None:

@@ -228,6 +228,11 @@ class AuditLogger(CustomLogger):
         self.endpoint = os.environ.get("AUDIT_S3_ENDPOINT", "")
         self.region = os.environ.get("AUDIT_S3_REGION", "us-east-1")
         self.bucket = os.environ.get("AUDIT_S3_BUCKET", "audit-raw")
+        # 1 つのバケットのディレクトリに書くときの接頭辞（例 audit-raw/）。記録に残す鍵は接頭辞なしの論理の鍵
+        self.key_prefix = os.environ.get("AUDIT_S3_KEY_PREFIX", "")
+        # 原本のオブジェクト単位の保持（日数が空なら付けない。Mac の RustFS はバケットの既定の保持）
+        self.retention_days = int(os.environ.get("AUDIT_S3_RETENTION_DAYS") or 0)
+        self.retention_mode = os.environ.get("AUDIT_S3_RETENTION_MODE") or "GOVERNANCE"
         self.access_key = os.environ.get("AUDIT_S3_ACCESS_KEY", "")
         self.secret_key = os.environ.get("AUDIT_S3_SECRET_KEY", "")
         self.flush_seconds = float(os.environ.get("AUDIT_FLUSH_SECONDS", "60"))
@@ -304,10 +309,17 @@ class AuditLogger(CustomLogger):
             if self.static_keys:
                 kwargs.update(aws_access_key_id=self.access_key, aws_secret_access_key=self.secret_key)
             self._client = boto3.client("s3", **kwargs)
+            # GCS の XML API も boto3 の x-amz-object-lock-* をそのまま受ける（x-goog-* に写すと ExcessHeaderValues。2026-10-31）
         return self._client
 
+    def _put_args(self) -> dict:
+        if not self.retention_days:
+            return {}
+        until = datetime.now(timezone.utc) + timedelta(days=self.retention_days)
+        return {"ObjectLockMode": self.retention_mode, "ObjectLockRetainUntilDate": until}
+
     def _put(self, key: str, data: bytes) -> None:
-        self.client().put_object(Bucket=self.bucket, Key=key, Body=data)
+        self.client().put_object(Bucket=self.bucket, Key=self.key_prefix + key, Body=data, **self._put_args())
 
     def _spool_size(self) -> int:
         return sum(p.stat().st_size for p in self.spool.glob("*") if p.is_file())

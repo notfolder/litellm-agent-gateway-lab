@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import shutil
 import sys
+from pathlib import Path
 
-from . import aws
+import yaml
+
+from . import aws, clouds, vm
 from . import objectstore as objstore
 from . import render
 from .core import (
@@ -49,11 +52,13 @@ def preflight() -> Env:
     env = Env.load()
     if env.is_aws:
         _preflight_aws(env)
+    elif env.is_vm:
+        _preflight_vm(env)
     else:
         require_commands("docker", "k3d", "kubectl", "helm")
-        if not succeeds(["kubectl", "cnpg", "version"]):
-            raise LabError("kubectl cnpg（CloudNativePG のプラグイン）がありません。brew install kubectl-cnpg で入れてください")
-    if not succeeds(["docker", "info"]):
+    if not env.is_aws and not succeeds(["kubectl", "cnpg", "version"]):
+        raise LabError("kubectl cnpg（CloudNativePG のプラグイン）がありません。brew install kubectl-cnpg で入れてください")
+    if not env.is_vm and not succeeds(["docker", "info"]):
         raise LabError("Docker が動いていません。OrbStack を起動してください")
 
     # 外付け SSD（LAB_DATA_DIR の親）がつながっているか
@@ -62,23 +67,68 @@ def preflight() -> Env:
                        "（外付け SSD がつながっているか確かめてください）")
     (env.data_dir / "chatgpt").mkdir(parents=True, exist_ok=True)
 
-    if not env.is_aws:
+    if not env.on_cloud:
         port_busy = succeeds(["lsof", "-nP", f"-iTCP:{env.http_port}", "-sTCP:LISTEN"])
         if port_busy and not cluster_exists():
             raise LabError(f"ポート {env.http_port} が別のプロセスに使われています（.env の LAB_HTTP_PORT を変えてください）")
 
     # 手作業の準備の状況（無くても構築は進む。該当する機能だけ無効になる）
-    for present, good, bad in [
+    checks = [
         (env.has_google(), "Google の OAuth クライアント: 設定あり",
          "Google の OAuth クライアントが未設定です。SSO と Gmail の MCP は無効のまま構築します（docs/setup-google.md）"),
         (env.has_users(), "検証ユーザー: 設定あり", "LAB_USER1_EMAIL が未設定です。利用者のキーは作りません"),
         (env.has_jev(), "Jev の API キー: 設定あり", "TYPESAFE_API_KEY が未設定です。一次判定（Jev）を使わずに構築します"),
-        (env.has_chatgpt(), "ChatGPT のトークン: あり",
-         "ChatGPT のトークンがありません。./lab chatgpt-login で取得するまで、Codex と二次判定は動きません"),
-    ]:
+    ]
+    if not env.is_vm:   # VM の環境は chatgpt/ を置かない（共有ファイルシステムが無い。変更仕様書 2026-10-25 4.2 節）
+        checks.append((env.has_chatgpt(), "ChatGPT のトークン: あり",
+                       "ChatGPT のトークンがありません。./lab chatgpt-login で取得するまで、Codex と二次判定は動きません"))
+    for present, good, bad in checks:
         ok(good) if present else warn(bad)
     ok(f"前提の確認が終わりました（LAB_TARGET={env.target}）")
     return env
+
+
+def ensure_access(env: Env) -> None:
+    """Kubernetes の API に届く状態にする。VM の環境は 22 の許可を操作者の今の IP に合わせ、SSH のポート転送を確かめて
+    （切れていれば）張り直す。段階を単独で流すときも、./lab up でも、最初に呼ぶ（基盤が無ければ何もしない）。"""
+    if env.is_vm:
+        vm.ensure_access(env)
+
+
+def _preflight_vm(env: Env) -> None:
+    """VM 3 台の環境の前提: 道具（ssh、kubectl、helm。Mac の Docker は要らない。イメージは VM 上でビルドする）、資格情報、
+    ホスト名、Let's Encrypt と審査官の設定。provided は既存資源の項目（変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 2 章）。"""
+    require_commands("kubectl", "helm", "ssh", "ssh-keygen", *(["aws"] if env.is_aws_ec2 else []))
+    _ = env.hostname   # 無ければここで止まる
+    for key, what in (("LAB_CLOUDFLARE_API_TOKEN", "Cloudflare の API トークン（DNS-01 用。Zone / DNS / Edit）"),
+                      ("LAB_ACME_EMAIL", "Let's Encrypt の連絡先のメールアドレス"),
+                      (render.JUDGE_KEY_ENV, "審査官の Anthropic の API キー")):
+        if not env.get(key):
+            raise LabError(f"LAB_TARGET={env.target} には .env の {key}（{what}）が要ります")
+    cloud = clouds.for_env(env)
+    ident = cloud.identity(env)
+    ok(f"{env.target} の資格情報: {ident['account']}、{ident['principal']}（{ident['region']}）、LAB_INFRA={env.infra_mode}")
+    if env.is_provided:
+        vm.require_provided_env(env)
+        ok("既存資源の項目（VM 3 台、バケット、内部ロードバランサ、踏み台、静的キー）がそろっています")
+    elif env.egress_proxy and not env.egress_proxy_vm and (env.egress_ca_file is None or not env.egress_ca_file.exists()):
+        raise LabError("LAB_EGRESS_PROXY には LAB_EGRESS_CA_FILE（中継の CA の PEM）が要ります")
+    if env.egress_proxy:
+        ok(f"出口プロキシ: {env.egress_proxy}（Mac: {env.egress_proxy_mac or '通さない'}）")
+    # 入口は内部ロードバランサなので、操作者の Mac は踏み台経由の転送口に別名で届く（変更設計書 2026-10-31 6 章）
+    if not env.local_hostname:
+        warn("LAB_LOCAL_HOSTNAME（Mac 用の別名）が空です。入口はプライベートなので、Mac からの試験とクライアントは別名の"
+             "A レコード（127.0.0.1）と証明書の SAN が要ります。VPC の内側から流すときだけ空でよい")
+    if env.zabbix_vm and not env.egress_proxy_vm:
+        raise LabError("LAB_ZABBIX_VM=true は LAB_EGRESS_PROXY_VM=true（Zabbix サーバーを載せる踏み台の VM）が要ります")
+    if not env.is_provided and not env.egress_proxy_vm and not env.vm_bastion_cidr:
+        warn("踏み台（LAB_EGRESS_PROXY_VM=true の中継の VM か LAB_VM_BASTION_HOST/CIDR）が無いので、管理系の経路（/ui、検索アプリ）と"
+             "Mac からの HTTPS の転送は使えません")
+    if env.zabbix_enabled:
+        ok(f"Zabbix: {'踏み台の VM にサーバーを立てる' if env.zabbix_vm else env.zabbix_server}")
+    for script in (vm.NODE_INIT_SCRIPT, vm.PROXY_INIT_SCRIPT):
+        if not script.exists():
+            raise LabError(f"{script.relative_to(ROOT)} がありません")
 
 
 def _preflight_aws(env: Env) -> None:
@@ -112,6 +162,9 @@ def cluster(env: Env) -> None:
     step("cluster クラスタ")
     if env.is_aws:
         _cluster_aws(env)
+        return
+    if env.is_vm:
+        _cluster_vm(env)
         return
     # イメージの置き場はクラスタより先に作る。クラスタを消しても残す
     ensure_registry(REGISTRY_NAME, REGISTRY_HOST_PORT)
@@ -178,6 +231,105 @@ def _cluster_aws(env: Env) -> None:
     ok(f"クラスタの準備ができました（EKS {env.aws_cluster_name}、{env.aws_region}）")
 
 
+def _provision_vm(env: Env, pubkey: str) -> None:
+    """managed: クラウド固有層で資源を作り（無ければ）、識別子と静的キーを .env に書く。中継の VM があれば初期化して CA を取る。"""
+    cloud = clouds.for_env(env)
+    cloud.ensure_apis(env)
+    result = cloud.provision(env, pubkey, vm.operator_cidr(env))
+    env.set("LAB_VM_NODES", ",".join(result["nodes"]))
+    env.set("LAB_VM_WORKER_NODES", ",".join(result.get("workers", [])))
+    env.set("LAB_VM_BUCKET", result["bucket"])
+    env.set("LAB_VM_ENTRY_IP_ID", result["entry_ip_id"])
+    for key in ("bastion_host", "bastion_cidr", "zabbix_server"):
+        if result.get(key):
+            env.set(f"LAB_VM_{key.upper()}" if key != "zabbix_server" else "LAB_ZABBIX_SERVER", result[key])
+    for user, (key, secret) in result["keys"].items():
+        if key == "json":   # GCP の registry はサービスアカウントの JSON キー（GCS ドライバ）
+            env.set(render.GCS_REGISTRY_KEY_ENV, secret)
+            continue
+        key_name, secret_name = render.s3_env_names(user, env)
+        env.set(key_name, key)
+        env.set(secret_name, secret)
+    if result["proxy"] is not None:
+        env.set("LAB_VM_PROXY_NODE", result["proxy"].id)
+        vm.init_proxy(env, vm.load_infra(env))
+    elif env.get("LAB_VM_PROXY_NODE") or env.get("LAB_EGRESS_PROXY_MAC"):
+        for key in ("LAB_VM_PROXY_NODE", "LAB_EGRESS_PROXY", "LAB_EGRESS_PROXY_MAC", "LAB_EGRESS_CA_FILE",
+                    "LAB_VM_BASTION_HOST", "LAB_VM_BASTION_CIDR", "LAB_ZABBIX_SERVER"):
+            env.set(key, "")
+    ok(f"基盤を .env に書きました（VM {len(result['nodes'])} 台 ＋ 足す台 {len(result.get('workers', []))} 台、バケット {result['bucket']}、入口（内部ロードバランサ）{result['entry_ip']}"
+       + (f"、踏み台 {result['bastion_host']}" if result.get("bastion_host") else "") + "）")
+
+
+def _cluster_vm(env: Env) -> None:
+    """VM 3 台: managed は provision（作って .env に書く）→ 両モード共通の setup: .env の識別子から基盤を組む → 22 / 80・443 の許可
+    （managed）→ k3s のトークンと版 → 3 台を SSH で順に初期化 → ポート転送 → Traefik（replica 2）→ namespace → SA →
+    中継の CA → イメージ置き場（registry、保存先はバケットの images/）→ オペレーター（replica 2）→ Let's Encrypt の ClusterIssuer
+    （変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 8 章）。"""
+    pubkey = vm.ensure_ssh_key(env)
+    if not env.is_provided:
+        _provision_vm(env, pubkey)
+    infra = vm.load_infra(env)
+    vm.ensure_access(env, forward=False)   # 初期化の前は k3s が無いので転送は張らない
+    # 減らした足す台を先に外す（外す台の IP は前回の nftables に残っているので、外し終わるまで Pod の通信は切れない。
+    # 変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 3.2 節）
+    vm.remove_leaving_workers(env, infra)
+    vm.init_nodes(env, infra, pubkey)
+    vm.ensure_forward(env, infra)
+    want = len(infra.all_nodes())
+    wait_until(600, f"全ノード（{want} 台）の Ready", lambda: _ready_nodes() >= want)
+    vm.label_entry_nodes(infra)
+    kapply(files=[K8S / "traefik-config-vm.yaml"], namespaced=False)
+    vm.wait_traefik(infra)
+    vm.ensure_https_forward(env, infra)   # 踏み台経由で入口（内部ロードバランサの 443）へ
+    kapply(files=[K8S / "namespace.yaml"], namespaced=False)
+    kapply(files=[K8S / "network-policies.yaml"])   # DB と Valkey への接続元を絞る（変更設計書 2026-10-31 5.2 節）
+    kapply(manifest=render.service_accounts_manifest())
+    _egress_ca(env)
+    _vm_registry(env)
+    operators(replicas=2, env=env)
+    # Let's Encrypt の DNS-01（Cloudflare の API トークンは cert-manager の名前空間の Secret）
+    kapply(manifest=secret_manifest("cloudflare-api-token", {"api-token": env.get("LAB_CLOUDFLARE_API_TOKEN")},
+                                    namespace="cert-manager"), namespaced=False)
+    kapply(manifest=render.vm_issuer_manifest(env), namespaced=False)
+    ok(f"クラスタの準備ができました（{env.target} の k3s 3 台 ＋ 足す台 {len(infra.workers)} 台、{env.vm_region}、入口（内部ロードバランサ）{infra.entry_ip}、"
+       f"LAB_INFRA={env.infra_mode}）")
+
+
+def _ready_nodes() -> int:
+    """Ready のノードの数。"""
+    nodes = json_output(kc("get", "nodes", "-o", "json"), default={}) or {}
+    return sum(1 for n in nodes.get("items", [])
+               if any(c["type"] == "Ready" and c["status"] == "True" for c in n["status"].get("conditions", [])))
+
+
+def _egress_ca(env: Env) -> None:
+    """中継（出口プロキシ）の CA を Pod に配る ConfigMap と Secret（litellm-lab と cert-manager の名前空間）。中継が無ければ何もしない。"""
+    if not env.egress_proxy:
+        return
+    kapply(manifest=yaml.safe_dump({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": "cert-manager"}}),
+           namespaced=False)
+    kapply(manifest=render.egress_ca_manifests(env, [NS, "cert-manager"]), namespaced=False)
+
+
+def _vm_registry(env: Env) -> None:
+    """クラスタの中のイメージ置き場（registry。保存先はバケットの images/）。cluster と secrets の両方から呼ぶ
+    （images の段階が push する前に要り、秘密は secrets の段階が揃え直す）。静的キーは .env の LAB_VM_S3_REGISTRY_*。"""
+    env.fill("LAB_REGISTRY_HTTP_SECRET", gen_secret(16))
+    kapply(manifest=secret_manifest(render.VM_REGISTRY_NAME, render.vm_registry_secret(env)))
+    if env.is_gcp_vm:
+        # GCS ドライバの JSON キー（Secret にファイルとして置く）と、置き場のディレクトリの印（ドライバは接頭辞が無いと作れない）
+        import base64
+        kapply(manifest=secret_manifest(render.VM_REGISTRY_GCS_SECRET,
+                                        {"key.json": base64.b64decode(env.get(render.GCS_REGISTRY_KEY_ENV)).decode()}))
+        with objstore.admin_s3(env) as s3:
+            marker = render.store_prefix(env, "images") + "registry/"
+            if not s3.list_objects_v2(Bucket=env.vm_bucket, Prefix=marker, MaxKeys=1).get("KeyCount"):
+                s3.put_object(Bucket=env.vm_bucket, Key=marker, Body=b"")
+    kapply(manifest=render.vm_registry_manifest(env, env.vm_bucket, clouds.REGISTRY_NODEPORT))
+    rollout(f"deploy/{render.VM_REGISTRY_NAME}", 300, "イメージ置き場（registry）の起動")
+
+
 def _ensure_chart(release: str, namespace: str, spec: dict, values: dict) -> None:
     """Helm のリリースを入れる。値のハッシュが同じなら helm を流さない（流すたびにリビジョンが増えるのを防ぐ）。
     ハッシュはリリースの説明（--description）に持つ（cert-manager のチャートは、値に知らない項目があると断るため）。"""
@@ -195,14 +347,20 @@ def _ensure_chart(release: str, namespace: str, spec: dict, values: dict) -> Non
              "--wait", "--timeout", "10m"))
 
 
-def operators() -> None:
-    """cert-manager → CloudNativePG のオペレーター → Barman Cloud Plugin（この順。プラグインは証明書を使う）。"""
+def operators(replicas: int = 1, env: Env | None = None) -> None:
+    """cert-manager → CloudNativePG のオペレーター → Barman Cloud Plugin（この順。プラグインは証明書を使う）。
+    replicas は VM の環境で 2（3 台とも server ノードなので「server ノードに置く」では 1 台に寄らず、
+    オペレーターの台が止まっても PostgreSQL の昇格が待たされないようにする。変更設計書 2026-10-25-EC2三台構成 2 章）。
+    env があれば cert-manager に中継（出口プロキシ）の値を重ねる（ACME と Cloudflare の API が中継を通る）。"""
     _ensure_chart("cert-manager", "cert-manager", CERT_MANAGER, {
-        "crds": {"enabled": True}, "nodeSelector": CONTROL_PLANE, "webhook": {"nodeSelector": CONTROL_PLANE},
-        "cainjector": {"nodeSelector": CONTROL_PLANE}, "startupapicheck": {"nodeSelector": CONTROL_PLANE}})
+        "crds": {"enabled": True}, "replicaCount": replicas, "nodeSelector": CONTROL_PLANE,
+        "webhook": {"nodeSelector": CONTROL_PLANE, "replicaCount": replicas},
+        "cainjector": {"nodeSelector": CONTROL_PLANE, "replicaCount": replicas},
+        "startupapicheck": {"nodeSelector": CONTROL_PLANE},
+        **(render.cert_manager_egress_values(env, clouds.for_env(env).dns_ips(env) if env.is_vm else None) if env is not None else {})})
     wait_until(300, "cert-manager の準備", kc("-n", "cert-manager", "wait", "--for=condition=Available",
                                               "deploy", "--all", "--timeout=5s"))
-    _ensure_chart("cnpg", "cnpg-system", CNPG, {"nodeSelector": CONTROL_PLANE})
+    _ensure_chart("cnpg", "cnpg-system", CNPG, {"nodeSelector": CONTROL_PLANE, "replicaCount": replicas})
     wait_until(300, "CloudNativePG のオペレーターの準備", kc("-n", "cnpg-system", "wait", "--for=condition=Available",
                                                          "deploy", "-l", "app.kubernetes.io/name=cloudnative-pg",
                                                          "--timeout=5s"))
@@ -213,6 +371,9 @@ def operators() -> None:
         if res.status != 200:
             raise LabError(f"Barman Cloud Plugin のマニフェストを取得できませんでした（{res.status}）")
         write_if_changed(manifest, render.pin_deployments(res.body, CONTROL_PLANE))
+    if env is not None and env.egress_proxy:
+        # Barman のプラグイン自身は外へ出ないが、同じ名前空間の sidecar の設定は ObjectStore（datastores の段階）で渡す
+        pass
     kapply(files=[manifest], namespaced=False)
     wait_until(300, "Barman Cloud Plugin の準備", kc("-n", "cnpg-system", "rollout", "status", "deploy/barman-cloud",
                                                   "--timeout=5s"))
@@ -249,7 +410,11 @@ def images(env: Env) -> dict:
     - apps/audit が無い間（実装の途中）は audit-lab を飛ばす
     外部のイメージ（PostgreSQL など）は、ノードが Docker Hub の中継キャッシュ経由で取るので扱わない。"""
     step("images イメージ")
-    push = _build_and_push_ecr if env.is_aws else _build_and_push
+    # Dockerfile が COPY する egress-ca.pem（出口プロキシの中では中継の CA、無ければ空）を両方の文脈に置く（タグのハッシュにも入る）
+    ca_text = render.egress_ca_text(env) if env.is_vm else ""
+    for ctx in (ROOT / "litellm", ROOT / "apps" / "audit"):
+        write_if_changed(ctx / "egress-ca.pem", ca_text)
+    push = _build_and_push_ecr if env.is_aws else _build_and_push_vm if env.is_vm else _build_and_push
     tag = render.image_tag(env.litellm_base_image, ROOT / "litellm")
     image = push("litellm-lab", tag, ROOT / "litellm",
                  ["--build-arg", f"LITELLM_BASE_IMAGE={env.litellm_base_image}"], env=env)
@@ -283,6 +448,21 @@ def _build_and_push_ecr(name: str, tag: str, context, build_args: list[str], env
     return {"repository": f"{registry}/{repository}", "tag": tag, "local": local_image}
 
 
+def _build_and_push_vm(name: str, tag: str, context, build_args: list[str], env: Env) -> dict:
+    """VM の環境: イメージを k3s の台の Docker でビルドし（アーキテクチャは VM のもの）、クラスタの中の置き場（registry。保存先は
+    バケットの images/）に push する（変更設計書 2026-10-30-既存資源からの構築と出口プロキシ 6 章）。Mac の Docker は使わない。
+    クラスタの中からは lab-registry:5000/<name>:<tag>（各ノードが自分の NodePort から引く）。"""
+    accept = ("application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, "
+              "application/vnd.oci.image.manifest.v1+json")
+    with vm.registry_forward() as endpoint:
+        res = http("HEAD", f"{endpoint}/v2/{name}/manifests/{tag}", headers={"Accept": accept}, timeout=10)
+    if res.status == 200:
+        ok(f"置き場に {name}:{tag} があります")
+    else:
+        vm.build_and_push_on_node(env, vm.load_infra(env), name, tag, Path(context), build_args)
+    return {"repository": f"{clouds.REGISTRY_HOST}/{name}", "tag": tag, "local": f"{name}:{tag}"}
+
+
 def load_image() -> dict:
     if not IMAGE_FILE.exists():
         raise LabError("イメージ名がありません。先に ./lab images を流してください")
@@ -291,7 +471,8 @@ def load_image() -> dict:
 
 def secrets_(env: Env) -> Env:
     """Mac: .env の空の値を生成し、k8s の Secret に反映する。既存の値は上書きしない。
-    AWS: Secrets Manager の {prefix}/app の空の項目を生成し、External Secrets Operator に同じ名前の Secret を作らせる。"""
+    AWS（EKS 版）: Secrets Manager の {prefix}/app の空の項目を生成し、External Secrets Operator に同じ名前の Secret を作らせる。
+    VM の環境: Mac と同じ。バケットの利用者のキーだけは生成せず、クラウドの静的キー（Kubernetes の Secret にだけ置く）を使う。"""
     step("secrets 秘密情報")
     if env.is_aws:
         _secrets_aws(env)
@@ -306,13 +487,17 @@ def secrets_(env: Env) -> Env:
     if render.noreview_enabled(env):
         for k in NOREVIEW_KEYS:
             env.fill(k, gen_key())
-    # オブジェクトストレージの管理者と、用途ごとの利用者（アクセスキーは利用者の名前、シークレットは生成）
-    env.fill("RUSTFS_ACCESS_KEY", "lab-admin")
-    env.fill("RUSTFS_SECRET_KEY", gen_secret(20))
-    for user in render.S3_USERS:
-        key_name, secret_name = render.s3_env_names(user)
-        env.fill(key_name, user)
-        env.fill(secret_name, gen_secret(20))
+    if env.is_vm:
+        _egress_ca(env)
+        _vm_registry(env)   # イメージ置き場の Secret を揃える（静的キーは .env の LAB_VM_S3_*）
+    else:
+        # オブジェクトストレージの管理者と、用途ごとの利用者（アクセスキーは利用者の名前、シークレットは生成）
+        env.fill("RUSTFS_ACCESS_KEY", "lab-admin")
+        env.fill("RUSTFS_SECRET_KEY", gen_secret(20))
+        for user in render.S3_USERS:
+            key_name, secret_name = render.s3_env_names(user, env)
+            env.fill(key_name, user)
+            env.fill(secret_name, gen_secret(20))
     env.fill("AUDIT_SESSION_SECRET", gen_secret(32))
 
     pg_password = env.get("POSTGRES_PASSWORD")
@@ -322,11 +507,11 @@ def secrets_(env: Env) -> Env:
     # DB 移行の Job が使う直結の接続先（Pooler を通さない）
     kapply(manifest=secret_manifest("litellm-migrate-db", {
         "DATABASE_URL": f"postgresql://litellm:{pg_password}@litellm-pg-rw:5432/litellm"}))
-    backup_key, backup_secret = render.s3_env_names("pg-backup")
+    backup_key, backup_secret = render.s3_env_names("pg-backup", env)
     kapply(manifest=secret_manifest("pg-backup-s3", {"ACCESS_KEY_ID": env.get(backup_key),
                                                      "ACCESS_SECRET_KEY": env.get(backup_secret)}))
     for user, secret in (("audit-compactor", "audit-compactor-s3"), ("audit-viewer", "audit-viewer-s3")):
-        key_name, secret_name = render.s3_env_names(user)
+        key_name, secret_name = render.s3_env_names(user, env)
         kapply(manifest=secret_manifest(secret, {"AUDIT_S3_ACCESS_KEY": env.get(key_name),
                                                  "AUDIT_S3_SECRET_KEY": env.get(secret_name)}))
     kapply(manifest=secret_manifest("audit-viewer-session", {"AUDIT_SESSION_SECRET": env.get("AUDIT_SESSION_SECRET")}))
@@ -337,8 +522,12 @@ def secrets_(env: Env) -> Env:
     kapply(manifest=secret_manifest("valkey", {"password": env.get("REDIS_PASSWORD"),
                                                "sentinel-password": env.get("SENTINEL_PASSWORD")}))
     kapply(manifest=secret_manifest("litellm-secrets", render.secrets_for_litellm(env)))
-    kapply(manifest=secret_manifest("rustfs", {"access-key": env.get("RUSTFS_ACCESS_KEY"),
-                                               "secret-key": env.get("RUSTFS_SECRET_KEY")}))
+    if env.is_vm:
+        kapply(manifest=secret_manifest("cloudflare-api-token", {"api-token": env.get("LAB_CLOUDFLARE_API_TOKEN")},
+                                        namespace="cert-manager"), namespaced=False)
+    else:
+        kapply(manifest=secret_manifest("rustfs", {"access-key": env.get("RUSTFS_ACCESS_KEY"),
+                                                   "secret-key": env.get("RUSTFS_SECRET_KEY")}))
     if env.has_google():
         kapply(manifest=secret_manifest("workspace-mcp", {
             "GOOGLE_OAUTH_CLIENT_ID": env.get("GOOGLE_OAUTH_CLIENT_ID"),
@@ -376,6 +565,14 @@ def objectstore(env: Env) -> None:
         objstore.check_buckets(env, aws.client(env, "s3"))
         ok("オブジェクトストレージ（S3）は仕様どおりです")
         return
+    if env.is_vm:
+        # バケット（1 つ）は managed なら provision が作り、provided なら用意する側の物。検査は Mac と同じ全部（利用者ごとの許可・拒否も）
+        cloud = clouds.for_env(env)
+        cloud.check_bucket(env, env.vm_bucket, strict=not env.is_provided)
+        with objstore.admin_s3(env) as admin:
+            objstore.self_check(env, admin, lambda user: objstore.cloud_user_client(env, user))
+        ok("オブジェクトストレージは前提どおりで、利用者ごとの権限も期待どおりです")
+        return
     kapply(files=[K8S / "rustfs.yaml"])
     rollout("statefulset/rustfs", 180, "RustFS の起動")
     with port_forward("svc/rustfs", 9000) as endpoint:
@@ -391,7 +588,7 @@ def objectstore(env: Env) -> None:
         wait_until(60, "RustFS の S3 の応答", ready)
         objstore.ensure_buckets(env, s3)
         objstore.ensure_users(env, objstore.Admin(endpoint, *objstore.admin_credentials(env)))
-        objstore.self_check(env, endpoint)
+        objstore.self_check(env, s3, lambda user: objstore.s3_client(endpoint, *objstore.user_credentials(env, user)))
     ok("オブジェクトストレージの準備ができました")
 
 
@@ -422,8 +619,8 @@ def datastores(env: Env) -> None:
         return
     # 1 台の PostgreSQL（以前の構成）を消す。中身は引き継がない（変更仕様書 4 章）
     _delete_if_present("statefulset/postgres", "service/postgres", "pvc/data-postgres-0", "secret/postgres")
-    kapply(manifest=render_template(K8S / "postgres-cnpg.yaml", {"S3_ENDPOINT": env.get("LAB_S3_ENDPOINT",
-                                                                                       render.DEFAULT_S3_ENDPOINT)}))
+    pg_manifest = render.add_egress_text(render_template(K8S / "postgres-cnpg.yaml", render.pg_backup_values(env)), env)
+    kapply(manifest=render.pin_to_servers(pg_manifest) if env.is_vm else pg_manifest)
     wait_until(1200, "PostgreSQL（3 台）の準備", kn("wait", "cluster/litellm-pg", "--for=condition=Ready",
                                                   "--timeout=5s"))
     rollout("deploy/litellm-pg-pooler-rw", 180, "Pooler の起動")
@@ -432,8 +629,9 @@ def datastores(env: Env) -> None:
     _delete_if_present("deployment/redis", "service/redis", "secret/redis")
     scripts = {p.name: p.read_text() for p in sorted((K8S / "valkey").glob("*.sh"))}
     kapply(manifest=configmap_manifest("valkey-scripts", scripts))
-    kapply(manifest=render_template(K8S / "valkey.yaml", {"SCRIPTS_HASH": short_hash(json.dumps(scripts,
-                                                                                                sort_keys=True))}))
+    valkey_manifest = render_template(K8S / "valkey.yaml", {"SCRIPTS_HASH": short_hash(json.dumps(scripts, sort_keys=True))})
+    # VM の環境は今の 3 台だけに置く（足す台を減らしても失わない。変更仕様書 2026-10-31-台の増減とLiteLLMのメモリ N9）
+    kapply(manifest=render.pin_to_servers(valkey_manifest) if env.is_vm else valkey_manifest)
     rollout("statefulset/valkey", 300, "Valkey（3 台）の起動")
     rollout("statefulset/valkey-sentinel", 300, "Sentinel（3 台）の起動")
     wait_until(60, "Sentinel 3 台が同じ primary を指す", lambda: len(set(sentinel_masters(env))) == 1
@@ -463,7 +661,7 @@ def mcp(env: Env) -> None:
     rollout("deploy/fake-llm", 180, "偽 LLM の起動")
 
     if env.has_google():
-        kapply(files=[K8S / "workspace-mcp.yaml"])
+        kapply(manifest=render.add_egress_text((K8S / "workspace-mcp.yaml").read_text(), env))
         rollout("deploy/workspace-mcp", 300, "google_workspace_mcp の起動")
     else:
         # 設定が消えた場合に備えて、置いてあれば片付ける
@@ -503,13 +701,19 @@ def litellm(env: Env) -> None:
     if env.is_aws and env.has_chatgpt():
         # chatgpt/ のトークンは Mac の auth.json を、全 Pod で共有する EFS の PVC に写す（変更仕様書 4.2 節）
         aws.sync_chatgpt_token(env)
-
-    config_text = render.to_yaml(render.litellm_config(env, env.has_chatgpt()), "./lab が生成。手で編集しない")
+    # VM の環境は chatgpt/ を置かない（トークンを全 Pod で共有する置き場が無い。変更仕様書 2026-10-25 4.2 節）
+    has_chatgpt = env.has_chatgpt() and not env.is_vm
+    config_text = render.to_yaml(render.litellm_config(env, has_chatgpt), "./lab が生成。手で編集しない")
     if write_if_changed(BUILD_DIR / "litellm-config.yaml", config_text):
         info("プロキシ設定を更新しました")
     kapply(manifest=configmap_manifest("litellm-config", {"config.yaml": config_text}))
 
-    overrides = render.helm_overrides(env, image["repository"], image["tag"], short_hash(config_text), out)
+    max_replicas = None
+    if env.is_vm:
+        # 最大数は台ごとの空きから数え直す（変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 4.1 節）。足りなければここで止める
+        max_replicas = litellm_max_replicas(env)
+        kapply(manifest=render.litellm_priority_class_manifest(), namespaced=False)
+    overrides = render.helm_overrides(env, image["repository"], image["tag"], short_hash(config_text), out, max_replicas)
     overrides_file = BUILD_DIR / "litellm-overrides.json"
     write_if_changed(overrides_file, json.dumps(overrides, indent=2) + "\n")
     values_file = ROOT / "litellm" / "values.yaml"
@@ -522,18 +726,99 @@ def litellm(env: Env) -> None:
         ok(f"LiteLLM のリリースは最新です（値のハッシュ {values_hash}）")
     else:
         info("LiteLLM を helm upgrade --install します")
+        # LiteLLM の PDB はチャートの値（litellm/values.yaml の pdb）で付く。一時期 ./lab litellm が別のマニフェストで
+        # 同名の PDB を付けていたので、Helm 管理でない PDB `litellm` が残っていれば消す（残っていると helm が所有権で失敗する）
+        stale = json_output(kn("get", "pdb", "litellm", "--ignore-not-found", "-o", "json"))
+        if stale and stale.get("metadata", {}).get("labels", {}).get("app.kubernetes.io/managed-by") != "Helm":
+            run(kn("delete", "pdb", "litellm", "--ignore-not-found"), quiet=True)
         run(helm("upgrade", "--install", HELM_RELEASE, LITELLM_CHART, "--version", env.chart_version,
                  "-n", NS, "-f", str(values_file), "-f", str(overrides_file),
                  "--set-string", f"labValuesHash={values_hash}", "--wait", "--timeout", "15m"))
 
+    if env.is_vm:
+        _set_litellm_priority()
     rollout("deploy/litellm", 600, "LiteLLM の起動")
     if env.is_aws:
         _ingress_aws(env, out, viewer=bool(render.audit_oidc_client(env)[0]))
     else:
         kapply(files=[K8S / "ingress.yaml"])
+        if env.is_vm:
+            _ingress_vm(env)
     wait_until(120, f"入口からの応答（{env.base_url}/health/liveliness）",
                lambda: http_ok(f"{env.base_url}/health/liveliness"))
     ok(f"LiteLLM の準備ができました: {env.base_url}（管理画面 {env.base_url}/ui）")
+
+
+def litellm_max_replicas(env: Env) -> int:
+    """LiteLLM の自動増減の最大数（VM の環境）。Ready で cordon されていないノードごとに、割り当て可能な量から LiteLLM 以外の Pod の
+    予約を引いた空きを出し、render.litellm_slots で数えて足す。最低の 2 に届かなければ止める（Helm は流さない）。"""
+    nodes = (json_output(kc("get", "nodes", "-o", "json"), default={}) or {}).get("items", [])
+    pods = (json_output(kc("get", "pods", "-A", "-o", "json"), default={}) or {}).get("items", [])
+    used: dict[str, list[float]] = {}
+    for p in pods:
+        node = p["spec"].get("nodeName")
+        if not node or p["status"].get("phase") in ("Succeeded", "Failed"):
+            continue
+        if (p["metadata"].get("labels") or {}).get("app.kubernetes.io/name") == "litellm" and p["metadata"]["namespace"] == NS:
+            continue
+        u = used.setdefault(node, [0.0, 0.0])
+        for c in p["spec"].get("containers", []):
+            req = (c.get("resources") or {}).get("requests") or {}
+            u[0] += render.quantity(req.get("cpu", "0"))
+            u[1] += render.quantity(req.get("memory", "0"))
+    rows = []
+    for n in nodes:
+        ready = any(c["type"] == "Ready" and c["status"] == "True" for c in n["status"].get("conditions", []))
+        if not ready or n["spec"].get("unschedulable"):
+            continue
+        name = n["metadata"]["name"]
+        alloc = n["status"]["allocatable"]
+        u = used.get(name, [0.0, 0.0])
+        rows.append({"name": name, "cpu": render.quantity(alloc["cpu"]), "memory": render.quantity(alloc["memory"]),
+                     "used_cpu": u[0], "used_memory": u[1]})
+    slots = render.litellm_slots(rows, render.quantity(render.LITELLM_CPU_REQUEST), render.quantity(env.litellm_memory_limit))
+    total = sum(slots.values())
+    detail = "、".join(f"{k} {v}" for k, v in sorted(slots.items()))
+    if total < render.LITELLM_MIN_REPLICAS:
+        free = "、".join(f"{r['name']}（CPU の空き {r['cpu'] - r['used_cpu']:.2f} 個、メモリの空き "
+                        f"{(r['memory'] - r['used_memory']) / 2**30:.2f} GiB）" for r in rows)
+        raise LabError(f"LiteLLM（CPU {render.LITELLM_CPU_REQUEST}、メモリの上限 {env.litellm_memory_limit}）を最低の "
+                       f"{render.LITELLM_MIN_REPLICAS} つ置ける空きがありません（置ける数: {detail or '無し'}）。変えずに止めます。"
+                       f"LAB_LITELLM_MEMORY_LIMIT を下げるか、台を足してください。空き: {free}")
+    info(f"LiteLLM の最大数を {total} にします（台ごと: {detail}。CPU {render.LITELLM_CPU_REQUEST}、メモリの上限 {env.litellm_memory_limit}）")
+    return total
+
+
+def _set_litellm_priority() -> None:
+    """LiteLLM の Deployment に優先度（litellm-lab-scalable）を付ける。チャートにこの値が無いので Helm の後に付ける
+    （Helm はこの欄を描かないので、次の upgrade でも残る）。違うときだけ付ける（付けると 1 つずつ入れ替わる）。"""
+    current = output(kn("get", "deploy", "litellm", "-o", "jsonpath={.spec.template.spec.priorityClassName}"), check=False).strip()
+    if current == render.LITELLM_PRIORITY_CLASS:
+        return
+    run(kn("patch", "deploy", "litellm", "--type", "merge", "-p",
+           json.dumps({"spec": {"template": {"spec": {"priorityClassName": render.LITELLM_PRIORITY_CLASS}}}})), quiet=True)
+    info(f"LiteLLM に優先度 {render.LITELLM_PRIORITY_CLASS} を付けました（ほかの Pod の置き場所が足りないときに退く）")
+
+
+def _ingress_vm(env: Env) -> None:
+    """HTTPS の入口: Let's Encrypt の証明書（本番のホスト名 ＋ Mac 用の別名。退避があれば先に戻す）、管理系の経路の送信元制限
+    （admin-only: 踏み台だけ）、Traefik の経路を websecure に TLS 付きで写す。A レコードは 2 本（ホスト名 → 内部ロードバランサの IP、
+    別名 → 127.0.0.1）を Cloudflare に作り、引けるまで待つ（変更設計書 2026-10-31 5.1 節・6 章）。"""
+    infra = vm.load_infra(env)
+    vm.restore_tls_secret()
+    kapply(manifest=render.vm_certificate_manifest(env))
+    admin = render.admin_only_manifest(env)
+    kapply(manifest=admin)
+    kapply(manifest=render.tls_ingressroutes((K8S / "ingress.yaml").read_text() + "\n---\n" + admin))
+    vm.ensure_a_record(env, infra.entry_ip)
+    if env.local_hostname:
+        vm.ensure_a_record(env, "127.0.0.1", env.local_hostname)
+    vm.wait_for_a_record(env, infra.entry_ip)
+    if env.local_hostname:
+        vm.wait_for_a_record(env, "127.0.0.1", env.local_hostname)
+    wait_until(900, f"Let's Encrypt の証明書（{', '.join(render.vm_certificate_names(env))}）の発行",
+               kn("wait", f"certificate/{render.VM_TLS_SECRET}", "--for=condition=Ready", "--timeout=5s"))
+    vm.ensure_https_forward(env, infra)
 
 
 def _ingress_aws(env: Env, out: dict, viewer: bool) -> None:
@@ -563,18 +848,14 @@ def audit(env: Env) -> None:
     step("audit 監査ログの整形と検索アプリ")
     image = load_audit_image()
     ref = f"{image['repository']}:{image['tag']}"
-    if env.is_aws:
-        common = {"IMAGE": ref, "S3_ENDPOINT": "", "S3_REGION": env.aws_region,
-                  "S3_BUCKET_PREFIX": env.get("LAB_AWS_BUCKET_PREFIX")}
-    else:
-        common = {"IMAGE": ref, "S3_ENDPOINT": env.get("LAB_S3_ENDPOINT", render.DEFAULT_S3_ENDPOINT),
-                  "S3_REGION": env.get("LAB_S3_REGION", "us-east-1"), "S3_BUCKET_PREFIX": ""}
-    kapply(manifest=render_template(K8S / "audit-compactor.yaml", common))
-    derived = render.bucket_name(env, render.AUDIT_DERIVED)
+    # 接続先・リージョン・接頭辞は環境ごと（Mac は RustFS、EKS は AWS S3 と Pod Identity、VM はクラウドのバケットと静的キー）
+    common = {"IMAGE": ref, **render.audit_s3_settings(env)}
+    kapply(manifest=render.add_egress_text(render_template(K8S / "audit-compactor.yaml", common), env))
+    derived, derived_prefix = render.store_location(env, render.AUDIT_DERIVED)
     with objstore.admin_s3(env) as s3:
         for kind, doc in (("contracts", render.initial_contracts(env)), ("fx_rates", render.initial_fx_rates(env))):
-            if not s3.list_objects_v2(Bucket=derived, Prefix=f"billing/{kind}/").get("KeyCount"):
-                s3.put_object(Bucket=derived, Key=f"billing/{kind}/00000000T000000-lab-initial.json",
+            if not s3.list_objects_v2(Bucket=derived, Prefix=f"{derived_prefix}billing/{kind}/").get("KeyCount"):
+                s3.put_object(Bucket=derived, Key=f"{derived_prefix}billing/{kind}/00000000T000000-lab-initial.json",
                               Body=json.dumps(doc, ensure_ascii=False, indent=2).encode())
                 info(f"{kind} の初期値を書きました")
     if render.audit_oidc_client(env)[0]:
@@ -584,16 +865,31 @@ def audit(env: Env) -> None:
                            "AUDITORS": env.get("LAB_AUDITORS"), "ROLE_CLAIM": env.get("LAB_AUDIT_ROLE_CLAIM")}
         values["CONFIG_HASH"] = short_hash(json.dumps(values, sort_keys=True) + json.dumps(
             render.audit_oidc_client(env)) + env.get("AUDIT_SESSION_SECRET"))
-        kapply(manifest=render_template(K8S / "audit-viewer.yaml", values))
+        viewer_manifest = render.add_egress_text(render_template(K8S / "audit-viewer.yaml", values), env)
+        if env.is_vm:
+            viewer_manifest = render.add_admin_middleware(viewer_manifest)   # 検索アプリは踏み台からだけ（変更設計書 2026-10-31 5.1 節）
+        kapply(manifest=viewer_manifest)
+        if env.is_vm:
+            kapply(manifest=render.tls_ingressroutes(viewer_manifest))   # HTTPS の経路（web は 443 へ転送される）
         rollout("deploy/audit-viewer", 300, "検索アプリの起動")
         ok(f"検索アプリ: {env.base_url}/lab-audit/")
     else:
         if succeeds(kn("get", "deploy", "audit-viewer")):
             run(kn("delete", "deploy/audit-viewer", "service/audit-viewer", "--ignore-not-found"))
             if not env.is_aws:
-                run(kn("delete", "ingressroute/audit-viewer", "--ignore-not-found"))
+                run(kn("delete", "ingressroute/audit-viewer", "ingressroute/audit-viewer-tls", "--ignore-not-found"))
         warn("サインインの設定（Google の OAuth クライアントか LAB_AUDIT_OIDC_*）が無いので、検索アプリは入れません")
     ok("監査ログの段階が終わりました")
+
+
+def zabbix(env: Env) -> None:
+    """Zabbix による監視（VM の環境だけ。変更設計書 2026-10-31 7 章）。Mac と EKS では何もしない。"""
+    step("zabbix 監視（Zabbix）")
+    if not env.is_vm:
+        ok("Zabbix は VM の環境（aws-ec2 / gcp-vm）だけです")
+        return
+    from . import zabbix as zbx
+    zbx.setup(env)
 
 
 def migrate_db(image: dict, db_id: str | None = None) -> None:
