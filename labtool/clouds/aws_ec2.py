@@ -21,8 +21,8 @@ from .. import objectstore as objstore
 from .. import render
 from ..core import Env, LabError, info, ok, warn
 from . import (
-    AWS_DNS_IPS, AWS_META_IPS, KEY_ROLES, LEGACY_KEY_USERS, NODE_COUNT, PROXY_PORT, ZABBIX_SERVER_PORT, Infra, Node, network_plan,
-    s3_user_policies,
+    AWS_DNS_IPS, AWS_META_IPS, KEY_ROLES, LEGACY_KEY_USERS, NODE_COUNT, PROXY_PORT, WORKER_INDEX_BASE, ZABBIX_SERVER_PORT, Infra, Node,
+    network_plan, s3_user_policies, worker_plan,
 )
 
 TAG_KEY = "lab:prefix"
@@ -448,7 +448,8 @@ def _to_node(inst: dict, index: int | None = None) -> Node:
     tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
     return Node(id=inst["InstanceId"], index=index if index is not None else int(tags.get("lab:node-index", "0")),
                 private_ip=inst.get("PrivateIpAddress", ""), public_ip=inst.get("PublicIpAddress", ""),
-                zone=inst.get("Placement", {}).get("AvailabilityZone", ""))
+                zone=inst.get("Placement", {}).get("AvailabilityZone", ""),
+                role="worker" if tags.get("lab:role") == "worker" else "server")
 
 
 def ensure_nodes(env: Env, net: dict, pubkey: str) -> list[Node]:
@@ -485,6 +486,55 @@ def ensure_nodes(env: Env, net: dict, pubkey: str) -> list[Node]:
     return nodes
 
 
+def ensure_workers(env: Env, net: dict, pubkey: str, count: int) -> list[Node]:
+    """足す台 1〜count（<接頭辞>-worker<番号>、今の 3 台と同じ種類と AMI、サブネットは 3 つを順に、そのサブネットの .30+番号）。
+    無い番号だけ作る。count より大きい番号の台は消さない（vm.remove_leaving_workers が外した後に remove_workers で消す）。"""
+    if count <= 0:
+        return []
+    ec2 = _ec2(env)
+    keypair = _ensure_keypair(env, pubkey)
+    existing = {_to_node(i).index for i in _instances(env, role="worker")}
+    ami = resolve_ami(env, _instances(env))
+    for w in worker_plan(env.vm_cidr, True, count):
+        if w["index"] in existing:
+            continue
+        name = f"{env.vm_prefix}-worker{w['number']}"
+        res = ec2.run_instances(
+            ImageId=ami, InstanceType=env.ec2_instance_type, MinCount=1, MaxCount=1, KeyName=keypair,
+            NetworkInterfaces=[{
+                "DeviceIndex": 0, "SubnetId": net["subnet_ids"][w["subnet_index"]], "Groups": [net["security_group_id"]],
+                "AssociatePublicIpAddress": True, "PrivateIpAddress": w["private_ip"],
+            }],
+            BlockDeviceMappings=[{"DeviceName": "/dev/sda1", "Ebs": {
+                "VolumeType": "gp3", "VolumeSize": env.vm_disk_gib, "Encrypted": True, "DeleteOnTermination": True}}],
+            MetadataOptions={"HttpTokens": "required", "HttpPutResponseHopLimit": 2},
+            TagSpecifications=_tag_spec(env, "instance", name, **{"lab:node-index": str(w["index"]), "lab:role": "worker"}),
+        )
+        info(f"EC2 {res['Instances'][0]['InstanceId']}（{name}、足す台、{w['private_ip']}）を起こしました")
+    workers = [n for n in list_workers(env) if n.index <= WORKER_INDEX_BASE + count]
+    if workers:
+        ec2.get_waiter("instance_running").wait(InstanceIds=[n.id for n in workers], WaiterConfig={"Delay": 5, "MaxAttempts": 60})
+        workers = [n for n in list_workers(env) if n.index <= WORKER_INDEX_BASE + count]
+    return workers
+
+
+def list_workers(env: Env) -> list[Node]:
+    """作った足す台すべて（タグ lab:role=worker。番号の順）。"""
+    return sorted((_to_node(i) for i in _instances(env, role="worker")), key=lambda n: n.index)
+
+
+def remove_workers(env: Env, nodes: list[Node]) -> None:
+    """足す台を内部 NLB のターゲットグループから外し、VM を消す。"""
+    if not nodes:
+        return
+    elb = _elbv2(env)
+    names = _names(env)
+    for tg in elb.describe_target_groups()["TargetGroups"]:
+        if tg["TargetGroupName"] in (names["tg_https"], names["tg_http"]):
+            elb.deregister_targets(TargetGroupArn=tg["TargetGroupArn"], Targets=[{"Id": n.id, "Port": tg["Port"]} for n in nodes])
+    _terminate(env, [n.id for n in nodes])
+
+
 def ensure_proxy_node(env: Env, net: dict, pubkey: str) -> Node:
     """中継（出口プロキシ）の VM 1 台（amd64、1 番のサブネットの .20、公開 IP あり）。検証では踏み台と Zabbix サーバーも兼ねるので、
     LAB_ZABBIX_VM=true なら t3.medium（4 GiB）とディスク 20 GiB。"""
@@ -506,15 +556,19 @@ def ensure_proxy_node(env: Env, net: dict, pubkey: str) -> Node:
     return _to_node(_instances(env, role="proxy")[0], index=0)
 
 
-def describe_nodes(env: Env, ids: list[str]) -> list[Node]:
-    """.env の識別子（インスタンス ID）から Node を組む。順番が台の番号。"""
+def describe_nodes(env: Env, ids: list[str], base: int = 0) -> list[Node]:
+    """.env の識別子（インスタンス ID）から Node を組む。順番が台の番号（base ＋ 1 から。足す台は base=100 で role=worker）。"""
+    if not ids:
+        return []
     res = _ec2(env).describe_instances(InstanceIds=ids)
     found = {i["InstanceId"]: i for r in res["Reservations"] for i in r["Instances"]}
     nodes = []
-    for i, node_id in enumerate(ids, start=1):
+    for i, node_id in enumerate(ids, start=base + 1):
         if node_id not in found:
-            raise LabError(f"EC2 {node_id}（LAB_VM_NODES）がありません")
-        nodes.append(_to_node(found[node_id], index=i))
+            raise LabError(f"EC2 {node_id}（{'LAB_VM_WORKER_NODES' if base else 'LAB_VM_NODES'}）がありません")
+        node = _to_node(found[node_id], index=i)
+        node.role = "worker" if base >= WORKER_INDEX_BASE else "server"
+        nodes.append(node)
     return nodes
 
 
@@ -553,9 +607,10 @@ def provision(env: Env, pubkey: str, operator_cidr: str) -> dict:
     bucket = ensure_bucket(env)
     keys = ensure_static_keys(env, bucket)
     nodes = ensure_nodes(env, net, pubkey)
-    entry_ip, entry_ip_id = ensure_load_balancer(env, net, nodes)
+    workers = ensure_workers(env, net, pubkey, env.vm_workers)
+    entry_ip, entry_ip_id = ensure_load_balancer(env, net, nodes + workers)
     proxy = ensure_proxy_node(env, net, pubkey) if env.egress_proxy_vm else None
-    return {"nodes": [n.id for n in nodes], "bucket": bucket, "entry_ip": entry_ip, "entry_ip_id": entry_ip_id,
+    return {"nodes": [n.id for n in nodes], "workers": [n.id for n in workers], "bucket": bucket, "entry_ip": entry_ip, "entry_ip_id": entry_ip_id,
             "keys": keys, "proxy": proxy, "proxy_url": f"http://{net['plan']['proxy_ip']}:{PROXY_PORT}" if proxy else "",
             "bastion_host": proxy.public_ip if proxy else "", "bastion_cidr": f"{proxy.private_ip}/32" if proxy else "",
             "zabbix_server": f"{proxy.private_ip}:{ZABBIX_SERVER_PORT}" if proxy and env.zabbix_vm else ""}
@@ -612,7 +667,8 @@ def destroy(env: Env) -> None:
             iam.delete_user(UserName=name)
             info(f"IAM ユーザー {name} を消しました")
     _delete_load_balancer(env, None)
-    _terminate(env, [i["InstanceId"] for i in _instances(env)] + [i["InstanceId"] for i in _instances(env, role="proxy")])
+    _terminate(env, [i["InstanceId"] for i in _instances(env)] + [i["InstanceId"] for i in _instances(env, role="worker")]
+               + [i["InstanceId"] for i in _instances(env, role="proxy")])
     role = names["role"]
     with contextlib.suppress(iam.exceptions.NoSuchEntityException):
         with contextlib.suppress(iam.exceptions.NoSuchEntityException):
@@ -661,7 +717,7 @@ def destroy_provided(env: Env, infra: Infra) -> None:
     _delete_bucket(env, infra.bucket)
     if infra.entry_ip_id:
         _delete_load_balancer(env, infra.entry_ip_id)
-    _terminate(env, [n.id for n in infra.nodes])
+    _terminate(env, [n.id for n in infra.all_nodes()])
 
 
 def _retry(fn, what: str, attempts: int = 12, delay: int = 10) -> None:

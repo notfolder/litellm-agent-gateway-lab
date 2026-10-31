@@ -112,6 +112,7 @@ ChatGPT:         {yn(env.has_chatgpt())}  → Codex 用のモデルと二次判�
             health = clouds.for_env(env).lb_targets_healthy(env, infra) if infra.entry_ip_id else {}
             print(f"基盤:            LAB_INFRA={env.infra_mode}（バケット {infra.bucket}）\n"
                   f"VM:              {', '.join(f'{n.id}({n.public_ip})' for n in infra.nodes)}\n"
+                  f"足す台:          {', '.join(f'{n.id}({n.private_ip})' for n in infra.workers) or '無し'}\n"
                   f"入口（内部 LB）: {infra.entry_ip}（健全 {sum(health.values())}/{len(health)} 台: "
                   f"{', '.join(k for k, v in health.items() if v) or '無し'}）\n"
                   f"踏み台:          {infra.bastion_host or '無し'}（{infra.bastion_cidr or '-'}）。管理系の経路（/ui、検索アプリ）はここからだけ\n"
@@ -162,23 +163,22 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
     infra = vm.load_infra(env)
     vm.ensure_forward(env, infra)
     versions = vm.node_versions()
-    if len(versions) != clouds.NODE_COUNT:
-        raise LabError(f"ノードが {len(versions)} 台です（{clouds.NODE_COUNT} 台そろってから上げてください）")
+    expected = clouds.NODE_COUNT + len(infra.workers)
+    if len(versions) != expected:
+        raise LabError(f"ノードが {len(versions)} 台です（今の 3 台と足す台 {len(infra.workers)} 台の {expected} 台がそろってから上げてください）")
     oldest = min(versions.values(), key=vm.parse_k3s_version)
     vm.check_upgrade_step(oldest, target)
     if all(v == target for v in versions.values()):
         vm.set_version(env, target)
-        ok(f"3 台とも {target} です")
+        ok(f"{expected} 台とも {target} です")
         return {"version": target, "upgraded": []}
-    traefik = vm.traefik_nodes()
-    holder = next((n.id for n in infra.nodes if vm.k8s_name_for_node(n) in traefik), None)
-    order = vm.upgrade_order(infra.node_ids(), holder, vm.forward_target())
+    order = vm.upgrade_order(infra.node_ids(), [n.id for n in sorted(infra.workers, key=lambda n: n.index)], vm.forward_target())
     failover.wait_healthy(env)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     vm.etcd_snapshot(env, infra.node(order[-1]), f"lab-pre-upgrade-{stamp}")
     todo = [i for i in order if versions.get(vm.k8s_name_for_node(infra.node(i))) != target]
     eta = datetime.now() + timedelta(minutes=8 * len(todo))
-    info(f"{len(todo)} 台を {' → '.join(todo)} の順に上げます（Traefik の台 {holder} は最後）。"
+    info(f"{len(todo)} 台を {' → '.join(todo)} の順に上げます（今の 3 台が先、足す台が後）。"
          f"終了見込み {eta:%H:%M} ごろ（1 台 5〜8 分）")
 
     restarts_before = failover.litellm_restarts()
@@ -200,7 +200,7 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
             vm.uncordon_node(name)
             failover.wait_healthy(env)
             succeeds(["kubectl", "--context", vm.kube_context(env), "-n", "kube-system", "rollout", "status",
-                      "deploy/traefik", "--timeout=300s"], timeout=320)
+                      "ds/traefik", "--timeout=300s"], timeout=320)
             upgraded.append(name)
             ok(f"{name} を {target} にしました")
         if load is not None:

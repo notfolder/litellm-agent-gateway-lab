@@ -17,7 +17,9 @@ from types import ModuleType
 from .. import render
 from ..core import Env, LabError
 
-NODE_COUNT = 3
+NODE_COUNT = 3          # 今の 3 台（k3s の server。etcd を持つ）。足す台（k3s の agent）は別に数える
+WORKER_INDEX_BASE = 100  # 足す台の Node.index は 100 ＋ 番号（server の 1〜3、中継の 0 と重ならない）
+WORKER_HOST_OFFSET = 30  # 足す台 i の内部 IP はサブネットの .30+i
 # クラスタの中のイメージ置き場（registry。保存先はバケットの images/）。ノードは自分の NodePort 経由で引く（vm/node-init.sh）
 REGISTRY_HOST = "lab-registry:5000"
 REGISTRY_NODEPORT = 30500
@@ -56,6 +58,8 @@ FUNCTIONS = [
     "health_check_ranges", "meta_ips", "dns_ips", "stop_node", "start_node", "check_bucket", "snapshot", "empty_bucket",
     # provision（managed だけ）
     "provision", "destroy", "allow_ssh_from", "allow_proxy_from", "recreate_node",
+    # 足す台（managed だけ。変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 2 章）
+    "ensure_workers", "list_workers", "remove_workers",
     # provided の全削除
     "destroy_provided",
 ]
@@ -63,12 +67,14 @@ FUNCTIONS = [
 
 @dataclass
 class Node:
-    """VM 1 台。id は AWS がインスタンス ID、GCP が <ゾーン>/<名前>。index は台の番号（1〜3。中継は 0）。"""
+    """VM 1 台。id は AWS がインスタンス ID、GCP が <ゾーン>/<名前>。index は台の番号（1〜3。中継は 0、足す台は 100 ＋ 番号）。
+    role は server（今の 3 台）か worker（足す台）。"""
     id: str
     index: int
     private_ip: str
     public_ip: str
     zone: str
+    role: str = "server"
 
 
 @dataclass
@@ -77,6 +83,7 @@ class Infra:
     entry_ip は内部ロードバランサの固定の内部 IP、entry_ip_id はその識別子（AWS: NLB の ARN、GCP: 転送ルールの名前）。
     bastion_host は踏み台の SSH の宛先、bastion_cidr は踏み台の内部 IP（管理系の経路と 22 の許可）。"""
     nodes: list[Node] = field(default_factory=list)
+    workers: list[Node] = field(default_factory=list)
     entry_ip: str = ""
     entry_ip_id: str = ""
     bucket: str = ""
@@ -86,8 +93,12 @@ class Infra:
     bastion_cidr: str = ""
     extra: dict = field(default_factory=dict)
 
+    def all_nodes(self) -> list[Node]:
+        """今の 3 台と足す台（台の番号の順）。"""
+        return sorted([*self.nodes, *self.workers], key=lambda n: n.index)
+
     def node(self, node_id: str) -> Node:
-        for n in self.nodes:
+        for n in self.all_nodes():
             if n.id == node_id:
                 return n
         raise LabError(f"ノード {node_id} が基盤にありません")
@@ -128,6 +139,22 @@ def network_plan(cidr: str, subnets_per_node: bool) -> dict:
     proxy_ip = str(list(blocks[0].hosts())[PROXY_HOST_INDEX])
     lb_ips = [str(list(ipaddress.ip_network(s).hosts())[LB_HOST_INDEX]) for s in subnets]
     return {"vpc": str(net), "subnets": subnets, "nodes": nodes, "proxy_ip": proxy_ip, "lb_ips": lb_ips}
+
+
+def worker_plan(cidr: str, subnets_per_node: bool, count: int) -> list[dict]:
+    """足す台 1〜count の固定の内部 IP。GCP（subnets_per_node=False）はリージョンのサブネットの .30+i、AWS は 3 つのサブネットを
+    順に使い、そのサブネットの .30+i（番号が違えば IP も違う）。"""
+    blocks = list(ipaddress.ip_network(cidr).subnets(new_prefix=24))
+    out = []
+    for i in range(1, count + 1):
+        sn = blocks[(i - 1) % NODE_COUNT] if subnets_per_node else blocks[0]
+        hosts = list(sn.hosts())
+        if WORKER_HOST_OFFSET + i - 1 >= len(hosts) - 1:
+            raise LabError(f"足す台が多すぎます（{count} 台。サブネット {sn} に入りきらない）")
+        out.append({"number": i, "index": WORKER_INDEX_BASE + i, "subnet": str(sn),
+                    "subnet_index": (i - 1) % NODE_COUNT if subnets_per_node else 0,
+                    "private_ip": str(hosts[WORKER_HOST_OFFSET + i - 1])})
+    return out
 
 
 def static_key_policies(env: Env) -> dict[str, dict]:

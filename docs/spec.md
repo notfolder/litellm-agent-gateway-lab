@@ -955,7 +955,7 @@ env_http_headers = { "x-litellm-api-key" = "LITELLM_MCP_AUTH" }  # 値は "Beare
 
 Mac の検証環境（8 章）と同じ中身を、マネージドサービスを使わずクラウドの部品を計算資源とオブジェクトストレージに限って動かす環境。構成図は [vm_architecture.md](vm_architecture.md)。
 経緯は `.history/2026-10-25-EC2三台構成/`、`.history/2026-10-30-VM環境の共通化とGCP追加/`、`.history/2026-10-30-既存資源からの構築と出口プロキシ/`、
-`.history/2026-10-31-内部LBとVM側の防御とZabbix/`。
+`.history/2026-10-31-内部LBとVM側の防御とZabbix/`、`.history/2026-10-31-台の増減とLiteLLMのメモリ/`。
 
 ### 12.1 要件
 
@@ -963,11 +963,14 @@ Mac の検証環境（8 章）と同じ中身を、マネージドサービス�
 |---|---|
 | クラウドの部品 | 計算資源（VM 3 台）とオブジェクトストレージ（バケット 1 つ）以外を使わない。付随する物（ネットワーク、内部ロードバランサ、役割ごとの静的キー）は使う。VM にクラウドの権限は付けない（VM はクラウドの API を呼ばない）。パラメータストア、Secret Manager、Session Manager、IAP、Bedrock、Vertex AI は使わない |
 | クラウド | AWS（EC2 と S3、東京）と GCP（Compute Engine と Cloud Storage、東京）。クラウドごとに違ってよいのは「計算資源とネットワークを作るところ」だけで、VM の中と Kubernetes の中は 1 つのコード |
-| 可用性 | 1 台が落ちても処理が続く（k3s の server 3 台、PostgreSQL 3 台、Valkey と Sentinel 3 台）。入口は内部ロードバランサ（L4、TCP の素通し。AWS は内部 NLB、GCP は内部パススルー ネットワーク ロードバランサ）の固定の内部 IP。ヘルスチェック（TCP 80）で落ちた台を外す。利用者は VPC の内側からこの IP（ホスト名）を呼ぶ |
+| 可用性 | 1 台が落ちても処理が続く（k3s の server 3 台、PostgreSQL 3 台、Valkey と Sentinel 3 台）。足す台は何台落ちても処理が続く（受けられる量が減るだけ）。入口は内部ロードバランサ（L4、TCP の素通し。AWS は内部 NLB、GCP は内部パススルー ネットワーク ロードバランサ）の固定の内部 IP。ヘルスチェック（TCP 80）で落ちた台を外す。利用者は VPC の内側からこの IP（ホスト名）を呼ぶ |
+| 台の増減 | 台は 2 種類。今の 3 台（k3s の server。etcd、PostgreSQL、Valkey を持つ）は数を変えない。足す台（k3s の agent。LiteLLM と入口の Traefik だけを動かし、DB は持たない）は 0 台から何台でも。人が `.env` を直して `./lab up` を流す（managed は `LAB_VM_WORKERS` の台数、provided は担当部署が作ってロードバランサに登録した VM の識別子を `LAB_VM_WORKER_NODES` に）。減らすときは入口から外し、Pod を他の台へ逃がし、クラスタから外し、k3s・nftables・Zabbix agent を外す（managed は VM の削除まで、provided は担当部署への依頼を表示）。足す・減らすは利用者の要求を止めない。加える前に台の CPU とメモリを読み、LiteLLM を 1 つも置けない台は加えずに止める。Pod を逃がす処理が 10 分で終わらなければ止めて台を残す。負荷に応じて VM を自動では増やさない |
+| 入口と LiteLLM の数 | 入口の Traefik は全台に 1 つずつ。LiteLLM の自動増減の下限は 2、最大数は `./lab up` のたびに台ごとに数え直す（割り当て可能な量から LiteLLM 以外の Pod の予約を引いた空きについて「CPU の空き ÷ CPU の予約」と「メモリの空き ÷ メモリの上限」の小さい方を出し、全台を足す）。1 台分の余裕は空けず、LiteLLM の優先度をほかの Pod より低くして、置き場所が足りないときはほかの Pod が LiteLLM を退かせる。OS と k3s 本体の分は置き場所から除く（今の 3 台 CPU 0.5 個・メモリ 2 GiB、足す台 CPU 0.25 個・メモリ 1 GiB） |
+| LiteLLM のメモリ | 予約と上限を `.env`（`LAB_LITELLM_MEMORY_REQUEST` / `LAB_LITELLM_MEMORY_LIMIT`、既定 512 MiB / 1 GiB）で変えられる。運用中に変えて `./lab up` を流すと 1 つずつ入れ替え、最大数を数え直す（メモリを増やせば最大数は減る）。最低の 2 つを置けない値なら変えずに止める。公式の本番向けの手引きは 1 つ 4 GiB で、本番では 1 つ 6〜8 GB まで増える（ユーザーの実測）ので、本番の VM は CPU 4 個・メモリ 32 GB で頼む |
 | 基盤の持ち方 | `LAB_INFRA=managed`（構築ツールが作る。検証）と `provided`（既存の VM 3 台、バケット 1 つ、ロードバランサ、踏み台を使う。本番）。provided では構築ツールはネットワーク・ロードバランサ・権限・バケットの設定を変えない。既存の物は `.env` に識別子と静的キーを書いて伝える |
-| 守り | クラウドのファイアウォールに頼らない。各 VM の nftables（入りは踏み台・VPC・ヘルスチェックの送信元・3 台の内部通信だけ、出は中継と内側だけ）、Traefik の経路ごとの送信元制限（管理画面 `/ui` `/login` `/sso` `/metrics` と検索アプリ `/lab-audit` は踏み台からだけ）、Kubernetes の NetworkPolicy（PostgreSQL・Pooler・Valkey は必要な Pod だけ）の 3 層。管理者の DB 接続は踏み台から SSH で入り `kubectl port-forward` |
+| 守り | クラウドのファイアウォールに頼らない。各 VM の nftables（入りは踏み台・VPC・ヘルスチェックの送信元・全台の間の内部通信だけ、出は中継と内側だけ）、Traefik の経路ごとの送信元制限（管理画面 `/ui` `/login` `/sso` `/metrics` と検索アプリ `/lab-audit` は踏み台からだけ）、Kubernetes の NetworkPolicy（PostgreSQL・Pooler・Valkey は必要な Pod だけ）の 3 層。管理者の DB 接続は踏み台から SSH で入り `kubectl port-forward` |
 | 操作者の経路 | SSH は各台の固定の公開 IP。HTTPS は踏み台に SSH し、ロードバランサの 443 へポート転送（Mac 用の別名 `LAB_LOCAL_HOSTNAME` を A レコード 127.0.0.1 と証明書の SAN に入れる）。試験とクライアントの設定はこの転送口を使う。`./lab forward` で転送だけ張る |
-| 監視 | Zabbix。agent 2 を全 VM に（能動、自動登録）、公式 Helm チャート（zabbix-proxy、kube-state-metrics）を k3s に入れ、`./lab zabbix` が API で登録する。見張るもの: VM の CPU・メモリ・ディスク・agent の途絶、ノードの台数（Ready が 3 未満で重大）と逼迫、要求の比、予定の Pod 数（Deployment・StatefulSet の食い違い、Pending、自動増減の上限）、コンテナのメモリと CPU の上限比と OOM、制御部分、PostgreSQL（台数、WAL の保管、26 時間のバックアップ）、入口、証明書の期限（14 日）、監査ログの整形（2 時間）。ダッシュボード「litellm-lab」。検証では Zabbix サーバーも `./lab` が踏み台の VM に立て、通知は送らない。本番は既存サーバーの宛先と API トークンを `.env` に書き、通知はそのサーバーの設定に任せる |
+| 監視 | Zabbix。agent 2 を全 VM に（能動、自動登録）、公式 Helm チャート（zabbix-proxy、kube-state-metrics）を k3s に入れ、`./lab zabbix` が API で登録する。見張るもの: VM の CPU・メモリ・ディスク・agent の途絶、ノードの台数（Ready が決めた台数（3 ＋ 足す台）より少なければ重大）と逼迫、要求の比、予定の Pod 数（Deployment・StatefulSet の食い違い、Pending、自動増減の上限）、コンテナのメモリと CPU の上限比と OOM、制御部分、PostgreSQL（台数、WAL の保管、26 時間のバックアップ）、入口、証明書の期限（14 日）、監査ログの整形（2 時間）。ダッシュボード「litellm-lab」。検証では Zabbix サーバーも `./lab` が踏み台の VM に立て、通知は送らない。本番は既存サーバーの宛先と API トークンを `.env` に書き、通知はそのサーバーの設定に任せる |
 | VM の初期化 | 構築ツールが SSH で初期化する（起動時のユーザーデータは使わない。既存の VM で使えないため）。k3s のトークンと版は SSH で渡し、VM にバケットの権限を求めない |
 | オブジェクトストレージ | バケットは 1 つ。論理名（原本、閲覧記録、整形済み、DB のバックアップ、イメージ置き場、k3s のトークンと版）はディレクトリ。原本と閲覧記録は書くときにオブジェクト単位の保持（どちらも 90 日）を付ける。バケット全体の既定の保持は使わない。権限は 5.3 の意味を保つ（書き込み用は原本を読めず消せない、検索アプリは原本に書けない、誰も原本と閲覧記録の版を消せず保持を回避できない）。一覧はバケット全体に許す |
 | 自作イメージ | k3s の台の Docker でビルドし、クラスタの中の置き場（registry）に push する。アーキテクチャは VM のもの（arm64 でも amd64 でも同じ手順）。Mac の Docker は使わない |
@@ -980,9 +983,9 @@ Mac の検証環境（8 章）と同じ中身を、マネージドサービス�
 
 | 項目 | 内容 |
 |---|---|
-| VM | Ubuntu 24.04（arm64 / amd64）、3 台、固定の内部 IP、公開 IP（操作者の SSH 用）、ディスク 40 GiB 以上。SSH の鍵と `sudo` できる利用者。**クラウドの権限は不要**。AWS は別 AZ でよい |
+| VM | Ubuntu 24.04（arm64 / amd64）、3 台、固定の内部 IP、ディスク 40 GiB 以上、CPU 4 個・メモリ 32 GB。SSH の鍵と `sudo` できる利用者。**クラウドの権限は不要**。AWS は別 AZ でよい。足す台も同じ条件（CPU とメモリは違ってよい。加えるときに構築ツールが読んで判定する） |
 | ネットワーク | クラウドのファイアウォールは無くてもよい（守りは VM の nftables）。あるなら 22（踏み台と操作者）、80/443（VPC の中とヘルスチェックの送信元）、3 台の間、10050/10051（Zabbix）を通す。外向きは中継（Zscaler）経由。`LAB_VM_CIDR` に VPC の実際の CIDR を書く |
-| 内部ロードバランサ | L4（TCP）、80 と 443、固定の内部 IP、3 台をターゲット、ヘルスチェックは TCP 80（AWS 10 秒 × 2、GCP 5 秒 × 2）、送信元 IP の保持（既定）。識別子（AWS: NLB の ARN、GCP: 転送ルールの名前）を `LAB_VM_ENTRY_IP_ID` に |
+| 内部ロードバランサ | L4（TCP）、80 と 443、固定の内部 IP、全台（3 台と足す台）をターゲット、ヘルスチェックは TCP 80（AWS 10 秒 × 2、GCP 5 秒 × 2）、送信元 IP の保持（既定）。識別子（AWS: NLB の ARN、GCP: 転送ルールの名前）を `LAB_VM_ENTRY_IP_ID` に |
 | 踏み台 | 操作者が SSH できるホスト 1 台（`LAB_VM_BASTION_HOST`）と、その内部 IP（`LAB_VM_BASTION_CIDR`）。管理系の経路と VM の 22 はここからだけ |
 | DNS | Cloudflare の API トークン（ホスト名 → ロードバランサの内部 IP、別名 → 127.0.0.1 の A レコード） |
 | Zabbix（任意） | サーバーの宛先（`LAB_ZABBIX_SERVER`、10051）、API の URL とトークン（`LAB_ZABBIX_API_URL` / `LAB_ZABBIX_API_TOKEN`。ホスト・プロキシ・アクションの作成と更新の権限） |
@@ -995,14 +998,15 @@ Mac の検証環境（8 章）と同じ中身を、マネージドサービス�
 | 項目 | 確かめ方 |
 |---|---|
 | 構築 | `./lab up` が managed（作って組み立てる）と provided（既存の物の上に組み立てる）の両方で通り、2 回目で何も変わらない（`test-idempotency`） |
-| 疎通・監査・障害 | `test-smoke`、`test-audit`、`test-failover`（Mac の 5 場面 ＋ `entry-node`: Traefik の Pod が載る台を止め、ロードバランサが外して Traefik が移るまで 60 秒以内） |
+| 疎通・監査・障害 | `test-smoke`、`test-audit`、`test-failover`（Mac の 5 場面 ＋ `entry-node`: Traefik の Pod が載る台を止め、ロードバランサが外すまで ＋ `worker-node`: LiteLLM が載った足す台を止める。足す台があるときだけ。どちらもほかの台を止める場面と同じく 120 秒以内、GCP は 180 秒以内） |
+| 台の増減 | 要求を流しながら足す台を 1 台足す・減らす・LiteLLM のメモリの上限を変えるとき、失敗が 0 件。Traefik とロードバランサの健全な台が全台数、LiteLLM の最大数が数え直され、Zabbix の決めた台数が変わり、減らした台の Zabbix のホストが消える。置けない値では変えずに止まる。それぞれの後の 2 回目の `./lab up` で何も変わらない |
 | 守り | 台から別の台の 22 は拒否、10250 は通る。台からの直接の外向き HTTPS はタイムアウトし中継経由は通る（Pod からも）。管理系の経路は踏み台からだけ通り（台からロードバランサ経由は 403）、利用者の API はどこからも通る。ラベルの無い Pod から Pooler・PostgreSQL・Valkey へ届かず、LiteLLM からは届く |
 | 操作者の経路 | Mac から `https://<LAB_LOCAL_HOSTNAME>:18443/health/liveliness` が 200。証明書の SAN に 2 名 |
 | 監視 | Zabbix の web が踏み台経由で開き、VM（3 台と踏み台）、Kubernetes、入口のホストに最新値が入る |
 | 保持 | 原本と閲覧記録が、書き込み用・検索アプリ・管理者（保持の回避なし）のどの資格情報でも消せない |
 | 出口プロキシ | 3 台の直接の外向き通信を遮断した状態で全段階と全試験が通る。中継の記録に Anthropic・Let's Encrypt・Cloudflare・バケット・イメージの取得が現れる。`./lab` 自身も中継経由で通る |
 | VM 上のビルド | Mac の Docker 無しで `./lab images` が通る |
-| 版上げ | `./lab upgrade-k8s --measure` で 1 台ずつ上がり、Traefik の台が最後になる。上げている間の要求の失敗の数と幅を記録する |
+| 版上げ | `./lab upgrade-k8s --measure` で 1 台ずつ上がる（今の 3 台が先、足す台が後）。上げている間の要求の失敗の数と幅を記録する |
 | 全削除 | `./lab down`（managed）/ `down --all`（provided）の後に有料の物（ロードバランサの部品を含む）が残らない |
 
 結果は `docs/design.md` 21.10 節。

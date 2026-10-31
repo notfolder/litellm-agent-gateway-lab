@@ -81,15 +81,18 @@ flowchart TB
             subgraph NODES["VM × 3（Ubuntu 24.04、k3s server × 3、組み込み etcd、nftables、Zabbix agent 2）"]
                 DK["Docker（自作イメージのビルド）"]
                 subgraph K3S["k3s（PVC は local-path）"]
-                    TR["Traefik × 2（hostPort 80/443）<br/>80 → 443、admin-only（踏み台だけ）"]
+                    TR["Traefik × 全台に 1 つ（hostPort 80/443）<br/>80 → 443、admin-only（踏み台だけ）"]
                     CM["cert-manager × 2<br/>Let's Encrypt DNS-01（確認はクラウドの DNS）"]
                     REG["registry × 2（保存先は images/）<br/>NodePort 30500、各台が自分の IP から引く"]
-                    LL["LiteLLM × 2〜4"]
+                    LL["LiteLLM × 2〜最大数（台ごとの空きから数える）<br/>優先度は低め（足りなければ退く）"]
                     PG[("PostgreSQL × 3 ＋ Pooler × 2<br/>オペレーター × 2")]
                     VK[("Valkey × 3 ＋ Sentinel × 3")]
                     AV["検索アプリ × 2、整形の CronJob<br/>google_workspace_mcp"]
                     ZP["zabbix-proxy ＋ kube-state-metrics（monitoring）"]
                 end
+            end
+            subgraph WORKERS["足す台 × 0〜（Ubuntu 24.04、k3s agent、nftables、Zabbix agent 2。DB は持たない）"]
+                WK["Traefik × 1、LiteLLM（置ける数まで）"]
             end
         end
         S3[("バケット × 1<br/>audit-raw/（保持 90 日）audit-access/（保持 90 日）<br/>audit-derived/ pg-backup/ images/ cluster/")]
@@ -97,21 +100,25 @@ flowchart TB
     end
     CLI -->|"SSH の転送（踏み台経由）"| PX -->|"443"| LB
     USERS["利用者（VPC の内側）"] -->|"https://ホスト名"| LB --> TR
+    LB --> WK
+    WK --> PG & VK
     TR --> LL & AV
     LL --> PG & VK
     LL & PG & AV & REG & CM -->|"中継経由（CA を信頼）"| PX
     PX --> S3 & ANT & CF
-    NODES -->|"agent 2（能動）"| PX
+    NODES & WORKERS -->|"agent 2（能動）"| PX
     ZP -->|"10051"| PX
     KEYS -.->|".env → Secret"| K3S
     LAB -->|"provision（managed だけ）"| CLOUD
     LAB -->|"ssh: 初期化・docker build・6443 の転送"| NODES
+    LAB -->|"ssh: 初期化（agent）、外すときの片付け"| WORKERS
     LAB -->|"ssh: 443 と Zabbix の web の転送、中継（LAB_EGRESS_PROXY_MAC）"| PX
 ```
 
-- 1 台が落ちても処理が続く（etcd、PostgreSQL、Sentinel はいずれも 3 台の多数決）。Traefik の載った台が落ちると、ロードバランサがヘルスチェック（5〜10 秒 × 2 回）で外し、Traefik が別の台に移る（障害の試験 `--scenario entry-node`）。IP の付け替えは無い（VM はクラウドの API を呼ばない）
+- 1 台が落ちても処理が続く（etcd、PostgreSQL、Sentinel はいずれも 3 台の多数決）。Traefik は全台に 1 つずつで、台が落ちるとロードバランサがヘルスチェック（5〜10 秒 × 2 回）で外す（障害の試験 `--scenario entry-node`、足す台は `worker-node`）。IP の付け替えは無い（VM はクラウドの API を呼ばない）
+- 足す台（k3s の agent）は `.env` で増減して `./lab up`。LiteLLM と入口だけを動かし、PostgreSQL と Valkey は今の 3 台だけに置くので、減らしても DB のデータは失わない。減らすときはヘルスチェックを先に落として新しい接続を止めてから、Pod を逃がしてクラスタから外す（経緯は `.history/2026-10-31-台の増減とLiteLLMのメモリ/`）
 - データは各台の PVC（local-path）に置き、PostgreSQL のバックアップと監査ログはバケットに出る
-- 守りは 3 層: 各 VM の nftables（入りは踏み台・VPC・ヘルスチェックの送信元・3 台の内部通信だけ。出は中継と内側だけ）、Traefik の送信元制限（管理系の経路は踏み台だけ）、NetworkPolicy（PostgreSQL・Pooler・Valkey は必要な Pod だけ）
+- 守りは 3 層: 各 VM の nftables（入りは踏み台・VPC・ヘルスチェックの送信元・全台の間の内部通信だけ。出は中継と内側だけ）、Traefik の送信元制限（管理系の経路は踏み台だけ）、NetworkPolicy（PostgreSQL・Pooler・Valkey は必要な Pod だけ）
 
 ## 3. 基盤の持ち方（`LAB_INFRA`）
 
@@ -176,7 +183,7 @@ Mac の RustFS は従来の 4 バケットとバケット既定の保持のま�
 
 ## 7. Kubernetes（k3s）の版上げ（`./lab upgrade-k8s <版>`）
 
-版はバケットの `cluster/k3s/version` に置き、`./lab up` では変えない。上げるときは 1 台ずつ、Traefik（入口）の Pod が載る台を最後にする。マイナー版は 1 つずつで、飛ばす・下げる指示は止める。
+版はバケットの `cluster/k3s/version` に置き、`./lab up` では変えない。上げるときは 1 台ずつ、今の 3 台が先で足す台が後。マイナー版は 1 つずつで、飛ばす・下げる指示は止める。
 途中で止まっても再実行で続きから進む。`--measure` で上げている間の要求の失敗数と幅を測る（経緯は `.history/2026-10-26-k3s版上げ/`）。
 
 ## 8. Mac の k3d との対応
@@ -185,7 +192,7 @@ Mac の RustFS は従来の 4 バケットとバケット既定の保持のま�
 |---|---|---|---|
 | Kubernetes | k3d（server 1 + agent 2） | k3s（server 3、組み込み etcd）。版上げは `./lab upgrade-k8s` | `k8s/k3d-config.yaml` / `vm/node-init.sh` |
 | 基盤 | OrbStack | managed: `labtool/clouds/*.provision`。provided: 用意する側 ＋ `.env` | `labtool/clouds/`、`labtool/vm.py` |
-| 入口 | Traefik × 1 | 内部ロードバランサ → Traefik × 2（hostPort）。管理系の経路は踏み台だけ | 遮断する経路の一覧は同じ。`render.admin_only_manifest` |
+| 入口 | Traefik × 1 | 内部ロードバランサ → Traefik × 全台に 1 つ（hostPort、DaemonSet）。管理系の経路は踏み台だけ | 遮断する経路の一覧は同じ。`render.admin_only_manifest` |
 | 守り | なし | nftables（VM）、NetworkPolicy（DB と Valkey） | `vm/node-init.sh`、`k8s/network-policies.yaml` |
 | TLS | なし（localhost） | cert-manager ＋ Let's Encrypt（DNS-01）、Cloudflare の A レコード 2 本（`./lab` が作る） | `render.vm_issuer_manifest`、`render.vm_certificate_manifest` |
 | PostgreSQL / Valkey | CloudNativePG × 3、Valkey × 3 | 同じ（バックアップ先は `pg-backup/`） | `k8s/` |
@@ -196,4 +203,4 @@ Mac の RustFS は従来の 4 バケットとバケット既定の保持のま�
 | 監視 | なし | Zabbix（agent 2、公式 Helm チャート、API での登録） | `labtool/zabbix.py` |
 | 審査官 / Claude のモデル | ChatGPT / Anthropic API（トークン転送） | Anthropic API キーの Haiku 4.5 / 同じ | `render.litellm_config()` |
 | 構築ツールの経路 | localhost | SSH の転送 3 本（6443 はノード経由、443 と Zabbix の web は踏み台経由。`litellm-lab-ec2` / `litellm-lab-gcp` のコンテキスト） | `labtool/vm.py` |
-| 障害の試験 | DB・Redis・LiteLLM の場面 | 同じ ＋ `entry-node`（Traefik の台） | `labtool/failover.py` |
+| 障害の試験 | DB・Redis・LiteLLM の場面 | 同じ ＋ `entry-node`（Traefik の台）＋ `worker-node`（足す台） | `labtool/failover.py` |

@@ -237,6 +237,7 @@ def _provision_vm(env: Env, pubkey: str) -> None:
     cloud.ensure_apis(env)
     result = cloud.provision(env, pubkey, vm.operator_cidr(env))
     env.set("LAB_VM_NODES", ",".join(result["nodes"]))
+    env.set("LAB_VM_WORKER_NODES", ",".join(result.get("workers", [])))
     env.set("LAB_VM_BUCKET", result["bucket"])
     env.set("LAB_VM_ENTRY_IP_ID", result["entry_ip_id"])
     for key in ("bastion_host", "bastion_cidr", "zabbix_server"):
@@ -256,7 +257,7 @@ def _provision_vm(env: Env, pubkey: str) -> None:
         for key in ("LAB_VM_PROXY_NODE", "LAB_EGRESS_PROXY", "LAB_EGRESS_PROXY_MAC", "LAB_EGRESS_CA_FILE",
                     "LAB_VM_BASTION_HOST", "LAB_VM_BASTION_CIDR", "LAB_ZABBIX_SERVER"):
             env.set(key, "")
-    ok(f"基盤を .env に書きました（VM {len(result['nodes'])} 台、バケット {result['bucket']}、入口（内部ロードバランサ）{result['entry_ip']}"
+    ok(f"基盤を .env に書きました（VM {len(result['nodes'])} 台 ＋ 足す台 {len(result.get('workers', []))} 台、バケット {result['bucket']}、入口（内部ロードバランサ）{result['entry_ip']}"
        + (f"、踏み台 {result['bastion_host']}" if result.get("bastion_host") else "") + "）")
 
 
@@ -270,11 +271,16 @@ def _cluster_vm(env: Env) -> None:
         _provision_vm(env, pubkey)
     infra = vm.load_infra(env)
     vm.ensure_access(env, forward=False)   # 初期化の前は k3s が無いので転送は張らない
+    # 減らした足す台を先に外す（外す台の IP は前回の nftables に残っているので、外し終わるまで Pod の通信は切れない。
+    # 変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 3.2 節）
+    vm.remove_leaving_workers(env, infra)
     vm.init_nodes(env, infra, pubkey)
     vm.ensure_forward(env, infra)
-    wait_until(300, "全ノードの Ready", kc("wait", "--for=condition=Ready", "nodes", "--all", "--timeout=5s"))
+    want = len(infra.all_nodes())
+    wait_until(600, f"全ノード（{want} 台）の Ready", lambda: _ready_nodes() >= want)
+    vm.label_entry_nodes(infra)
     kapply(files=[K8S / "traefik-config-vm.yaml"], namespaced=False)
-    wait_until(300, "Traefik の起動", kc("-n", "kube-system", "rollout", "status", "deploy/traefik", "--timeout=5s"))
+    vm.wait_traefik(infra)
     vm.ensure_https_forward(env, infra)   # 踏み台経由で入口（内部ロードバランサの 443）へ
     kapply(files=[K8S / "namespace.yaml"], namespaced=False)
     kapply(files=[K8S / "network-policies.yaml"])   # DB と Valkey への接続元を絞る（変更設計書 2026-10-31 5.2 節）
@@ -286,8 +292,15 @@ def _cluster_vm(env: Env) -> None:
     kapply(manifest=secret_manifest("cloudflare-api-token", {"api-token": env.get("LAB_CLOUDFLARE_API_TOKEN")},
                                     namespace="cert-manager"), namespaced=False)
     kapply(manifest=render.vm_issuer_manifest(env), namespaced=False)
-    ok(f"クラスタの準備ができました（{env.target} の k3s 3 台、{env.vm_region}、入口（内部ロードバランサ）{infra.entry_ip}、"
+    ok(f"クラスタの準備ができました（{env.target} の k3s 3 台 ＋ 足す台 {len(infra.workers)} 台、{env.vm_region}、入口（内部ロードバランサ）{infra.entry_ip}、"
        f"LAB_INFRA={env.infra_mode}）")
+
+
+def _ready_nodes() -> int:
+    """Ready のノードの数。"""
+    nodes = json_output(kc("get", "nodes", "-o", "json"), default={}) or {}
+    return sum(1 for n in nodes.get("items", [])
+               if any(c["type"] == "Ready" and c["status"] == "True" for c in n["status"].get("conditions", [])))
 
 
 def _egress_ca(env: Env) -> None:
@@ -606,7 +619,8 @@ def datastores(env: Env) -> None:
         return
     # 1 台の PostgreSQL（以前の構成）を消す。中身は引き継がない（変更仕様書 4 章）
     _delete_if_present("statefulset/postgres", "service/postgres", "pvc/data-postgres-0", "secret/postgres")
-    kapply(manifest=render.add_egress_text(render_template(K8S / "postgres-cnpg.yaml", render.pg_backup_values(env)), env))
+    pg_manifest = render.add_egress_text(render_template(K8S / "postgres-cnpg.yaml", render.pg_backup_values(env)), env)
+    kapply(manifest=render.pin_to_servers(pg_manifest) if env.is_vm else pg_manifest)
     wait_until(1200, "PostgreSQL（3 台）の準備", kn("wait", "cluster/litellm-pg", "--for=condition=Ready",
                                                   "--timeout=5s"))
     rollout("deploy/litellm-pg-pooler-rw", 180, "Pooler の起動")
@@ -615,8 +629,9 @@ def datastores(env: Env) -> None:
     _delete_if_present("deployment/redis", "service/redis", "secret/redis")
     scripts = {p.name: p.read_text() for p in sorted((K8S / "valkey").glob("*.sh"))}
     kapply(manifest=configmap_manifest("valkey-scripts", scripts))
-    kapply(manifest=render_template(K8S / "valkey.yaml", {"SCRIPTS_HASH": short_hash(json.dumps(scripts,
-                                                                                                sort_keys=True))}))
+    valkey_manifest = render_template(K8S / "valkey.yaml", {"SCRIPTS_HASH": short_hash(json.dumps(scripts, sort_keys=True))})
+    # VM の環境は今の 3 台だけに置く（足す台を減らしても失わない。変更仕様書 2026-10-31-台の増減とLiteLLMのメモリ N9）
+    kapply(manifest=render.pin_to_servers(valkey_manifest) if env.is_vm else valkey_manifest)
     rollout("statefulset/valkey", 300, "Valkey（3 台）の起動")
     rollout("statefulset/valkey-sentinel", 300, "Sentinel（3 台）の起動")
     wait_until(60, "Sentinel 3 台が同じ primary を指す", lambda: len(set(sentinel_masters(env))) == 1
@@ -693,7 +708,12 @@ def litellm(env: Env) -> None:
         info("プロキシ設定を更新しました")
     kapply(manifest=configmap_manifest("litellm-config", {"config.yaml": config_text}))
 
-    overrides = render.helm_overrides(env, image["repository"], image["tag"], short_hash(config_text), out)
+    max_replicas = None
+    if env.is_vm:
+        # 最大数は台ごとの空きから数え直す（変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 4.1 節）。足りなければここで止める
+        max_replicas = litellm_max_replicas(env)
+        kapply(manifest=render.litellm_priority_class_manifest(), namespaced=False)
+    overrides = render.helm_overrides(env, image["repository"], image["tag"], short_hash(config_text), out, max_replicas)
     overrides_file = BUILD_DIR / "litellm-overrides.json"
     write_if_changed(overrides_file, json.dumps(overrides, indent=2) + "\n")
     values_file = ROOT / "litellm" / "values.yaml"
@@ -715,6 +735,8 @@ def litellm(env: Env) -> None:
                  "-n", NS, "-f", str(values_file), "-f", str(overrides_file),
                  "--set-string", f"labValuesHash={values_hash}", "--wait", "--timeout", "15m"))
 
+    if env.is_vm:
+        _set_litellm_priority()
     rollout("deploy/litellm", 600, "LiteLLM の起動")
     if env.is_aws:
         _ingress_aws(env, out, viewer=bool(render.audit_oidc_client(env)[0]))
@@ -725,6 +747,57 @@ def litellm(env: Env) -> None:
     wait_until(120, f"入口からの応答（{env.base_url}/health/liveliness）",
                lambda: http_ok(f"{env.base_url}/health/liveliness"))
     ok(f"LiteLLM の準備ができました: {env.base_url}（管理画面 {env.base_url}/ui）")
+
+
+def litellm_max_replicas(env: Env) -> int:
+    """LiteLLM の自動増減の最大数（VM の環境）。Ready で cordon されていないノードごとに、割り当て可能な量から LiteLLM 以外の Pod の
+    予約を引いた空きを出し、render.litellm_slots で数えて足す。最低の 2 に届かなければ止める（Helm は流さない）。"""
+    nodes = (json_output(kc("get", "nodes", "-o", "json"), default={}) or {}).get("items", [])
+    pods = (json_output(kc("get", "pods", "-A", "-o", "json"), default={}) or {}).get("items", [])
+    used: dict[str, list[float]] = {}
+    for p in pods:
+        node = p["spec"].get("nodeName")
+        if not node or p["status"].get("phase") in ("Succeeded", "Failed"):
+            continue
+        if (p["metadata"].get("labels") or {}).get("app.kubernetes.io/name") == "litellm" and p["metadata"]["namespace"] == NS:
+            continue
+        u = used.setdefault(node, [0.0, 0.0])
+        for c in p["spec"].get("containers", []):
+            req = (c.get("resources") or {}).get("requests") or {}
+            u[0] += render.quantity(req.get("cpu", "0"))
+            u[1] += render.quantity(req.get("memory", "0"))
+    rows = []
+    for n in nodes:
+        ready = any(c["type"] == "Ready" and c["status"] == "True" for c in n["status"].get("conditions", []))
+        if not ready or n["spec"].get("unschedulable"):
+            continue
+        name = n["metadata"]["name"]
+        alloc = n["status"]["allocatable"]
+        u = used.get(name, [0.0, 0.0])
+        rows.append({"name": name, "cpu": render.quantity(alloc["cpu"]), "memory": render.quantity(alloc["memory"]),
+                     "used_cpu": u[0], "used_memory": u[1]})
+    slots = render.litellm_slots(rows, render.quantity(render.LITELLM_CPU_REQUEST), render.quantity(env.litellm_memory_limit))
+    total = sum(slots.values())
+    detail = "、".join(f"{k} {v}" for k, v in sorted(slots.items()))
+    if total < render.LITELLM_MIN_REPLICAS:
+        free = "、".join(f"{r['name']}（CPU の空き {r['cpu'] - r['used_cpu']:.2f} 個、メモリの空き "
+                        f"{(r['memory'] - r['used_memory']) / 2**30:.2f} GiB）" for r in rows)
+        raise LabError(f"LiteLLM（CPU {render.LITELLM_CPU_REQUEST}、メモリの上限 {env.litellm_memory_limit}）を最低の "
+                       f"{render.LITELLM_MIN_REPLICAS} つ置ける空きがありません（置ける数: {detail or '無し'}）。変えずに止めます。"
+                       f"LAB_LITELLM_MEMORY_LIMIT を下げるか、台を足してください。空き: {free}")
+    info(f"LiteLLM の最大数を {total} にします（台ごと: {detail}。CPU {render.LITELLM_CPU_REQUEST}、メモリの上限 {env.litellm_memory_limit}）")
+    return total
+
+
+def _set_litellm_priority() -> None:
+    """LiteLLM の Deployment に優先度（litellm-lab-scalable）を付ける。チャートにこの値が無いので Helm の後に付ける
+    （Helm はこの欄を描かないので、次の upgrade でも残る）。違うときだけ付ける（付けると 1 つずつ入れ替わる）。"""
+    current = output(kn("get", "deploy", "litellm", "-o", "jsonpath={.spec.template.spec.priorityClassName}"), check=False).strip()
+    if current == render.LITELLM_PRIORITY_CLASS:
+        return
+    run(kn("patch", "deploy", "litellm", "--type", "merge", "-p",
+           json.dumps({"spec": {"template": {"spec": {"priorityClassName": render.LITELLM_PRIORITY_CLASS}}}})), quiet=True)
+    info(f"LiteLLM に優先度 {render.LITELLM_PRIORITY_CLASS} を付けました（ほかの Pod の置き場所が足りないときに退く）")
 
 
 def _ingress_vm(env: Env) -> None:

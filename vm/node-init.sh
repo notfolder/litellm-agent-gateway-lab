@@ -2,16 +2,20 @@
 # VM ノードの初期化（LAB_TARGET=aws-ec2 / gcp-vm。labtool/vm.py が SSH で `sudo bash -s` に流す。
 # 変更設計書 .history/2026-10-31-内部LBとVM側の防御とZabbix/ 4 章）。Ubuntu 24.04 LTS（arm64 / amd64）。
 # labtool/vm.py が @@名前@@ を置き換える。クラウド固有の手順は無い（VM はクラウドの API を呼ばない。入口は内部ロードバランサ）。
-# 3 台で同じ内容で、台ごとの値だけが違う。k3s の参加トークンと版は SSH で渡す（VM にバケットの権限は要らない）。
+# 全台で同じ内容で、台ごとの値だけが違う。k3s の参加トークンと版は SSH で渡す（VM にバケットの権限は要らない）。
+# ROLE=server は今の 3 台（etcd を持つ）、ROLE=worker は足す台（k3s の agent。変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 3 章）。
 # 2 回目以降（/var/lib/lab/ready がある）は、CA・中継・nftables・Zabbix agent の設定だけ直して抜ける。
 set -euo pipefail
 exec > >(tee -a /var/log/lab-node-init.log) 2>&1
 
-NODE_INDEX="@@NODE_INDEX@@"            # 1〜3
+NODE_INDEX="@@NODE_INDEX@@"            # 1〜3（足す台は 100 ＋ 番号）
+ROLE="@@ROLE@@"                        # server / worker
+RESERVED="@@RESERVED@@"                # OS と k3s 本体の分（kubelet の system-reserved。例 cpu=500m,memory=2Gi）
+WORKER_LABEL="@@WORKER_LABEL@@"        # 足す台に付けるラベル（litellm-lab/role=worker）
 SELF_IP="@@SELF_IP@@"                  # 自分のプライベート IP（固定）
 FIRST_IP="@@FIRST_IP@@"                # 1 番の台のプライベート IP
-PEER_IPS="@@PEER_IPS@@"                # 他の 2 台のプライベート IP（空白区切り）
-NODE_IPS="@@NODE_IPS@@"                # 3 台のプライベート IP（カンマ区切り。nftables の集合）
+PEER_IPS="@@PEER_IPS@@"                # 自分以外の今の 3 台（server）のプライベート IP（空白区切り。参加先を探す）
+NODE_IPS="@@NODE_IPS@@"                # 全台（今の 3 台と足す台）のプライベート IP（カンマ区切り。nftables の集合）
 REGISTRY_HOST="@@REGISTRY_HOST@@"      # クラスタの中のイメージ置き場の名前（例 lab-registry:5000）
 REGISTRY_NODEPORT="@@REGISTRY_NODEPORT@@"
 SSH_PUBKEY="@@SSH_PUBKEY@@"            # 構築ツールの SSH の公開鍵（空なら触らない）
@@ -75,12 +79,15 @@ EOT
 Environment="HTTP_PROXY=${EGRESS_PROXY}" "HTTPS_PROXY=${EGRESS_PROXY}" "NO_PROXY=${EGRESS_NO_PROXY}"
 EOT
   # k3s（containerd）。インストールスクリプトも同じ値を書くが、2 回目以降の変更にも効くように毎回書く
-  cat > /etc/systemd/system/k3s.service.env <<EOT
+  # （足す台のサービスは k3s-agent。参加先とトークンは config.yaml にあるので、この環境ファイルは中継だけ）
+  K3S_ENV_FILE=/etc/systemd/system/k3s.service.env
+  [ "$ROLE" = "worker" ] && K3S_ENV_FILE=/etc/systemd/system/k3s-agent.service.env
+  cat > "$K3S_ENV_FILE" <<EOT
 HTTP_PROXY=${EGRESS_PROXY}
 HTTPS_PROXY=${EGRESS_PROXY}
 NO_PROXY=${EGRESS_NO_PROXY}
 EOT
-  chmod 600 /etc/systemd/system/k3s.service.env
+  chmod 600 "$K3S_ENV_FILE"
 else
   rm -f /etc/apt/apt.conf.d/90lab-proxy /etc/systemd/system/docker.service.d/http-proxy.conf
 fi
@@ -204,29 +211,44 @@ fi
 # （既定は 127.0.0.1。認証と認可は付いたまま。nftables は 3 台と Pod 網からだけ 10257 / 10259 を通す。変更設計書 2026-10-31-Zabbixの監視の一揃い）
 # `+` は config.yaml の同じ引数に足す（置き換えない）
 mkdir -p /etc/rancher/k3s/config.yaml.d
+K3S_SERVICE=k3s
+[ "$ROLE" = "worker" ] && K3S_SERVICE=k3s-agent
+CONF_CHANGED=""
+write_conf() {  # $1 のファイルを $2 の中身にする（違うときだけ。変わったら CONF_CHANGED）
+  if [ "$(cat "$1" 2>/dev/null)" != "$2" ]; then
+    printf '%s\n' "$2" > "$1"
+    chmod 600 "$1"
+    CONF_CHANGED=1
+  fi
+}
 METRICS_CONF=/etc/rancher/k3s/config.yaml.d/50-lab-metrics.yaml
-METRICS_WANT='kube-controller-manager-arg+:
+if [ "$ROLE" = "server" ]; then
+  write_conf "$METRICS_CONF" 'kube-controller-manager-arg+:
   - bind-address=0.0.0.0
 kube-scheduler-arg+:
   - bind-address=0.0.0.0'
-METRICS_CHANGED=""
-if [ "$(cat "$METRICS_CONF" 2>/dev/null)" != "$METRICS_WANT" ]; then
-  printf '%s\n' "$METRICS_WANT" > "$METRICS_CONF"
-  chmod 600 "$METRICS_CONF"
-  METRICS_CHANGED=1
+else
+  rm -f "$METRICS_CONF"   # agent はコントローラーとスケジューラーを持たない
 fi
+# OS と k3s 本体の分を Kubernetes の置き場所から除く（変更仕様書 2026-10-31-台の増減とLiteLLMのメモリ N11）
+write_conf /etc/rancher/k3s/config.yaml.d/60-lab-reserved.yaml "kubelet-arg+:
+  - system-reserved=${RESERVED}"
 
 if [ -f /var/lib/lab/ready ]; then
   systemctl daemon-reload || true
   if systemctl is-active --quiet docker; then systemctl restart docker || true; fi
-  if [ -n "$METRICS_CHANGED" ] && systemctl is-active --quiet k3s; then
+  if [ -n "$CONF_CHANGED" ] && systemctl is-active --quiet "$K3S_SERVICE"; then
     # 設定が変わったら k3s を再起動する（コンテナは止まらない）。API の準備を待ってから抜ける（./lab は台を 1 台ずつ流す）
-    systemctl restart k3s
-    for _ in $(seq 1 60); do
-      if /usr/local/bin/k3s kubectl get --raw /readyz >/dev/null 2>&1; then break; fi
-      sleep 5
-    done
-    echo "k3s restarted for the metrics settings"
+    systemctl restart "$K3S_SERVICE"
+    if [ "$ROLE" = "server" ]; then
+      for _ in $(seq 1 60); do
+        if /usr/local/bin/k3s kubectl get --raw /readyz >/dev/null 2>&1; then break; fi
+        sleep 5
+      done
+    else
+      sleep 10
+    fi
+    echo "${K3S_SERVICE} restarted for the k3s settings"
   fi
   echo "already initialized (proxy, ca, nftables, zabbix and k3s settings refreshed)"; exit 0
 fi
@@ -258,7 +280,7 @@ alive() {  # 6443 が何か答えるか（k3s の server が起きているか�
 }
 
 # 参加先を探す。誰か答えたらそこへ参加（1 台を作り直したときに、別のクラスタを作ってしまわない）。
-# 誰も答えないとき、1 番なら新しいクラスタを起こし、2 番と 3 番は 1 番が起きるまで待つ
+# 誰も答えないとき、1 番なら新しいクラスタを起こし、2 番と 3 番（と足す台）は 1 番が起きるまで待つ
 JOIN=""
 for ip in $PEER_IPS; do
   if alive "$ip"; then JOIN="$ip"; break; fi
@@ -272,33 +294,53 @@ if [ -z "$JOIN" ] && [ "$NODE_INDEX" != "1" ]; then
   [ -n "$JOIN" ] || { echo "the first node did not come up"; exit 1; }
 fi
 
-# 引数は設定ファイルに書く（コマンドラインに書くと、版上げでインストールスクリプトを再実行したときに消える）。
-# 内容は Mac の k3d と同じ（ノードが止まったら 30 秒で Pod を移す）。Traefik と ServiceLB は同梱のものを使う。
-# 参加先（server）と cluster-init は初回だけ意味を持ち、etcd のデータがある台の再起動では無視される
-{
-  echo "node-ip: ${SELF_IP}"
-  echo "kube-apiserver-arg:"
-  echo "  - default-not-ready-toleration-seconds=30"
-  echo "  - default-unreachable-toleration-seconds=30"
-  echo "kube-controller-manager-arg:"
-  echo "  - node-monitor-grace-period=20s"
-  if [ -n "$JOIN" ]; then
+if [ "$ROLE" = "worker" ]; then
+  # 足す台（k3s の agent）。参加先とトークンは設定ファイルに書く（インストールスクリプトは再実行（版上げ）のたびにサービスの
+  # 環境ファイルを作り直すので、環境変数で渡したトークンは残らない）。ラベルは参加のときに k3s が付ける
+  {
+    echo "node-ip: ${SELF_IP}"
     echo "server: https://${JOIN}:6443"
-  else
-    echo "cluster-init: true"
-  fi
-} > /etc/rancher/k3s/config.yaml
-chmod 600 /etc/rancher/k3s/config.yaml
-if [ -n "$JOIN" ]; then echo "joining the cluster via $JOIN"; else echo "initializing a new cluster"; fi
-# トークンは参加のときだけ環境変数で渡す（server/token に保存され、以後の再起動と版上げでは要らない）。
-# 中継の環境変数（HTTP_PROXY など）は、インストールスクリプトが k3s.service.env に写す
-curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" K3S_TOKEN="$K3S_TOKEN" sh -s - server
-unset K3S_TOKEN
+    echo "token: ${K3S_TOKEN}"
+    echo "node-label:"
+    echo "  - ${WORKER_LABEL}"
+  } > /etc/rancher/k3s/config.yaml
+  chmod 600 /etc/rancher/k3s/config.yaml
+  echo "joining the cluster as an agent via $JOIN"
+  curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" sh -s - agent
+  unset K3S_TOKEN
+  for _ in $(seq 1 60); do
+    if systemctl is-active --quiet k3s-agent; then break; fi
+    sleep 5
+  done
+else
+  # 引数は設定ファイルに書く（コマンドラインに書くと、版上げでインストールスクリプトを再実行したときに消える）。
+  # 内容は Mac の k3d と同じ（ノードが止まったら 30 秒で Pod を移す）。Traefik と ServiceLB は同梱のものを使う。
+  # 参加先（server）と cluster-init は初回だけ意味を持ち、etcd のデータがある台の再起動では無視される
+  {
+    echo "node-ip: ${SELF_IP}"
+    echo "kube-apiserver-arg:"
+    echo "  - default-not-ready-toleration-seconds=30"
+    echo "  - default-unreachable-toleration-seconds=30"
+    echo "kube-controller-manager-arg:"
+    echo "  - node-monitor-grace-period=20s"
+    if [ -n "$JOIN" ]; then
+      echo "server: https://${JOIN}:6443"
+    else
+      echo "cluster-init: true"
+    fi
+  } > /etc/rancher/k3s/config.yaml
+  chmod 600 /etc/rancher/k3s/config.yaml
+  if [ -n "$JOIN" ]; then echo "joining the cluster via $JOIN"; else echo "initializing a new cluster"; fi
+  # トークンは参加のときだけ環境変数で渡す（server/token に保存され、以後の再起動と版上げでは要らない）。
+  # 中継の環境変数（HTTP_PROXY など）は、インストールスクリプトが k3s.service.env に写す
+  curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" K3S_TOKEN="$K3S_TOKEN" sh -s - server
+  unset K3S_TOKEN
 
-for _ in $(seq 1 120); do
-  if /usr/local/bin/k3s kubectl get --raw /readyz >/dev/null 2>&1; then break; fi
-  sleep 5
-done
+  for _ in $(seq 1 120); do
+    if /usr/local/bin/k3s kubectl get --raw /readyz >/dev/null 2>&1; then break; fi
+    sleep 5
+  done
+fi
 
 touch /var/lib/lab/ready
 echo "node $NODE_INDEX ready"

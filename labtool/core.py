@@ -373,6 +373,29 @@ class Env:
         return [x.strip() for x in self.get("LAB_VM_NODES").split(",") if x.strip()]
 
     @property
+    def vm_worker_nodes(self) -> list[str]:
+        """足す台（k3s の agent）の識別子。provided は人が書き、managed は ./lab が書く（変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 1 章）。"""
+        return [x.strip() for x in self.get("LAB_VM_WORKER_NODES").split(",") if x.strip()]
+
+    @property
+    def vm_workers(self) -> int:
+        """managed: 足す台の数（既定 0）。"""
+        value = self.get("LAB_VM_WORKERS", "0").strip() or "0"
+        if not value.isdigit():
+            raise LabError(f"LAB_VM_WORKERS は 0 以上の整数です（{value}）")
+        return int(value)
+
+    @property
+    def litellm_memory_request(self) -> str:
+        """LiteLLM 1 つのメモリの予約（Kubernetes の量の形。既定 512Mi）。"""
+        return self.get("LAB_LITELLM_MEMORY_REQUEST", "512Mi").strip() or "512Mi"
+
+    @property
+    def litellm_memory_limit(self) -> str:
+        """LiteLLM 1 つのメモリの上限（既定 1Gi）。最大数の計算はこの値で割る。"""
+        return self.get("LAB_LITELLM_MEMORY_LIMIT", "1Gi").strip() or "1Gi"
+
+    @property
     def vm_ssh_key(self) -> Path:
         value = self.get("LAB_VM_SSH_KEY")
         return Path(value).expanduser() if value else BUILD_DIR / "vm-ssh-key"

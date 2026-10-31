@@ -10,7 +10,7 @@ from pathlib import Path
 import yaml
 
 from labtool import checks, render
-from labtool.core import Env, has_chatgpt_token, parse_env, render_template, secret_manifest, set_env_line
+from labtool.core import ROOT, Env, LabError, has_chatgpt_token, parse_env, render_template, secret_manifest, set_env_line
 
 BASE = {"LITELLM_MASTER_KEY": "sk-master", "LAB_HTTP_PORT": "8080"}
 
@@ -721,14 +721,14 @@ class VmTargetTest(unittest.TestCase):
         self.assertEqual(failover.scenarios_for(self.vm("gcp-vm")), [*failover.SCENARIOS, "entry-node"])
         self.assertEqual(failover.scenarios_for(env()), failover.SCENARIOS)
         self.assertEqual(failover.scenarios_for(env(LAB_TARGET="aws", LAB_AWS_HOSTNAME="x")), failover.SCENARIOS_AWS)
-        # 入口は内部ロードバランサ（Traefik の台を止める場面）。目安は両クラウド 60 秒（変更仕様書 2026-10-31 R22）
-        self.assertEqual(failover.LIMITS["entry-node"], 60)
+        # 入口の台と足す台を止める場面も、ほかの台を止める場面と同じ目安（ユーザーの判断 2026-11-01: 1A）
+        self.assertEqual((failover.LIMITS["entry-node"], failover.LIMITS["worker-node"]), (120, 120))
         # GCP だけ、台を止める場面の目安を広げる（2026-10-30 の判断 2A）
         gcp = VmTargetTest().vm("gcp-vm")
-        self.assertEqual((failover.limit_for(gcp, "entry-node"), failover.limit_for(gcp, "pg-node"), failover.limit_for(gcp, "pg-pod")),
-                         (60, 180, 60))
+        self.assertEqual((failover.limit_for(gcp, "entry-node"), failover.limit_for(gcp, "worker-node"), failover.limit_for(gcp, "pg-node"),
+                          failover.limit_for(gcp, "pg-pod")), (180, 180, 180, 60))
         ec2 = VmTargetTest().vm("aws-ec2")
-        self.assertEqual((failover.limit_for(ec2, "entry-node"), failover.limit_for(ec2, "pg-node")), (60, 120))
+        self.assertEqual((failover.limit_for(ec2, "entry-node"), failover.limit_for(ec2, "pg-node")), (120, 120))
         self.assertEqual(failover.SCENARIO_ALIASES["eip-node"], "entry-node")   # EC2 版の名前も受ける
 
     def test_k3s_version_rules(self):
@@ -746,13 +746,13 @@ class VmTargetTest(unittest.TestCase):
         with self.assertRaises(LabError):
             vm.parse_k3s_version("1.36.1")
 
-    def test_k3s_upgrade_order_puts_entry_holder_last(self):
+    def test_k3s_upgrade_order_servers_first(self):
+        """今の 3 台が先（SSH の転送先は 3 台の最後）、足す台が後（変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 3.3 節）。"""
         from labtool import vm
         ids = ["i-1", "i-2", "i-3"]
-        self.assertEqual(vm.upgrade_order(ids, "i-2"), ["i-1", "i-3", "i-2"])
-        self.assertEqual(vm.upgrade_order(ids, "i-2", forward_target="i-1"), ["i-3", "i-1", "i-2"])
-        self.assertEqual(vm.upgrade_order(ids, "i-2", forward_target="i-2"), ["i-1", "i-3", "i-2"])
-        self.assertEqual(vm.upgrade_order(ids, None), ids)
+        self.assertEqual(vm.upgrade_order(ids, []), ids)
+        self.assertEqual(vm.upgrade_order(ids, [], forward_target="i-1"), ["i-2", "i-3", "i-1"])
+        self.assertEqual(vm.upgrade_order(ids, ["w-1", "w-2"], forward_target="i-2"), ["i-1", "i-3", "i-2", "w-1", "w-2"])
 
     def test_operator_cidr(self):
         """22 を開ける送信元: .env で固定、無ければ外部に問い合わせた IPv4 の /32。IPv6 や失敗は止める。"""
@@ -869,6 +869,88 @@ class CloudLayerTest(unittest.TestCase):
         return clouds.Infra(nodes=nodes, entry_ip=plan["lb_ips"][0],
                             entry_ip_id="arn:aws:elasticloadbalancing:r:1:loadbalancer/net/lb/1" if target == "aws-ec2" else "litellm-lab-lb",
                             bucket="lab-bucket", region="r", bastion_host="203.0.113.20", bastion_cidr="10.60.0.20/32")
+
+    def test_worker_plan_and_init(self):
+        """足す台（変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 2 章・3 章）: IP の割り振り、初期化スクリプトは agent で入れ、
+        参加先とトークンを config.yaml に書き、コントローラーの待ち受けの設定を消す。nftables の台の一覧は全台。"""
+        from labtool import clouds, vm
+        g = clouds.worker_plan("10.60.0.0/16", False, 3)
+        self.assertEqual([w["private_ip"] for w in g], ["10.60.0.31", "10.60.0.32", "10.60.0.33"])
+        self.assertEqual([w["index"] for w in g], [101, 102, 103])
+        a = clouds.worker_plan("10.60.0.0/16", True, 4)
+        self.assertEqual([w["private_ip"] for w in a], ["10.60.0.31", "10.60.1.32", "10.60.2.33", "10.60.0.34"])
+        self.assertEqual([w["subnet_index"] for w in a], [0, 1, 2, 0])
+        server_ips = {n["private_ip"] for n in clouds.network_plan("10.60.0.0/16", False)["nodes"]}
+        self.assertFalse(server_ips & {w["private_ip"] for w in g})
+        infra = self.infra("gcp-vm")
+        infra.workers = [clouds.Node(id="z/w1", index=101, private_ip="10.60.0.31", public_ip="", zone="z", role="worker")]
+        self.assertEqual([n.index for n in infra.all_nodes()], [1, 2, 3, 101])
+        self.assertEqual(infra.node("z/w1").role, "worker")
+        e = VmTargetTest().vm("gcp-vm", LAB_SSH_ALLOW_CIDR="203.0.113.5")
+        fw = vm.firewall_values(e, infra)
+        self.assertEqual(fw["NODE_IPS"].split(","), [n.private_ip for n in infra.all_nodes()])
+        values = {"K3S_VERSION": "v1.35.5+k3s1", "K3S_TOKEN": "tok", **fw}
+        w = vm.render_node_init(infra.workers[0], infra.nodes, "k", values)
+        self.assertEqual(re.findall(r"@@[A-Z_0-9]+@@", w), [])
+        for needle in ('ROLE="worker"', 'RESERVED="cpu=250m,memory=1Gi"', 'WORKER_LABEL="litellm-lab/role=worker"',
+                       'PEER_IPS="' + " ".join(n.private_ip for n in infra.nodes) + '"', "sh -s - agent", 'echo "token: ${K3S_TOKEN}"',
+                       "k3s-agent.service.env", "60-lab-reserved.yaml", "system-reserved=${RESERVED}", 'rm -f "$METRICS_CONF"'):
+            self.assertIn(needle, w, needle)
+        srv = vm.render_node_init(infra.nodes[0], infra.nodes, "k", values)
+        self.assertIn('ROLE="server"', srv)
+        self.assertIn('RESERVED="cpu=500m,memory=2Gi"', srv)
+        self.assertIn("k3s-agent-uninstall.sh", vm.UNINSTALL_SCRIPT)
+
+    def test_litellm_capacity(self):
+        """LiteLLM の最大数（変更設計書 4.1 節）と、足す台の置けるかの判定、メモリの値、DB の置き場所、優先度。"""
+        from labtool import render
+        gi = 2**30
+        rows = [{"name": "n1", "cpu": 2.0, "memory": 6 * gi, "used_cpu": 0.6, "used_memory": 1 * gi},   # CPU で 5
+                {"name": "w1", "cpu": 2.0, "memory": 7 * gi, "used_cpu": 0.0, "used_memory": 0},         # CPU で 8、メモリ 7
+                {"name": "full", "cpu": 2.0, "memory": 1 * gi, "used_cpu": 2.5, "used_memory": 2 * gi}]  # 負 → 0
+        self.assertEqual(render.litellm_slots(rows, 0.25, 1 * gi), {"n1": 5, "w1": 7, "full": 0})
+        self.assertEqual(render.litellm_slots(rows, 0.25, 8 * gi), {"n1": 0, "w1": 0, "full": 0})
+        self.assertEqual(render.litellm_slots([{"name": "x", "cpu": 1.0, "memory": 4 * gi, "used_cpu": 0, "used_memory": 0}],
+                                              0.25, 1 * gi), {"x": 4})   # 割り切れるときに 1 つ少なく数えない
+        self.assertEqual(render.quantity("250m"), 0.25)
+        self.assertEqual(render.quantity("8023456Ki"), 8023456 * 1024)
+        self.assertEqual(render.quantity("1Gi"), gi)
+        with self.assertRaises(ValueError):
+            render.quantity("1GB")
+        self.assertEqual(render.worker_capacity_shortage(2, 8 * gi, 0.25, 1 * gi), "")
+        self.assertIn("メモリ", render.worker_capacity_shortage(2, 8 * gi, 0.25, 16 * gi))
+        self.assertIn("CPU", render.worker_capacity_shortage(0.4, 8 * gi, 0.25, 1 * gi))
+        e = VmTargetTest().vm("gcp-vm")
+        self.assertEqual(render.litellm_resources(e), {"requests": {"cpu": "250m", "memory": "512Mi"}, "limits": {"memory": "1Gi"}})
+        e2 = VmTargetTest().vm("gcp-vm", LAB_LITELLM_MEMORY_REQUEST="4Gi", LAB_LITELLM_MEMORY_LIMIT="8Gi")
+        self.assertEqual(render.litellm_resources(e2)["limits"]["memory"], "8Gi")
+        with self.assertRaises(ValueError):
+            render.litellm_resources(VmTargetTest().vm("gcp-vm", LAB_LITELLM_MEMORY_REQUEST="2Gi", LAB_LITELLM_MEMORY_LIMIT="1Gi"))
+        o = render.helm_overrides(e2, "repo", "tag", "h", None, 9)
+        self.assertEqual((o["autoscaling"], o["resources"]["requests"]["memory"]), ({"maxReplicas": 9}, "4Gi"))
+        self.assertNotIn("autoscaling", render.helm_overrides(e, "repo", "tag", "h"))
+        pinned = list(yaml.safe_load_all(render.pin_to_servers(
+            "apiVersion: postgresql.cnpg.io/v1\nkind: Cluster\nmetadata: {name: p}\nspec: {affinity: {enablePodAntiAffinity: true}}\n---\n"
+            "apiVersion: apps/v1\nkind: StatefulSet\nmetadata: {name: v}\nspec: {template: {spec: {containers: []}}}\n---\n"
+            "apiVersion: v1\nkind: Service\nmetadata: {name: s}\n")))
+        self.assertEqual(pinned[0]["spec"]["affinity"], {"enablePodAntiAffinity": True, "nodeSelector": render.CONTROL_PLANE_SELECTOR})
+        self.assertEqual(pinned[1]["spec"]["template"]["spec"]["nodeSelector"], render.CONTROL_PLANE_SELECTOR)
+        self.assertNotIn("spec", pinned[2])
+        pc = yaml.safe_load(render.litellm_priority_class_manifest())
+        self.assertEqual((pc["value"], pc["preemptionPolicy"]), (-100, "Never"))
+        self.assertEqual(e.vm_workers, 0)
+        with self.assertRaises(LabError):
+            _ = VmTargetTest().vm("gcp-vm", LAB_VM_WORKERS="two").vm_workers
+
+    def test_traefik_runs_on_every_entry_node(self):
+        """入口の Traefik は全台に 1 つずつ（DaemonSet、入口の印のある台だけ）。障害の試験の足す台の場面は足す台があるときだけ。"""
+        from labtool import failover
+        cfg = yaml.safe_load(yaml.safe_load((ROOT / "k8s" / "traefik-config-vm.yaml").read_text())["spec"]["valuesContent"])
+        self.assertEqual(cfg["deployment"], {"kind": "DaemonSet"})
+        self.assertEqual(cfg["nodeSelector"], {"litellm-lab/entry": "true"})
+        self.assertNotIn("affinity", cfg)
+        self.assertNotIn("worker-node", failover.scenarios_for(VmTargetTest().vm("gcp-vm")))
+        self.assertIn("worker-node", failover.scenarios_for(VmTargetTest().vm("gcp-vm", LAB_VM_WORKER_NODES="z/w1")))
 
     def test_both_clouds_implement_the_same_functions(self):
         import inspect
@@ -1074,7 +1156,12 @@ class CloudLayerTest(unittest.TestCase):
         hpa = next(i for i in s["items"] if i["key_"] == "lab.k8s.hpa.litellm.max")
         self.assertTrue(hpa["preprocessing"][0]["params"].endswith("\nvalue\n"))
         node_trig = next(t for t in s["triggers"] if "Ready のノード" in t["description"])
-        self.assertEqual((node_trig["expression"], node_trig["priority"]), ("last(/litellm-lab-k8s/lab.k8s.nodes.ready)<3", mon.HIGH))
+        self.assertEqual((node_trig["expression"], node_trig["priority"]),
+                         ("last(/litellm-lab-k8s/lab.k8s.nodes.ready)<{$LAB.NODES.EXPECTED}", mon.HIGH))
+        expected = next(i for i in s["items"] if i["key_"] == "lab.k8s.nodes.expected")
+        self.assertEqual(expected["params"], "{$LAB.NODES.EXPECTED}")
+        self.assertNotIn("litellm-lab: Ready のノードが 3 台未満", [t["description"] for t in s["triggers"]])
+        self.assertIn("litellm-lab: Ready のノードが 3 台未満", mon.RETIRED_TRIGGERS)
         http_items = [i for i in s["items"] if i["type"] == mon.T_HTTP]
         for i in http_items:
             self.assertTrue(i["url"].startswith("{$KUBE.API.URL}/apis/"))
@@ -1105,7 +1192,7 @@ class CloudLayerTest(unittest.TestCase):
         infra = self.infra("gcp-vm")
         text = vm.render_node_init(infra.nodes[0], infra.nodes, "k", vm.firewall_values(VmTargetTest().vm("gcp-vm"), infra))
         for needle in ("/etc/rancher/k3s/config.yaml.d/50-lab-metrics.yaml", "kube-controller-manager-arg+:", "kube-scheduler-arg+:",
-                       "bind-address=0.0.0.0", "systemctl restart k3s", "10257, 10259"):
+                       "bind-address=0.0.0.0", 'systemctl restart "$K3S_SERVICE"', "K3S_SERVICE=k3s\n", "10257, 10259"):
             self.assertIn(needle, text)
 
     def test_zabbix_api_and_setup_is_idempotent(self):

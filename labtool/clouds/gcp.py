@@ -21,6 +21,7 @@ from .. import render
 from ..core import Env, LabError, info, ok, warn
 from . import (
     GCP_DNS_IPS, GCP_HEALTH_CHECK_RANGES, GCP_META_IPS, GCS_ROLE_LISTER, GCS_ROLE_WRITER, KEY_ROLES, LEGACY_KEY_USERS, NODE_COUNT,
+    WORKER_INDEX_BASE, worker_plan,
     PROXY_PORT, ZABBIX_SERVER_PORT, Infra, Node, gcs_bindings, network_plan,
 )
 
@@ -82,6 +83,15 @@ def assign_zones(available: list[str], count: int = NODE_COUNT) -> list[str]:
 
 def _zones(env: Env) -> list[str]:
     """リージョンの UP なゾーンのうち、LAB_GCP_MACHINE_TYPE が置けるゾーンを名前順に拾い、台に割り振る。"""
+    usable = _usable_zones(env)
+    if len(usable) < NODE_COUNT and not _zones_warned:
+        _zones_warned.append(env.gcp_region)
+        warn(f"{env.gcp_machine_type} が使えるゾーンは {', '.join(usable)} の {len(usable)} つなので、{NODE_COUNT} 台を繰り返して割り振ります")
+    return assign_zones(usable)
+
+
+def _usable_zones(env: Env) -> list[str]:
+    """LAB_GCP_MACHINE_TYPE を置けるゾーン（名前順）。"""
     compute = _compute()
     from google.api_core import exceptions as gexc
     zones = sorted(z.name for z in compute.ZonesClient().list(project=env.gcp_project)
@@ -94,10 +104,7 @@ def _zones(env: Env) -> list[str]:
             usable.append(zone)
     if not usable:
         raise LabError(f"{env.gcp_region} に {env.gcp_machine_type} を置けるゾーンがありません（ゾーン: {', '.join(zones) or '無し'}）")
-    if len(usable) < NODE_COUNT and not _zones_warned:
-        _zones_warned.append(env.gcp_region)
-        warn(f"{env.gcp_machine_type} が使えるゾーンは {', '.join(usable)} の {len(usable)} つなので、{NODE_COUNT} 台を繰り返して割り振ります")
-    return assign_zones(usable)
+    return usable
 
 
 def _NotFound():
@@ -696,8 +703,10 @@ def _to_node(inst, index: int | None = None) -> Node:
     zone = inst.zone.rsplit("/", 1)[-1]
     nic = inst.network_interfaces[0] if inst.network_interfaces else None
     public = nic.access_configs[0].nat_i_p if nic and nic.access_configs else ""
-    return Node(id=f"{zone}/{inst.name}", index=index if index is not None else int((inst.labels or {}).get("lab-node-index", "0")),
-                private_ip=nic.network_i_p if nic else "", public_ip=public or "", zone=zone)
+    labels = inst.labels or {}
+    return Node(id=f"{zone}/{inst.name}", index=index if index is not None else int(labels.get("lab-node-index", "0")),
+                private_ip=nic.network_i_p if nic else "", public_ip=public or "", zone=zone,
+                role="worker" if labels.get("lab-role") == "worker" else "server")
 
 
 def _create_instance(env: Env, zone: str, name: str, machine_type: str, image: str, disk_type: str, disk_gb: int,
@@ -744,6 +753,48 @@ def ensure_nodes(env: Env, net: dict, pubkey: str) -> list[Node]:
     return nodes
 
 
+def ensure_workers(env: Env, net: dict, pubkey: str, count: int) -> list[Node]:
+    """足す台 1〜count（<接頭辞>-worker<番号>、今の 3 台と同じ種類とイメージ、ゾーンは順に、サブネットの .30+番号）。無い番号だけ作る。
+    count より大きい番号の台は消さない（vm.remove_leaving_workers がクラスタから外した後に remove_workers で消す）。"""
+    if count <= 0:
+        return []
+    names = _names(env)
+    existing = {_to_node(i).index: i for i in _instances(env, role="worker")}
+    zones = _usable_zones(env)
+    image = _image(env, _instances(env), IMAGE_FAMILY)
+    for w in worker_plan(env.vm_cidr, False, count):
+        if w["index"] in existing:
+            continue
+        zone = zones[(w["number"] - 1) % len(zones)]
+        name = f"{env.vm_prefix}-worker{w['number']}"
+        _create_instance(env, zone, name, env.gcp_machine_type, image, DISK_TYPE, env.vm_disk_gib, net["subnet"],
+                         w["private_ip"], pubkey, None, [names["tag"]],
+                         {LABEL_KEY: env.vm_prefix, "lab-role": "worker", "lab-node-index": str(w["index"])})
+        info(f"Compute Engine {name}（足す台、{zone}、{w['private_ip']}）を起こしました")
+    return [n for n in list_workers(env) if n.index <= WORKER_INDEX_BASE + count]
+
+
+def list_workers(env: Env) -> list[Node]:
+    """作った足す台すべて（ラベル lab-role=worker。番号の順）。"""
+    return sorted((_to_node(i) for i in _instances(env, role="worker")), key=lambda n: n.index)
+
+
+def remove_workers(env: Env, nodes: list[Node]) -> None:
+    """足す台をロードバランサの転送先（ゾーンのインスタンスグループ）から外し、VM を消す。"""
+    if not nodes:
+        return
+    compute = _compute()
+    names, project = _names(env), env.gcp_project
+    igs = compute.InstanceGroupsClient()
+    for n in nodes:
+        zone, name = n.id.split("/", 1)
+        with contextlib.suppress(_NotFound()):
+            igs.remove_instances(project=project, zone=zone, instance_group=f"{names['lb_group']}-{zone}",
+                                 instance_groups_remove_instances_request_resource=compute.InstanceGroupsRemoveInstancesRequest(
+                                     instances=[compute.InstanceReference(instance=f"projects/{project}/zones/{zone}/instances/{name}")])).result()
+    _delete_instances(env, [n.id for n in nodes])
+
+
 def ensure_proxy_node(env: Env, net: dict, pubkey: str) -> Node:
     """中継（出口プロキシ）の VM 1 台（amd64、サブネットの .20、公開 IP あり）。検証では踏み台と Zabbix サーバーも兼ねるので、
     LAB_ZABBIX_VM=true なら e2-medium（4 GiB）とディスク 20 GiB。"""
@@ -759,19 +810,21 @@ def ensure_proxy_node(env: Env, net: dict, pubkey: str) -> Node:
     return _to_node(existing[0], index=0)
 
 
-def describe_nodes(env: Env, ids: list[str]) -> list[Node]:
-    """.env の識別子（<ゾーン>/<名前>）から Node を組む。順番が台の番号。"""
+def describe_nodes(env: Env, ids: list[str], base: int = 0) -> list[Node]:
+    """.env の識別子（<ゾーン>/<名前>）から Node を組む。順番が台の番号（base ＋ 1 から。足す台は base=100 で role=worker）。"""
     compute = _compute()
     nodes = []
-    for i, node_id in enumerate(ids, start=1):
+    for i, node_id in enumerate(ids, start=base + 1):
         if "/" not in node_id:
             raise LabError(f"LAB_VM_NODES の {node_id} は <ゾーン>/<名前> の形にしてください")
         zone, name = node_id.split("/", 1)
         try:
             inst = compute.InstancesClient().get(project=env.gcp_project, zone=zone, instance=name)
         except _NotFound():
-            raise LabError(f"Compute Engine {node_id}（LAB_VM_NODES）がありません")
-        nodes.append(_to_node(inst, index=i))
+            raise LabError(f"Compute Engine {node_id}（{'LAB_VM_WORKER_NODES' if base else 'LAB_VM_NODES'}）がありません")
+        node = _to_node(inst, index=i)
+        node.role = "worker" if base >= WORKER_INDEX_BASE else "server"
+        nodes.append(node)
     return nodes
 
 
@@ -810,9 +863,10 @@ def provision(env: Env, pubkey: str, operator_cidr: str) -> dict:
     bucket = ensure_bucket(env)
     keys = ensure_static_keys(env, bucket)
     nodes = ensure_nodes(env, net, pubkey)
-    entry_ip, entry_ip_id = ensure_load_balancer(env, net, nodes)
+    workers = ensure_workers(env, net, pubkey, env.vm_workers)
+    entry_ip, entry_ip_id = ensure_load_balancer(env, net, nodes + workers)
     proxy = ensure_proxy_node(env, net, pubkey) if env.egress_proxy_vm else None
-    return {"nodes": [n.id for n in nodes], "bucket": bucket, "entry_ip": entry_ip, "entry_ip_id": entry_ip_id,
+    return {"nodes": [n.id for n in nodes], "workers": [n.id for n in workers], "bucket": bucket, "entry_ip": entry_ip, "entry_ip_id": entry_ip_id,
             "keys": keys, "proxy": proxy, "proxy_url": f"http://{net['plan']['proxy_ip']}:{PROXY_PORT}" if proxy else "",
             "bastion_host": proxy.public_ip if proxy else "", "bastion_cidr": f"{proxy.private_ip}/32" if proxy else "",
             "zabbix_server": f"{proxy.private_ip}:{ZABBIX_SERVER_PORT}" if proxy and env.zabbix_vm else ""}
@@ -954,7 +1008,8 @@ def destroy(env: Env) -> None:
             iam.delete_service_account(name=f"projects/{project}/serviceAccounts/{email}")
             info(f"サービスアカウント {email} を消しました")
     _delete_load_balancer(env, None)
-    ids = [_to_node(i).id for i in _instances(env)] + [_to_node(i).id for i in _instances(env, role="proxy")]
+    ids = ([_to_node(i).id for i in _instances(env)] + [_to_node(i).id for i in _instances(env, role="worker")]
+           + [_to_node(i).id for i in _instances(env, role="proxy")])
     _delete_instances(env, ids)
     from google.api_core import exceptions as gexc
     for role_name in [f"projects/{project}/roles/{names['node_role']}",   # 前の版の VM 用ロール（残っていれば）
@@ -980,4 +1035,4 @@ def destroy_provided(env: Env, infra: Infra) -> None:
     _delete_bucket(env, infra.bucket)
     if infra.entry_ip_id:
         _delete_load_balancer(env, infra.entry_ip_id)
-    _delete_instances(env, [n.id for n in infra.nodes])
+    _delete_instances(env, [n.id for n in infra.all_nodes()])

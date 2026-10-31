@@ -21,6 +21,7 @@ SPEC_MARK = "lab-spec:"
 KSM_MASTER_KEY = "kube.state.metrics"     # テンプレート「Kubernetes cluster state by HTTP」のスクリプトアイテム
 DASHBOARD = "litellm-lab"
 DASHBOARD_HASH_MACRO = "{$LAB.DASHBOARD.HASH}"
+RETIRED_TRIGGERS = ["litellm-lab: Ready のノードが 3 台未満"]
 ZABBIX_SERVER_HOST = "Zabbix server"
 ZABBIX_SERVER_DROP_TEMPLATE = "Linux by Zabbix agent"
 
@@ -188,9 +189,12 @@ def k8s_specs() -> dict:
         calc("lab.k8s.cpu.requests.pct", "litellm-lab: CPU の要求の比", f"100*last(/{HOST}/lab.k8s.cpu.requests)/last(/{HOST}/lab.k8s.cpu.allocatable)", "%"),
         calc("lab.k8s.mem.requests.pct", "litellm-lab: メモリの要求の比", f"100*last(/{HOST}/lab.k8s.mem.requests)/last(/{HOST}/lab.k8s.mem.allocatable)", "%"),
         calc("lab.cert.days_left", "litellm-lab: 証明書の残り日数", f"(last(/{HOST}/lab.cert.not_after)-now())/86400", "d", delay="10m"),
+        calc("lab.k8s.nodes.expected", "litellm-lab: 決めた台数（今の 3 台 ＋ 足す台）", "{$LAB.NODES.EXPECTED}", delay="5m"),
     ]
     triggers = [
-        trig("litellm-lab: Ready のノードが 3 台未満", f"last({h}lab.k8s.nodes.ready)<3", HIGH),
+        # 決めた台数（今の 3 台 ＋ 足す台）は、ホストのマクロ（./lab zabbix が書く。変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 5 章）
+        trig("litellm-lab: Ready のノードが決めた台数（{$LAB.NODES.EXPECTED}）より少ない",
+             f"last({h}lab.k8s.nodes.ready)<{{$LAB.NODES.EXPECTED}}", HIGH),
         trig("litellm-lab: 圧迫（メモリ・ディスク・プロセス）のあるノードがある", f"last({h}lab.k8s.nodes.pressure)>0", WARN),
         trig("litellm-lab: 置けない（cordon）ノードが 30 分続いている", f"min({h}lab.k8s.nodes.unschedulable,30m)>0", INFO),
         trig("litellm-lab: CPU の要求が割り当て可能な量の 90% を超えた", f"min({h}lab.k8s.cpu.requests.pct,10m)>90", WARN),
@@ -283,6 +287,12 @@ def ensure_specs(client, specs: dict | None = None) -> dict[str, int]:
     for spec in specs["triggers"]:
         _, did = _ensure(client, "trigger", {"hostids": hostid}, {"description": spec["description"]}, spec, "comments")
         changed["triggers"] += did
+    # 名前を変えたトリガーの古い方を消す（台数のトリガーは 2026-10-31 に「3 台未満」から「決めた台数より少ない」へ）
+    for old in RETIRED_TRIGGERS:
+        stale = client.call("trigger.get", {"hostids": hostid, "filter": {"description": old}, "output": ["triggerid"]})
+        if stale:
+            client.call("trigger.delete", [t["triggerid"] for t in stale])
+            changed["triggers"] += 1
     d = specs["discovery"]
     rule_body = {**_item_payload(d["rule"], ids), "hostid": hostid}
     ruleid, did = _ensure(client, "discoveryrule", {"hostids": hostid}, {"key_": d["rule"]["key_"]}, rule_body, "description")
@@ -325,19 +335,20 @@ def dashboard_spec(groupids: list[str], itemids: dict[str, str]) -> dict:
         {"type": "problemsbysv", "name": "深刻度ごとの障害", "x": 0, "y": 0, "width": 72, "height": 3, "fields": list(groups)},
         {"type": "problems", "name": "障害", "x": 0, "y": 3, "width": 72, "height": 6, "fields": list(groups)},
     ]
-    values = [("lab.k8s.nodes.ready", "Ready のノード"), ("lab.k8s.pods.pending", "Pending の Pod"),
+    values = [("lab.k8s.nodes.ready", "Ready のノード"), ("lab.k8s.nodes.expected", "決めた台数"),
+              ("lab.k8s.hpa.litellm.max", "LiteLLM の上限"), ("lab.k8s.pods.pending", "Pending の Pod"),
               ("lab.cnpg.ready_instances", "PostgreSQL の台数"), ("lab.cert.days_left", "証明書の残り日数"),
               ("lab.k8s.cpu.requests.pct", "CPU の要求の比"), ("lab.k8s.mem.requests.pct", "メモリの要求の比")]
     for n, (key, title) in enumerate(values):
         if key in itemids:
-            widgets.append({"type": "item", "name": title, "x": 12 * n, "y": 9, "width": 12, "height": 3,
+            widgets.append({"type": "item", "name": title, "x": 9 * n, "y": 9, "width": 9, "height": 3,
                             "fields": [_f(4, "itemid.0", itemids[key])]})
     graphs = [("VM の CPU 使用率", "CPU utilization"), ("VM のメモリ使用率", "Memory utilization"),
               ("VM のディスク（/）の使用率", "FS [/]: Space: Used, in %")]
     for n, (title, pattern) in enumerate(graphs):
         widgets.append({"type": "svggraph", "name": title, "x": 24 * n, "y": 12, "width": 24, "height": 6, "fields": [
-            _f(1, "ds.0.hosts.0", "litellm-lab-node*"), _f(1, "ds.0.hosts.1", "litellm-lab-proxy"),
-            _f(1, "ds.0.items.0", pattern)]})
+            _f(1, "ds.0.hosts.0", "litellm-lab-node*"), _f(1, "ds.0.hosts.1", "litellm-lab-worker*"),
+            _f(1, "ds.0.hosts.2", "litellm-lab-proxy"), _f(1, "ds.0.items.0", pattern)]})
     widgets.append({"type": "svggraph", "name": "コンテナのメモリ（上限比）", "x": 0, "y": 18, "width": 72, "height": 6, "fields": [
         _f(1, "ds.0.hosts.0", HOST), _f(1, "ds.0.items.0", "*メモリ（上限比）")]})
     return {"name": DASHBOARD, "display_period": 30, "auto_start": 1, "pages": [{"name": "概要", "widgets": widgets}]}

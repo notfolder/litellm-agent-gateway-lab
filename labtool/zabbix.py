@@ -35,6 +35,7 @@ KSM_ENDPOINT = f"{RELEASE}-kube-state-metrics"
 DEFAULT_ADMIN = ("Admin", "zabbix")
 TOKEN_NAME = "litellm-lab"
 ENTRY_CHECKS = [("liveliness", "/health/liveliness"), ("readiness", "/health/readiness")]
+EXPECTED_NODES_MACRO = "{$LAB.NODES.EXPECTED}"   # 決めた台数（今の 3 台 ＋ 足す台）。ホスト litellm-lab-k8s に ./lab zabbix が書く
 
 
 class ZabbixApi:
@@ -349,9 +350,12 @@ def setup(env: Env) -> None:
     from .core import kapply
     kapply(manifest=extra_rbac_manifest(), namespaced=False)
     proxyid = ensure_proxy(client, PROXY_HOSTNAME)
+    from .clouds import NODE_COUNT
     k8s_macros = {"{$KUBE.API.URL}": "https://kubernetes.default.svc.cluster.local:443",
                   "{$KUBE.API.TOKEN}": service_account_token(),
-                  "{$KUBE.STATE.ENDPOINT.NAME}": KSM_ENDPOINT}
+                  "{$KUBE.STATE.ENDPOINT.NAME}": KSM_ENDPOINT,
+                  # 決めた台数（今の 3 台 ＋ 足す台。変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 5 章）
+                  EXPECTED_NODES_MACRO: str(NODE_COUNT + len(infra.workers))}
     ensure_host(client, K8S_HOST, [groups["k8s"]], [template_id(client, TEMPLATE_K8S_STATE)], k8s_macros, proxyid,
                 tags={"lab": "k8s"})
     entry = ensure_host(client, ENTRY_HOST, [groups["service"]], [], {}, proxyid, tags={"lab": "entry"})
@@ -363,8 +367,29 @@ def setup(env: Env) -> None:
         mon.fix_zabbix_server_host(client)
     mon.ensure_specs(client)
     mon.ensure_dashboard(client, list(groups.values()))
-    ok(f"Zabbix の設定がそろいました（web: http://127.0.0.1:{env.zabbix_local_port}/ Admin。ホスト: VM {len(infra.nodes)} 台 ＋ 踏み台は自動登録、"
+    ok(f"Zabbix の設定がそろいました（web: http://127.0.0.1:{env.zabbix_local_port}/ Admin。ホスト: VM {len(infra.all_nodes())} 台 ＋ 踏み台は自動登録、"
        f"{K8S_HOST}、{ENTRY_HOST}）" if env.zabbix_vm else f"Zabbix の設定がそろいました（{env.zabbix_api_url}）")
+
+
+def delete_hosts_by_ip(env: Env, infra, ips: list[str]) -> list[str]:
+    """エージェントのインターフェースの IP でホストを探して消す（減らした足す台。自動登録のホストは VM の名前なので、IP で引く）。
+    消したホスト名を返す。Zabbix に届かなければ警告して空。"""
+    try:
+        client = api(env, infra)
+        ifaces = client.call("hostinterface.get", {"filter": {"ip": ips, "type": 1}, "output": ["hostid", "ip"]})
+        hostids = sorted({i["hostid"] for i in ifaces})
+        if not hostids:
+            return []
+        # 発見ルールが作ったホスト（Kubernetes のテンプレートの「Kubelet <ノード>」など。flags=4）は発見ルールが消すので、
+        # 自動登録の VM のホスト（flags=0）だけを消す
+        hosts = client.call("host.get", {"hostids": hostids, "output": ["hostid", "host"], "filter": {"flags": 0}})
+        if not hosts:
+            return []
+        client.call("host.delete", [h["hostid"] for h in hosts])
+        return [h["host"] for h in hosts]
+    except LabError as e:
+        warn(f"Zabbix のホストを消せませんでした（{e}）。画面から消してください: {', '.join(ips)}")
+        return []
 
 
 def summary(env: Env) -> list[str]:

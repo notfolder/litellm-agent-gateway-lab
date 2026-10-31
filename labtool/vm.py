@@ -60,7 +60,7 @@ K3S_INSTALL_URL = "https://get.k3s.io"
 IP_LOOKUPS = ["http://checkip.amazonaws.com", "http://api.ipify.org"]
 UNRETAINED_PREFIXES = [f"{s}/" for s in render.VM_STORES if s not in render.RETAINED_STORES]
 # .env に provision が書く項目（managed の down で消す）
-PROVISIONED_ENV_KEYS = ["LAB_VM_NODES", "LAB_VM_BUCKET", "LAB_VM_ENTRY_IP_ID", "LAB_VM_PROXY_NODE", "LAB_EGRESS_PROXY",
+PROVISIONED_ENV_KEYS = ["LAB_VM_NODES", "LAB_VM_WORKER_NODES", "LAB_VM_BUCKET", "LAB_VM_ENTRY_IP_ID", "LAB_VM_PROXY_NODE", "LAB_EGRESS_PROXY",
                         "LAB_EGRESS_PROXY_MAC", "LAB_EGRESS_CA_FILE", render.GCS_REGISTRY_KEY_ENV,
                         "LAB_VM_BASTION_HOST", "LAB_VM_BASTION_CIDR", "LAB_ZABBIX_SERVER", "LAB_ZABBIX_API_TOKEN",
                         "LAB_ZABBIX_ADMIN_PASSWORD"]
@@ -98,11 +98,11 @@ def check_upgrade_step(current: str, target: str) -> None:
         raise LabError(f"{current} → {target} はマイナー版を飛ばしています。1 つずつ上げてください（例 v{cur[0]}.{cur[1] + 1}.x+k3s1）")
 
 
-def upgrade_order(node_ids: list[str], entry_holder: str | None, forward_target: str | None = None) -> list[str]:
-    """上げる順。入口（Traefik の Pod）が載る台は最後（Traefik の移動を 1 回にする）。転送先の台はその前（転送の張り直しを 1 回にする）。"""
-    rest = [i for i in node_ids if i not in (entry_holder, forward_target)]
-    tail = [i for i in (forward_target, entry_holder) if i and i in node_ids]
-    return rest + list(dict.fromkeys(tail))
+def upgrade_order(server_ids: list[str], worker_ids: list[str], forward_target: str | None = None) -> list[str]:
+    """上げる順。今の 3 台（server）を先に、足す台（agent）を後に。SSH の転送先の台は 3 台の最後（転送の張り直しを 1 回にする）。
+    Traefik は全台に 1 つずつ（DaemonSet）なので、入口の台を最後にする必要は無くなった（2026-10-31-台の増減とLiteLLMのメモリ）。"""
+    servers = [i for i in server_ids if i != forward_target] + [i for i in server_ids if i == forward_target]
+    return servers + list(worker_ids)
 
 
 def traefik_nodes() -> list[str]:
@@ -269,6 +269,7 @@ def load_infra(env: Env) -> Infra:
     infra = Infra(region=env.vm_region, bucket=env.vm_bucket, entry_ip_id=env.vm_entry_ip_id,
                   bastion_host=env.vm_bastion_host, bastion_cidr=env.vm_bastion_cidr)
     infra.nodes = cloud.describe_nodes(env, env.vm_nodes)
+    infra.workers = cloud.describe_nodes(env, env.vm_worker_nodes, base=clouds.WORKER_INDEX_BASE) if env.vm_worker_nodes else []
     if env.vm_entry_ip_id:
         infra.entry_ip = cloud.describe_entry_ip(env, env.vm_entry_ip_id)
     proxy_id = env.get("LAB_VM_PROXY_NODE")
@@ -321,9 +322,12 @@ def ensure_access(env: Env, forward: bool = True) -> None:
 
 def refresh_public_ips(env: Env, infra: Infra) -> bool:
     """台の公開 IP をクラウドから引き直す（GCP は浮動 IP を取った台の公開 IP が静的 IP に変わる。配備で判明 2026-10-30）。"""
-    fresh = {n.index: n for n in clouds.for_env(env).describe_nodes(env, env.vm_nodes)}
+    cloud = clouds.for_env(env)
+    fresh = {n.index: n for n in cloud.describe_nodes(env, env.vm_nodes)}
+    if infra.workers:
+        fresh.update({n.index: n for n in cloud.describe_nodes(env, [w.id for w in infra.workers], base=clouds.WORKER_INDEX_BASE)})
     changed = False
-    for n in infra.nodes:
+    for n in infra.all_nodes():
         f = fresh.get(n.index)
         if f and f.public_ip and f.public_ip != n.public_ip:
             info(f"{n.id} の公開 IP が {n.public_ip or '(無し)'} → {f.public_ip} に変わりました")
@@ -528,7 +532,7 @@ def egress_values(env: Env, infra: Infra) -> dict[str, str]:
     """初期化スクリプトに渡す中継の値（URL、除外、CA の base64）。中継が無ければ空。"""
     if not env.egress_proxy:
         return {"EGRESS_PROXY": "", "EGRESS_NO_PROXY": "", "EGRESS_CA_B64": ""}
-    no_proxy = render.NODE_NO_PROXY_BASE + "," + env.vm_cidr + "," + ",".join(n.private_ip for n in infra.nodes if n.private_ip)
+    no_proxy = render.NODE_NO_PROXY_BASE + "," + env.vm_cidr + "," + ",".join(n.private_ip for n in infra.all_nodes() if n.private_ip)
     ca = render.egress_ca_text(env)
     return {"EGRESS_PROXY": env.egress_proxy, "EGRESS_NO_PROXY": no_proxy,
             "EGRESS_CA_B64": base64.b64encode(ca.encode()).decode() if ca else ""}
@@ -551,7 +555,7 @@ def firewall_values(env: Env, infra: Infra) -> dict[str, str]:
     if zabbix_host and re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", zabbix_host):
         egress.append(cidr(zabbix_host))
     return {
-        "NODE_IPS": ",".join(n.private_ip for n in sorted(infra.nodes, key=lambda n: n.index) if n.private_ip),
+        "NODE_IPS": ",".join(n.private_ip for n in infra.all_nodes() if n.private_ip),
         "VPC_CIDR": env.vm_cidr, "LB_IP": infra.entry_ip, "HC_RANGES": ",".join(cloud.health_check_ranges(env)),
         "ADMIN_CIDRS": ",".join(admin_cidrs(env, infra)), "EGRESS_CIDRS": ",".join(dict.fromkeys(egress)),
         "POD_CIDR": POD_CIDR, "SVC_CIDR": SVC_CIDR,
@@ -574,10 +578,13 @@ def render_node_init(node: Node, all_nodes: list[Node], pubkey: str, values: dic
     """vm/node-init.sh の @@名前@@ をこの台の値で置き換える。
     values: K3S_VERSION、K3S_TOKEN、EGRESS_*、SSH_USER、nftables（firewall_values）、Zabbix（zabbix_values）。"""
     text = script if script is not None else NODE_INIT_SCRIPT.read_text()
-    ordered = sorted(all_nodes, key=lambda n: n.index)
+    ordered = sorted([n for n in all_nodes if n.role == "server"], key=lambda n: n.index)
     peers = [n.private_ip for n in ordered if n.index != node.index]
+    reserved = render.RESERVED[node.role]
     filled = {
         "NODE_INDEX": str(node.index), "SELF_IP": node.private_ip, "FIRST_IP": ordered[0].private_ip,
+        "ROLE": node.role, "RESERVED": f"cpu={reserved['cpu']},memory={reserved['memory']}",
+        "WORKER_LABEL": f"{render.WORKER_LABEL}=worker",
         "PEER_IPS": " ".join(peers), "NODE_IPS": ",".join(n.private_ip for n in ordered), "REGISTRY_HOST": REGISTRY_HOST,
         "REGISTRY_NODEPORT": str(REGISTRY_NODEPORT), "SSH_PUBKEY": pubkey,
         "K3S_VERSION": "", "K3S_TOKEN": "", "EGRESS_PROXY": "", "EGRESS_NO_PROXY": "", "EGRESS_CA_B64": "", "SSH_USER": "ubuntu",
@@ -595,20 +602,43 @@ def render_node_init(node: Node, all_nodes: list[Node], pubkey: str, values: dic
 
 
 def init_nodes(env: Env, infra: Infra, pubkey: str) -> None:
-    """3 台を 1 番から順に SSH で初期化する（1 番がクラスタを起こし、2・3 番が参加する）。2 回目以降は中継・CA・nftables・
-    Zabbix agent の設定だけ直す。中継を通さないか、まだ中継の VM が無い間は、外へ出る手順（apt、k3s）が失敗するので、
-    中継は先に初期化しておく。"""
+    """今の 3 台を 1 番から順に SSH で初期化し（1 番がクラスタを起こし、2・3 番が参加する）、続けて足す台を順に（k3s の agent として
+    参加する）。2 回目以降は中継・CA・nftables・Zabbix agent・k3s の追加の設定だけ直す。中継を通さないか、まだ中継の VM が無い間は、
+    外へ出る手順（apt、k3s）が失敗するので、中継は先に初期化しておく。足す台は加える前に CPU とメモリを確かめる（足りなければ止める）。"""
     token, version = ensure_cluster_objects(env)
-    wait_ssh(env, infra.nodes, infra)
+    wait_ssh(env, infra.all_nodes(), infra)
+    check_worker_capacity(env, infra)
     common = {"K3S_VERSION": version, "K3S_TOKEN": token, "SSH_USER": env.vm_ssh_user, **egress_values(env, infra),
               **firewall_values(env, infra)}
-    for node in sorted(infra.nodes, key=lambda n: n.index):
+    for node in [*sorted(infra.nodes, key=lambda n: n.index), *sorted(infra.workers, key=lambda n: n.index)]:
         script = render_node_init(node, infra.nodes, pubkey, {**common, **zabbix_values(env, node)})
-        info(f"{node.id}（node{node.index}）を初期化します（SSH）")
+        info(f"{node.id}（{'足す台' if node.role == 'worker' else 'node'}{node.index - clouds.WORKER_INDEX_BASE if node.role == 'worker' else node.index}）"
+             "を初期化します（SSH）")
         out = run_on(env, node, script, timeout=1500)
         tail = out.strip().splitlines()[-1] if out.strip() else ""
         ok(f"{node.id}: {tail}")
         refresh_public_ips(env, infra)   # 止めて起こした台の一時的な外部 IP が変わっていることがある
+
+
+def check_worker_capacity(env: Env, infra: Infra) -> None:
+    """足す台のうち、まだクラスタに入っていない台（/var/lib/lab/ready が無い）の CPU の数とメモリの量を読み、OS と k3s 本体の分を除いて
+    LiteLLM を 1 つも置けなければ止める（変更仕様書 2026-10-31-台の増減とLiteLLMのメモリ N7）。"""
+    cpu_req = render.quantity(render.LITELLM_CPU_REQUEST)
+    mem_lim = render.quantity(env.litellm_memory_limit)
+    short = []
+    for node in infra.workers:
+        out = run_on(env, node, "test -f /var/lib/lab/ready && echo ready; nproc; awk '/^MemTotal:/{print $2}' /proc/meminfo", timeout=30)
+        lines = out.split()
+        if lines and lines[0] == "ready":
+            continue
+        cpus, mem_kib = float(lines[0]), float(lines[1])
+        lack = render.worker_capacity_shortage(cpus, mem_kib * 1024, cpu_req, mem_lim)
+        if lack:
+            short.append(f"{node.id}（CPU {cpus:g} 個、メモリ {mem_kib / 2**20:.1f} GiB）: {lack}足りません")
+    if short:
+        raise LabError("足す台に LiteLLM を 1 つも置けないので、クラスタに加えません（OS と k3s 本体の分 "
+                       f"CPU {render.RESERVED['worker']['cpu']}・メモリ {render.RESERVED['worker']['memory']} を除き、LiteLLM 1 つに "
+                       f"CPU {render.LITELLM_CPU_REQUEST}・メモリ {env.litellm_memory_limit} が要る）:\n  " + "\n  ".join(short))
 
 
 def node_arch(env: Env, node: Node) -> str:
@@ -727,16 +757,19 @@ def proxy_log(env: Env, since: str) -> dict[str, int]:
     return dict(sorted(counts.items(), key=lambda kv: -kv[1]))
 
 
-# ---- アンインストール（provided の down） ----
+# ---- アンインストール（provided の down と、足す台を減らすとき） ----
+UNINSTALL_SCRIPT = ("set +e; /usr/local/bin/k3s-uninstall.sh >/dev/null 2>&1; /usr/local/bin/k3s-agent-uninstall.sh >/dev/null 2>&1; "
+                    "systemctl disable --now zabbix-agent2 keepalived lab-egress >/dev/null 2>&1; "
+                    "nft delete table inet lab >/dev/null 2>&1; rm -f /etc/nftables.conf.lab; "
+                    "rm -f /var/lib/lab/ready /var/lib/lab/hooks.sh /etc/keepalived/keepalived.conf; echo uninstalled")
+
+
 def uninstall(env: Env, infra: Infra) -> None:
     """3 台の k3s と Zabbix agent を外し、nftables の表を消して（用意された VM の元の状態に戻す）、初期化の印を消す。"""
-    script = ("set +e; /usr/local/bin/k3s-uninstall.sh >/dev/null 2>&1; systemctl disable --now zabbix-agent2 keepalived lab-egress >/dev/null 2>&1; "
-              "nft delete table inet lab >/dev/null 2>&1; rm -f /etc/nftables.conf.lab; "
-              "rm -f /var/lib/lab/ready /var/lib/lab/hooks.sh /etc/keepalived/keepalived.conf; echo uninstalled")
-    for node in infra.nodes:
+    for node in infra.all_nodes():
         refresh_public_ips(env, infra)
         if ssh_reachable(env, node):
-            run_on(env, node, script, timeout=600)
+            run_on(env, node, UNINSTALL_SCRIPT, timeout=600)
             info(f"{node.id} の k3s を外しました")
         else:
             warn(f"{node.id} に SSH で届かないので飛ばします")
@@ -752,7 +785,7 @@ def empty_unretained(env: Env) -> None:
 def node_for_k8s_name(infra: Infra, name: str) -> Node:
     addrs = json.loads(output(kc("get", "node", name, "-o", "jsonpath={.status.addresses}")))
     internal = next(a["address"] for a in addrs if a["type"] == "InternalIP")
-    for n in infra.nodes:
+    for n in infra.all_nodes():
         if n.private_ip == internal:
             return n
     raise LabError(f"ノード {name}（{internal}）に当たる VM が見つかりません")
@@ -764,6 +797,97 @@ def k8s_name_for_node(node: Node) -> str:
         if any(a["type"] == "InternalIP" and a["address"] == node.private_ip for a in n["status"]["addresses"]):
             return n["metadata"]["name"]
     raise LabError(f"VM {node.id}（{node.private_ip}）に当たるノードが見つかりません")
+
+
+# ---- 台の増減（変更設計書 .history/2026-10-31-台の増減とLiteLLMのメモリ/ 3 章） ----
+HC_DRAIN_SECONDS = 30    # ヘルスチェック（5〜10 秒 × 2 回）で外れ、GCP の接続の排出（10 秒）が終わるまで
+DRAIN_TIMEOUT = 600
+
+
+def _internal_ip(k8s_node: dict) -> str:
+    return next((a["address"] for a in k8s_node["status"]["addresses"] if a["type"] == "InternalIP"), "")
+
+
+def label_entry_nodes(infra: Infra) -> None:
+    """入口の印（litellm-lab/entry=true）を全台（今の 3 台と、参加した足す台）に付ける。Traefik はこの印のある台にだけ立つ。"""
+    want = {n.private_ip for n in infra.all_nodes()}
+    nodes = json.loads(output(kc("get", "nodes", "-o", "json")))["items"]
+    for n in nodes:
+        name = n["metadata"]["name"]
+        if _internal_ip(n) in want and (n["metadata"].get("labels") or {}).get(render.ENTRY_LABEL) != "true":
+            run(kc("label", "node", name, f"{render.ENTRY_LABEL}=true", "--overwrite"), quiet=True)
+            info(f"ノード {name} に入口の印を付けました")
+
+
+def wait_traefik(infra: Infra, timeout: int = 300) -> None:
+    """Traefik（DaemonSet）が入口の印のある台の数だけ準備できるまで待つ。"""
+    want = len(infra.all_nodes())
+
+    def ready() -> bool:
+        ds = json.loads(output(kc("-n", "kube-system", "get", "ds", "traefik", "-o", "json"), check=False) or "{}")
+        st = ds.get("status") or {}
+        return st.get("desiredNumberScheduled") == want and st.get("numberReady") == want and st.get("updatedNumberScheduled") == want
+    wait_until(timeout, f"Traefik の起動（{want} 台）", ready)
+
+
+def leaving_workers(infra: Infra) -> list[dict]:
+    """クラスタの足す台（litellm-lab/role=worker）のうち、内部 IP が今回の足す台に無いもの（Kubernetes のノード）。"""
+    want = {n.private_ip for n in infra.workers}
+    nodes = json.loads(output(kc("get", "nodes", "-l", f"{render.WORKER_LABEL}=worker", "-o", "json")))["items"]
+    return [n for n in nodes if _internal_ip(n) not in want]
+
+
+def remove_leaving_workers(env: Env, infra: Infra) -> list[str]:
+    """減らした足す台をクラスタから外す（初期化の前に流す。外す台の IP は前回の nftables の「台の一覧」に残っているので、外し終わる
+    まで Pod の通信は切れない）。ヘルスチェックを落として新しい接続を止める → 入口の印を外す → cordon と drain → ノードの削除 →
+    SSH で k3s・Zabbix agent・nftables を外す → Zabbix のホストを消す → managed は VM を消す（provided は担当部署への依頼を出す）。
+    クラスタがまだ無ければ何もしない。外した台の名前を返す。"""
+    if not forward_alive():
+        try:
+            ensure_forward(env, infra)
+        except LabError:
+            return []
+    cloud = clouds.for_env(env)
+    leaving = leaving_workers(infra)
+    managed_vms = [] if env.is_provided else cloud.list_workers(env)
+    removed = []
+    for k in leaving:
+        name, ip = k["metadata"]["name"], _internal_ip(k)
+        vm_node = next((n for n in managed_vms if n.private_ip == ip), None) or Node(
+            id=name, index=clouds.WORKER_INDEX_BASE, private_ip=ip, public_ip="", zone="", role="worker")
+        reachable = ssh_reachable(env, vm_node)
+        info(f"足す台 {name}（{ip}）をクラスタから外します")
+        if reachable:
+            # ロードバランサのヘルスチェック（80）だけを落とす。利用者の 443 は通したまま、新しい接続が来なくなるのを待つ
+            run_on(env, vm_node, "nft insert rule inet lab ingress_filter tcp dport 80 ip saddr @hc drop", timeout=30)
+            info(f"ヘルスチェックを止めました。ロードバランサが外すまで {HC_DRAIN_SECONDS} 秒待ちます")
+            time.sleep(HC_DRAIN_SECONDS)
+        run(kc("label", "node", name, f"{render.ENTRY_LABEL}-"), quiet=True, check=False)
+        run(kc("cordon", name), quiet=True)
+        proc = run(kc("drain", name, "--ignore-daemonsets", "--delete-emptydir-data", f"--timeout={DRAIN_TIMEOUT}s"), check=False)
+        if proc.returncode != 0:
+            raise LabError(f"足す台 {name} の Pod を {DRAIN_TIMEOUT} 秒で逃がせませんでした（PDB か置き場所の不足）。台は残しています。"
+                           f"原因を直して ./lab up を流し直してください（kubectl uncordon {name} で元に戻せます）")
+        run(kc("delete", "node", name, "--wait=true"), quiet=True)
+        if reachable:
+            run_on(env, vm_node, UNINSTALL_SCRIPT, timeout=600)
+        else:
+            warn(f"{name}（{ip}）に SSH で届かないので、k3s・Zabbix agent・nftables はその台に残っています")
+        if env.zabbix_enabled:
+            from . import zabbix
+            for host in zabbix.delete_hosts_by_ip(env, infra, [ip]):
+                info(f"Zabbix のホスト {host} を消しました")
+        removed.append(name)
+        ok(f"足す台 {name} をクラスタから外しました")
+    if not env.is_provided:
+        keep = {n.id for n in infra.workers}
+        extra = [n for n in managed_vms if n.id not in keep]
+        if extra:
+            cloud.remove_workers(env, extra)
+            info(f"足す台の VM {', '.join(n.id for n in extra)} をロードバランサから外して消しました")
+    elif removed:
+        warn("担当部署に、外した台の VM の削除と内部ロードバランサからの登録の解除を頼んでください: " + ", ".join(removed))
+    return removed
 
 
 # ---- k3s の版上げ（1 台ずつ。変更設計書 2026-10-26-k3s版上げ 4 章） ----
@@ -785,7 +909,8 @@ def drain_node(node_name: str) -> None:
 def install_k3s(env: Env, node: Node, version: str) -> None:
     """その台でインストールスクリプトを再実行する（新しい binary を置き、k3s を再起動する）。引数は config.yaml から。
     中継は /etc/environment の値を使う。"""
-    run_on(env, node, f"set -a; . /etc/environment; set +a; curl -sfL {K3S_INSTALL_URL} | INSTALL_K3S_VERSION='{version}' sh -s - server",
+    command = "agent" if node.role == "worker" else "server"   # 足す台の参加先とトークンは config.yaml にある
+    run_on(env, node, f"set -a; . /etc/environment; set +a; curl -sfL {K3S_INSTALL_URL} | INSTALL_K3S_VERSION='{version}' sh -s - {command}",
            timeout=600)
 
 

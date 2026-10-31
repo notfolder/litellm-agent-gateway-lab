@@ -99,7 +99,9 @@
 |---|---|
 | 構築ツールの接続 | `./lab` を流すたびに SSH のポート転送（k3s の 6443 → 127.0.0.1:16443）を確かめて張り直す。`kubectl --context litellm-lab-gcp`（`-ec2`）でクラスタに届く |
 | 自作イメージの更新 | `./lab images` が k3s の台の Docker でビルドしてクラスタの中の registry に push する。Mac の Docker は使わない |
-| Kubernetes（k3s）の版上げ | `./lab upgrade-k8s <版> [--measure]`。1 台ずつ、Traefik（入口）の Pod が載る台は最後。入口は内部ロードバランサなので IP の移動は無く、drain で Traefik が移る間だけ失敗が出る。マイナー版は 1 つずつ |
+| Kubernetes（k3s）の版上げ | `./lab upgrade-k8s <版> [--measure]`。1 台ずつ、今の 3 台が先で足す台が後。Traefik は全台に 1 つずつで、入口は内部ロードバランサなので IP の移動は無い。drain で台を空ける間だけ失敗が出る。マイナー版は 1 つずつ |
+| 台を足す・減らす（処理量の調整） | 足す台（LiteLLM と入口だけ。DB は持たない）を `.env` で増減して `./lab up`。managed は `LAB_VM_WORKERS` の台数、provided は担当部署が作ってロードバランサに登録した VM を `LAB_VM_WORKER_NODES` に足す・外す（外した後の VM の削除と登録の解除は担当部署に頼む）。足す・減らすとも要求の失敗は 0 件（試験済み）。足す台に LiteLLM を 1 つも置けない（CPU とメモリが足りない）ときは加えずに止まる。合図は Zabbix の「CPU / メモリの要求が 90% を超えた」「LiteLLM の自動増減が上限に 15 分張り付いている」「Pending の Pod が 5 分続いている」 |
+| LiteLLM のメモリを変える | `.env` の `LAB_LITELLM_MEMORY_REQUEST` / `LAB_LITELLM_MEMORY_LIMIT` を変えて `./lab up`（か `./lab litellm`）。1 つずつ入れ替わり（要求の失敗 0 件、試験済み）、自動増減の最大数は台ごとの空き ÷ メモリの上限で数え直す。最低の 2 つを置けない値なら変えずに止まる。合図は Zabbix の「メモリが上限の 90% を超えた」と「OOM で落ちたコンテナがある」 |
 | 管理画面と検索アプリ、DB への接続 | 管理系の経路（`/ui`、`/lab-audit/`）は踏み台からだけ通る。Mac からは `./lab forward` で踏み台経由の転送を張り `https://<LAB_LOCAL_HOSTNAME>:18443/ui`。DB は踏み台から SSH で入り `kubectl port-forward svc/litellm-pg-pooler-rw 5432` |
 | 監視（Zabbix） | `./lab zabbix` がホスト・テンプレート・入口の HTTP 監視を API で揃える（冪等）。web は `http://127.0.0.1:18080/`（踏み台経由の転送。Admin のパスワードは `.env` の `LAB_ZABBIX_ADMIN_PASSWORD`）。VM が増えたら agent 2 の自動登録で入る。本番は既存サーバーの宛先と API トークンを `.env` に |
 | 操作者の回線が変わった | managed は `./lab up`（か `./lab cluster`）で 22 の許可（クラウドと nftables）が直る。provided は踏み台から入るので変更不要 |

@@ -1,7 +1,7 @@
 # k3s 同梱の Traefik の設定（LAB_TARGET=aws-ec2。変更設計書 .history/2026-10-25-EC2三台構成/ 2 章、4.6 節）。
 # Mac の traefik-config.yaml との違い:
-# - replica 2。3 台とも server ノードなので「server ノードに置く」では 1 台に寄らず、入口の Pod が載った台が
-#   止まっても Service の宛先が残るように 2 つにする
+# - 全台に 1 つずつ（DaemonSet）。入口の印（litellm-lab/entry=true）のある台にだけ立つ。印は ./lab cluster が全台に付け、足す台を
+#   減らすときに外す（変更設計書 .history/2026-10-31-台の増減とLiteLLMのメモリ/ 4 章）。前は replica 2 の Deployment だった
 # - web（80）は websecure（443）へ転送する。経路（IngressRoute）は websecure 側に TLS 付きで置く（render.tls_ingressroutes）
 # - 入口は内部ロードバランサ → 各台の 80/443 → Traefik の hostPort。ServiceLB（svclb）は使わない（Service は ClusterIP）。
 #   svclb は送信元を自分の Pod の IP に書き換える（MASQUERADE。externalTrafficPolicy: Local でも）ので、Traefik に利用者の IP
@@ -15,7 +15,9 @@ metadata:
 spec:
   valuesContent: |-
     deployment:
-      replicas: 2
+      kind: DaemonSet
+    nodeSelector:
+      litellm-lab/entry: "true"
     service:
       # チャートの版で鍵が違う（k3s 1.35 の 39 は service.type、1.36 の 40 は service.spec.type）ので両方書く。
       # k3s の ServiceLB は注釈でも止める（LoadBalancer のままでも svclb を作らせない。版上げで判明 2026-10-31）
@@ -44,15 +46,6 @@ spec:
             readTimeout: 600s
             writeTimeout: 600s
             idleTimeout: 600s
-    affinity:
-      podAntiAffinity:
-        preferredDuringSchedulingIgnoredDuringExecution:
-          - weight: 100
-            podAffinityTerm:
-              topologyKey: kubernetes.io/hostname
-              labelSelector:
-                matchLabels:
-                  app.kubernetes.io/name: traefik
     # アクセスログ（入口で返した状態コードと、どの Pod に送ったかを残す。502 などの切り分けに使う）
     logs:
       access:

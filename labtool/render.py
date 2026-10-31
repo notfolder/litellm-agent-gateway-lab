@@ -266,7 +266,8 @@ def to_yaml(data: dict, header: str = "") -> str:
     return (f"# {header}\n" if header else "") + body
 
 
-def helm_overrides(env: Env, image_repo: str, image_tag: str, config_hash: str, aws_out: dict | None = None) -> dict:
+def helm_overrides(env: Env, image_repo: str, image_tag: str, config_hash: str, aws_out: dict | None = None,
+                   max_replicas: int | None = None) -> dict:
     """values.yaml に重ねる、環境ごとの値。aws では CloudFormation の出力（aws_out）から接続先を入れる
     （変更仕様書 2026-10-24-AWS構成 2.3 節。差分はここに閉じ込め、values.yaml の骨格は共通）。
     VM の環境（aws-ec2 / gcp-vm）は Kubernetes の中が Mac と同じなので local の値を使い、監査ログのバケットとイメージの取り方だけ変える。"""
@@ -290,6 +291,10 @@ def helm_overrides(env: Env, image_repo: str, image_tag: str, config_hash: str, 
         "envVars": env_vars,
     }
     if not env.is_aws:
+        # LiteLLM のメモリ（.env で変えられる。変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 4 章）と、VM の環境の最大数
+        overrides["resources"] = litellm_resources(env)
+        if max_replicas is not None:
+            overrides["autoscaling"] = {"maxReplicas": max_replicas}
         env_vars.update({
             # Valkey は Sentinel 経由（パスワードは Secret litellm-secrets の REDIS_PASSWORD と REDIS_SENTINEL_PASSWORD）
             "REDIS_SENTINEL_NODES": SENTINEL_NODES,
@@ -646,6 +651,80 @@ def pin_deployments(manifest_text: str, node_selector: dict) -> str:
             d["spec"]["template"]["spec"]["nodeSelector"] = node_selector
     return yaml.safe_dump_all(docs, sort_keys=False)
 
+
+
+# ---- 台の増減と LiteLLM のメモリ（変更設計書 .history/2026-10-31-台の増減とLiteLLMのメモリ/ 4 章） ----
+CONTROL_PLANE_SELECTOR = {"node-role.kubernetes.io/control-plane": "true"}
+WORKER_LABEL = "litellm-lab/role"          # 足す台に k3s が参加のときに付ける（値 worker）
+ENTRY_LABEL = "litellm-lab/entry"          # 入口の印（値 true）。Traefik はこの印のある台にだけ立つ
+LITELLM_PRIORITY_CLASS = "litellm-lab-scalable"
+LITELLM_CPU_REQUEST = "250m"               # litellm/values.yaml と同じ（変えない）
+LITELLM_MIN_REPLICAS = 2
+# OS と k3s 本体の分（kubelet の system-reserved。変更仕様書の決定 12）
+RESERVED = {"server": {"cpu": "500m", "memory": "2Gi"}, "worker": {"cpu": "250m", "memory": "1Gi"}}
+
+_QUANTITY = re.compile(r"^([0-9.]+)([a-zA-Z]*)$")
+_SUFFIX = {"": 1, "m": 1e-3, "k": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "Ki": 2**10, "Mi": 2**20, "Gi": 2**30, "Ti": 2**40}
+
+
+def quantity(value: str) -> float:
+    """Kubernetes の量（250m、2、512Mi、1Gi、8023456Ki）→ 数（CPU は個、メモリはバイト）。"""
+    m = _QUANTITY.match(str(value).strip())
+    if not m or m.group(2) not in _SUFFIX:
+        raise ValueError(f"Kubernetes の量の形が違います: {value!r}")
+    return float(m.group(1)) * _SUFFIX[m.group(2)]
+
+
+def litellm_resources(env: Env) -> dict:
+    """LiteLLM の resources（CPU の予約は今のまま、メモリの予約と上限は .env）。"""
+    req, lim = env.litellm_memory_request, env.litellm_memory_limit
+    if quantity(req) > quantity(lim):
+        raise ValueError(f"LAB_LITELLM_MEMORY_REQUEST（{req}）が LAB_LITELLM_MEMORY_LIMIT（{lim}）より大きい")
+    return {"requests": {"cpu": LITELLM_CPU_REQUEST, "memory": req}, "limits": {"memory": lim}}
+
+
+def litellm_slots(nodes: list[dict], cpu_request: float, memory_limit: float) -> dict[str, int]:
+    """台ごとに置ける LiteLLM の数。nodes は {name, cpu, memory, used_cpu, used_memory}（割り当て可能な量と、LiteLLM 以外の
+    Pod の予約の合計）。min(floor(CPU の空き ÷ CPU の予約), floor(メモリの空き ÷ メモリの上限))、負なら 0。"""
+    out = {}
+    for n in nodes:
+        free_cpu = n["cpu"] - n["used_cpu"]
+        free_mem = n["memory"] - n["used_memory"]
+        # 浮動小数の誤差（0.25 × 4 = 0.9999…）で 1 つ少なく数えないよう、わずかに足してから切り捨てる
+        out[n["name"]] = max(0, min(int(free_cpu / cpu_request + 1e-9), int(free_mem / memory_limit + 1e-9)))
+    return out
+
+
+def worker_capacity_shortage(cpus: float, memory: float, cpu_request: float, memory_limit: float) -> str:
+    """足す台に LiteLLM を 1 つも置けないなら足りない量の説明、置けるなら空。OS と k3s 本体の分（RESERVED["worker"]）を除いて比べる。"""
+    free_cpu = cpus - quantity(RESERVED["worker"]["cpu"])
+    free_mem = memory - quantity(RESERVED["worker"]["memory"])
+    short = []
+    if free_cpu + 1e-9 < cpu_request:
+        short.append(f"CPU が {cpu_request - free_cpu:.2f} 個")
+    if free_mem + 1 < memory_limit:
+        short.append(f"メモリが {(memory_limit - free_mem) / 2**30:.2f} GiB")
+    return "、".join(short)
+
+
+def pin_to_servers(manifest_text: str) -> str:
+    """PostgreSQL（CloudNativePG の Cluster）と Valkey・Sentinel（StatefulSet）を今の 3 台（server）だけに置く指定を差し込む
+    （VM の環境。足す台を減らしても DB のデータを失わない）。"""
+    docs = [d for d in yaml.safe_load_all(manifest_text) if d]
+    for d in docs:
+        if d.get("kind") == "Cluster" and str(d.get("apiVersion", "")).startswith("postgresql.cnpg.io/"):
+            d["spec"].setdefault("affinity", {})["nodeSelector"] = dict(CONTROL_PLANE_SELECTOR)
+        elif d.get("kind") == "StatefulSet":
+            d["spec"]["template"]["spec"]["nodeSelector"] = dict(CONTROL_PLANE_SELECTOR)
+    return yaml.safe_dump_all(docs, sort_keys=False)
+
+
+def litellm_priority_class_manifest() -> str:
+    """LiteLLM の優先度（ほかの Pod の既定 0 より低い。LiteLLM がほかの Pod を退かせることはしない）。"""
+    return yaml.safe_dump({
+        "apiVersion": "scheduling.k8s.io/v1", "kind": "PriorityClass", "metadata": {"name": LITELLM_PRIORITY_CLASS},
+        "value": -100, "preemptionPolicy": "Never", "globalDefault": False,
+        "description": "litellm-lab: 増えた LiteLLM。置き場所が足りないとき、ほかの Pod のために退く"}, sort_keys=False)
 
 # ---- AWS 環境（LAB_TARGET=aws）。変更仕様書 2026-10-24-AWS構成 ----
 # Bedrock のモデル ID の既定（日本内で処理するクロスリージョン推論プロファイル。.env の LAB_BEDROCK_* で変えられる）

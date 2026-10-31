@@ -26,18 +26,18 @@ SCENARIOS = ["pg-switchover", "pg-pod", "pg-node", "valkey-pod", "valkey-node"]
 SCENARIOS_AWS = ["litellm-drain", "aurora-failover", "valkey-failover"]
 # VM 3 台の場面: Mac と同じ場面（ノードの停止は VM の停止）＋ 入口（Traefik の Pod が載る台）の停止。内部ロードバランサが
 # その台を外し、Traefik が別の台に移るまで（変更仕様書 2026-10-31 R22。前は浮動 IP を持つ台の停止）
-SCENARIOS_VM = [*SCENARIOS, "entry-node"]
+SCENARIOS_VM = [*SCENARIOS, "entry-node", "worker-node"]   # worker-node: LiteLLM が載った足す台の停止（足す台があるときだけ）
 SCENARIO_ALIASES = {"eip-node": "entry-node"}   # EC2 版の名前
 # 回復までの時間の合格の目安（秒）。ノードを止める場面は長め（変更仕様書 9.3 節）
 LIMITS = {"pg-switchover": 60, "pg-pod": 60, "pg-node": 120, "valkey-pod": 60, "valkey-node": 120,
-          "litellm-drain": 60, "aurora-failover": 90, "valkey-failover": 90, "entry-node": 60}
+          "litellm-drain": 60, "aurora-failover": 90, "valkey-failover": 90, "entry-node": 120, "worker-node": 120}
 # 直結（比較用）のときだけ、PostgreSQL の primary の切り替えと Pod の削除は 90 秒にする。Pooler は切り替えの間の要求を
 # 待たせて吸収する（2026-10-12 の実測で、どちらも失敗 0 件）が、直結では新しい primary が立つまでの 15〜50 秒が
 # そのまま失敗になり、最後の失敗まで 54〜77 秒だった（変更仕様書 9.3 節の目安を、1 回目の結果を見て見直した）
 DIRECT_LIMITS = {"pg-switchover": 90, "pg-pod": 90}
-# GCP の VM 3 台: 台を止める場面の目安を広げる（ユーザーの判断 2026-10-30: 2A）。入口の台は内部ロードバランサになり
-# 浮動 IP の付け替え（80〜150 秒）が無くなったので、entry-node は共通の目安（2026-10-31）
-GCP_LIMITS = {"pg-node": 180, "valkey-node": 180}
+# GCP の VM 3 台: 台を止める場面の目安を広げる（ユーザーの判断 2026-10-30: 2A）。入口の台（entry-node）と足す台（worker-node）を
+# 止める場面も、ほかの台を止める場面と同じ目安にする（120 秒、GCP は 180 秒。ユーザーの判断 2026-11-01: 1A）
+GCP_LIMITS = {"pg-node": 180, "valkey-node": 180, "entry-node": 180, "worker-node": 180}
 NODE_DOWN_SECONDS = 120
 
 
@@ -301,6 +301,18 @@ def trigger(env: Env, scenario: str, load: Load) -> str:
         load.eip_moved = bool(health) and all(health.values())
         return (f"Traefik の載ったノード {node}（{target.id}）を停止（戻った後のロードバランサの健全性: "
                 f"{sum(health.values())}/{len(health)} 台）")
+    if scenario == "worker-node":
+        # LiteLLM が載った足す台を止める（変更仕様書 2026-10-31-台の増減とLiteLLMのメモリ N13）
+        from . import render
+        workers = output(kc("get", "nodes", "-l", f"{render.WORKER_LABEL}=worker", "-o", "name"), check=False).split()
+        if not workers:
+            raise LabError("足す台がありません（LAB_VM_WORKERS か LAB_VM_WORKER_NODES で足してから流してください）")
+        names = [w.split("/", 1)[1] for w in workers]
+        pods = json_output(kn("get", "pods", "-l", "app.kubernetes.io/name=litellm", "-o", "json"), default={}) or {}
+        on = [p["spec"].get("nodeName") for p in pods.get("items", [])]
+        node = next((n for n in names if n in on), names[0])
+        _stop_node(node, load, env)
+        return f"足す台 {node}（LiteLLM {on.count(node)} つ）を停止"
     raise LabError(f"知らない場面です: {scenario}")
 
 
@@ -370,16 +382,20 @@ def run_scenario(env: Env, scenario: str) -> dict:
 def scenarios_for(env: Env) -> list[str]:
     if env.is_aws:
         return SCENARIOS_AWS
-    return SCENARIOS_VM if env.is_vm else SCENARIOS
+    if env.is_vm:
+        # 足す台の停止は、足す台があるときだけ「all」に入れる
+        return SCENARIOS_VM if env.vm_worker_nodes else [x for x in SCENARIOS_VM if x != "worker-node"]
+    return SCENARIOS
 
 
 def failover(env: Env, scenarios: list[str], audit_check=None) -> None:
     """障害の試験。audit_check(results) を渡すと、監査ログの欠けも照合する。"""
     scenarios = [SCENARIO_ALIASES.get(x, x) for x in scenarios]   # eip-node（EC2 版の名前）→ entry-node
-    bad = [x for x in scenarios if x not in scenarios_for(env)]
+    allowed = SCENARIOS_VM if env.is_vm else scenarios_for(env)
+    bad = [x for x in scenarios if x not in allowed]
     if bad:
         raise LabError(f"LAB_TARGET={env.target} では使えない場面です: {', '.join(bad)}"
-                       f"（使える場面: {', '.join(scenarios_for(env))}）")
+                       f"（使える場面: {', '.join(allowed)}）")
     where = "AWS: Aurora に直結" if env.is_aws else f"DB の接続先: {env.get('LAB_DB_POOLER', 'pooler')}" + (
         f"、{env.target} の VM 3 台" if env.is_vm else "")
     step(f"test-failover 障害の試験（{where}）")
