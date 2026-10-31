@@ -132,7 +132,7 @@ table inet lab {
     tcp dport 22 ip saddr @admins accept
     tcp dport { 80, 443 } ip saddr @internal accept
     tcp dport { 80, 443 } ip saddr @hc accept
-    tcp dport { 6443, 2379, 2380, 10250, ${REGISTRY_NODEPORT} } ip saddr @nodes accept
+    tcp dport { 6443, 2379, 2380, 10250, 10257, 10259, ${REGISTRY_NODEPORT} } ip saddr @nodes accept
     udp dport 8472 ip saddr @nodes accept
     tcp dport 10250 ip saddr ${POD_CIDR} accept
     tcp dport 10050 ip saddr @zabbix accept
@@ -200,10 +200,35 @@ else
   systemctl disable --now zabbix-agent2 >/dev/null 2>&1 || true
 fi
 
+# ---- k3s の追加の設定: コントローラーとスケジューラーの指標を、別の台の zabbix-proxy から読めるように全体で待ち受ける ----
+# （既定は 127.0.0.1。認証と認可は付いたまま。nftables は 3 台と Pod 網からだけ 10257 / 10259 を通す。変更設計書 2026-10-31-Zabbixの監視の一揃い）
+# `+` は config.yaml の同じ引数に足す（置き換えない）
+mkdir -p /etc/rancher/k3s/config.yaml.d
+METRICS_CONF=/etc/rancher/k3s/config.yaml.d/50-lab-metrics.yaml
+METRICS_WANT='kube-controller-manager-arg+:
+  - bind-address=0.0.0.0
+kube-scheduler-arg+:
+  - bind-address=0.0.0.0'
+METRICS_CHANGED=""
+if [ "$(cat "$METRICS_CONF" 2>/dev/null)" != "$METRICS_WANT" ]; then
+  printf '%s\n' "$METRICS_WANT" > "$METRICS_CONF"
+  chmod 600 "$METRICS_CONF"
+  METRICS_CHANGED=1
+fi
+
 if [ -f /var/lib/lab/ready ]; then
   systemctl daemon-reload || true
   if systemctl is-active --quiet docker; then systemctl restart docker || true; fi
-  echo "already initialized (proxy, ca, nftables and zabbix settings refreshed)"; exit 0
+  if [ -n "$METRICS_CHANGED" ] && systemctl is-active --quiet k3s; then
+    # 設定が変わったら k3s を再起動する（コンテナは止まらない）。API の準備を待ってから抜ける（./lab は台を 1 台ずつ流す）
+    systemctl restart k3s
+    for _ in $(seq 1 60); do
+      if /usr/local/bin/k3s kubectl get --raw /readyz >/dev/null 2>&1; then break; fi
+      sleep 5
+    done
+    echo "k3s restarted for the metrics settings"
+  fi
+  echo "already initialized (proxy, ca, nftables, zabbix and k3s settings refreshed)"; exit 0
 fi
 
 # ---- 道具 ----

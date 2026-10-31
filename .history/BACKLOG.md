@@ -58,8 +58,7 @@
 - [ ] `./lab down --all`（provided の全削除）の実機確認（今回は managed の `./lab down` で全部消した。保持（Unlocked）を外してバケットを消す経路は未確認）（追加 2026-10-31、重要 中） 2026-10-31 からはロードバランサ（識別子からたどる）も消す経路が加わった
 - [ ] Zscaler の実物での確認: 明示プロキシの URL と CA を `.env` に入れて `./lab up` が通るか（検証は mitmproxy。Zscaler 固有の挙動（SNI の検査、特定の宛先の除外、認証付きのプロキシ）は未確認）（追加 2026-10-31、重要 中） 本物の Zscaler では cert-manager の DNS-01 の伝搬確認（クラウドの再帰リゾルバに向けてある）と、Zabbix のリポジトリ・Helm チャートの取得が中継を通るかも確かめる
 - [ ] 検証を amd64 の VM でも流す（今回は arm64 だけ。ビルドは VM 上なのでアーキテクチャの違いは `uname -m` の判別だけだが、`google_workspace_mcp` の amd64 のイメージの有無は未確認）（追加 2026-10-31、重要 低）
-- [ ] Zabbix に LiteLLM と PostgreSQL の内部指標を取り込む: LiteLLM の `/metrics` は公式文書が Enterprise の機能と表示しているので無償版で出るか確かめ、出なければ `/health` と監査ログの件数で代える。CloudNativePG（9187）・Pooler（9127）は Zabbix の HTTP agent ＋ Prometheus 前処理で取り込む（NetworkPolicy は `monitoring` の名前空間から通してある）（追加 2026-10-31、重要 中）
-- [ ] Zabbix の「Kubernetes nodes by HTTP」テンプレートは使っていない（チャートの agent を入れると VM の agent 2 と 10050 とノード名が重なる）。ノードの OS の監視は VM の agent 2 の自動登録で足りるか、kubelet の指標（`Kubernetes kubelet by HTTP`。cluster state の LLD が作る）で十分かを運用で見て決める（追加 2026-10-31、重要 低）
+- [ ] Zabbix に LiteLLM の内部指標を取り込む: LiteLLM の `/metrics` は公式文書が Enterprise の機能と表示しているので無償版で出るか確かめ、出なければ `/health` と監査ログの件数で代える。PostgreSQL は CloudNativePG の状態で監視済み（2026-10-31）（追加 2026-10-31、重要 中）
 - [ ] 本物の踏み台での確認: provided の踏み台は操作者が SSH できる前提（`LAB_VM_BASTION_HOST`）。踏み台の SSH が別の経路（Zscaler Private Access など）のときの転送の張り方は未設計（追加 2026-10-31、重要 中）
 - [ ] 入口の台を止める場面（`entry-node`）の回復時間と k3s の版上げの切断時間を AWS（内部 NLB、ヘルスチェック 10 秒 × 2）でも測る（GCP の実測は変更設計書 2026-10-31 15.1 節）（追加 2026-10-31、重要 中）
 

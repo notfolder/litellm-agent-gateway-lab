@@ -1048,6 +1048,66 @@ class CloudLayerTest(unittest.TestCase):
             self.assertEqual(p["spec"]["policyTypes"], ["Ingress"])
             self.assertEqual(p["metadata"]["namespace"], "litellm-lab")
 
+    def test_zabbix_monitoring_specs(self):
+        """監視の一揃い（変更設計書 2026-10-31-Zabbixの監視の一揃い）: 宣言の整合（キーの重複が無い、従属の元がある、トリガーの式が
+        宣言したキーだけを使う）、前処理の形、ダッシュボード、Helm の権限、k3s の追加の設定。"""
+        import re as _re
+        from labtool import vm, zabbix, zabbix_monitors as mon
+        s = mon.k8s_specs()
+        keys = [i["key_"] for i in s["items"]]
+        self.assertEqual(len(keys), len(set(keys)))
+        known = set(keys) | {mon.KSM_MASTER_KEY}
+        for i in s["items"]:
+            if "master" in i:
+                self.assertIn(i["master"], known, i["key_"])
+                self.assertLess(keys.index(i["master"]) if i["master"] in keys else -1, keys.index(i["key_"]), i["key_"])   # 元が先
+        for need in ("lab.k8s.nodes.ready", "lab.k8s.pods.pending", "lab.k8s.containers.oomkilled", "lab.cnpg.last_backup",
+                     "lab.cert.days_left", "lab.k8s.compactor.last_success", "lab.k8s.mem.requests.pct"):
+            self.assertIn(need, keys)
+        for tr in s["triggers"]:
+            self.assertTrue(tr["description"].startswith("litellm-lab: "))
+            for ref in _re.findall(r"/litellm-lab-k8s/([a-z0-9_.]+)", tr["expression"]):
+                self.assertIn(ref, keys, tr["description"])
+        ready = next(i for i in s["items"] if i["key_"] == "lab.k8s.nodes.ready")
+        self.assertEqual(ready["preprocessing"][0]["type"], mon.PP_PROMETHEUS)
+        self.assertEqual(ready["preprocessing"][0]["params"], 'kube_node_status_condition{condition="Ready",status="true"}\nfunction\nsum')
+        hpa = next(i for i in s["items"] if i["key_"] == "lab.k8s.hpa.litellm.max")
+        self.assertTrue(hpa["preprocessing"][0]["params"].endswith("\nvalue\n"))
+        node_trig = next(t for t in s["triggers"] if "Ready のノード" in t["description"])
+        self.assertEqual((node_trig["expression"], node_trig["priority"]), ("last(/litellm-lab-k8s/lab.k8s.nodes.ready)<3", mon.HIGH))
+        http_items = [i for i in s["items"] if i["type"] == mon.T_HTTP]
+        for i in http_items:
+            self.assertTrue(i["url"].startswith("{$KUBE.API.URL}/apis/"))
+            self.assertEqual(i["headers"], mon.BEARER)
+            self.assertNotIn("trends", i)   # 文字列のアイテムに trends は付けられない
+        d = s["discovery"]
+        self.assertEqual(d["rule"]["master"], "lab.k8s.metrics.pods")
+        pkeys = [i["key_"] for i in d["items"]]
+        for tr in d["triggers"]:
+            for ref in _re.findall(r"/litellm-lab-k8s/([^,)]+\])", tr["expression"]):
+                self.assertIn(ref, pkeys, tr["description"])
+        mem_limit = next(i for i in d["items"] if i["key_"].startswith("lab.pod.mem.limit"))
+        self.assertEqual((mem_limit["preprocessing"][0]["error_handler"], mem_limit["preprocessing"][0]["error_handler_params"]), (mon.ON_FAIL_SET, "-1"))
+        self.assertIn("{#CONTAINER}", mon._js_usage("memory"))
+        # ダッシュボード
+        dash = mon.dashboard_spec(["10", "11"], {"lab.k8s.nodes.ready": "1", "lab.k8s.pods.pending": "2"})
+        widgets = dash["pages"][0]["widgets"]
+        self.assertEqual([w["type"] for w in widgets][:2], ["problemsbysv", "problems"])
+        self.assertEqual(sum(1 for w in widgets if w["type"] == "item"), 2)   # 有るアイテムだけ
+        self.assertTrue(all(w["x"] + w["width"] <= 72 for w in widgets))
+        self.assertIn({"type": 1, "name": "ds.0.items.0", "value": "FS [/]: Space: Used, in %"}, [f for w in widgets for f in w["fields"]])
+        # Helm の権限
+        self.assertNotIn("rbac", zabbix.chart_values(VmTargetTest().vm("gcp-vm"), "10.60.0.20:10051"))   # チャートの値では渡さない（YAML が壊れる）
+        role, binding = list(yaml.safe_load_all(zabbix.extra_rbac_manifest()))
+        self.assertEqual({g for r in role["rules"] for g in r["apiGroups"]}, {"metrics.k8s.io", "postgresql.cnpg.io", "cert-manager.io"})
+        self.assertEqual(binding["subjects"], [{"kind": "ServiceAccount", "name": "zabbix-service-account", "namespace": "monitoring"}])
+        # k3s の追加の設定と nftables の 10257 / 10259
+        infra = self.infra("gcp-vm")
+        text = vm.render_node_init(infra.nodes[0], infra.nodes, "k", vm.firewall_values(VmTargetTest().vm("gcp-vm"), infra))
+        for needle in ("/etc/rancher/k3s/config.yaml.d/50-lab-metrics.yaml", "kube-controller-manager-arg+:", "kube-scheduler-arg+:",
+                       "bind-address=0.0.0.0", "systemctl restart k3s", "10257, 10259"):
+            self.assertIn(needle, text)
+
     def test_zabbix_api_and_setup_is_idempotent(self):
         """Zabbix（変更設計書 2026-10-31 7 章）: 偽の JSON-RPC サーバーで、トークンの発行、ホストの作成 → 2 回目は何もしない、
         自動登録のアクションの形、HTTP のアイテムとトリガー、Helm の値。"""

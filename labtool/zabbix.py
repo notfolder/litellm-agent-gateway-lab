@@ -258,6 +258,17 @@ def ensure_http_check(client: ZabbixApi, hostid: str, host: str, name: str, url:
 
 
 # ---- Kubernetes（Helm チャート） ----
+# Zabbix の ServiceAccount に足す読み取りの権限（Metrics API、CloudNativePG、cert-manager。変更設計書 2026-10-31-Zabbixの監視の一揃い 1 章）。
+# チャートの値 rbac.additionalRulesForClusterRole は、テンプレートが字下げせずに埋め込むので YAML が壊れる（1.2.4。配備で判明 2026-10-31）。
+# 別の ClusterRole と ClusterRoleBinding で同じ ServiceAccount に付ける
+EXTRA_RBAC_NAME = "litellm-lab-zabbix-extra"
+EXTRA_RBAC_RULES = [
+    {"apiGroups": ["metrics.k8s.io"], "resources": ["pods", "nodes"], "verbs": ["get", "list"]},
+    {"apiGroups": ["postgresql.cnpg.io"], "resources": ["clusters", "backups"], "verbs": ["get", "list"]},
+    {"apiGroups": ["cert-manager.io"], "resources": ["certificates"], "verbs": ["get", "list"]},
+]
+
+
 def chart_values(env: Env, server: str) -> dict:
     """zabbix-proxy（能動。サーバーは踏み台）と kube-state-metrics。チャートの agent は入れない（VM の agent 2 と重なる）。"""
     return {
@@ -298,6 +309,17 @@ def ensure_chart(env: Env, server: str) -> None:
     ok("Zabbix の Helm チャート（zabbix-proxy、kube-state-metrics）を入れました")
 
 
+def extra_rbac_manifest() -> str:
+    """Zabbix の ServiceAccount（チャートが作る zabbix-service-account）に足す読み取りの権限。"""
+    import yaml
+    role = {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole", "metadata": {"name": EXTRA_RBAC_NAME},
+            "rules": EXTRA_RBAC_RULES}
+    binding = {"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding", "metadata": {"name": EXTRA_RBAC_NAME},
+               "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "ClusterRole", "name": EXTRA_RBAC_NAME},
+               "subjects": [{"kind": "ServiceAccount", "name": SA_SECRET, "namespace": NAMESPACE}]}
+    return yaml.safe_dump_all([role, binding], sort_keys=False)
+
+
 def service_account_token() -> str:
     data = output(kc("-n", NAMESPACE, "get", "secret", SA_SECRET, "-o", "jsonpath={.data.token}"), check=False).strip()
     if not data:
@@ -324,6 +346,8 @@ def setup(env: Env) -> None:
     ensure_autoregistration(client, ACTION_NODES, vm.ZABBIX_NODE_METADATA, groups["vm"], linux)
     ensure_autoregistration(client, ACTION_BASTION, "litellm-lab-bastion", groups["vm"], linux)
     ensure_chart(env, server)
+    from .core import kapply
+    kapply(manifest=extra_rbac_manifest(), namespaced=False)
     proxyid = ensure_proxy(client, PROXY_HOSTNAME)
     k8s_macros = {"{$KUBE.API.URL}": "https://kubernetes.default.svc.cluster.local:443",
                   "{$KUBE.API.TOKEN}": service_account_token(),
@@ -333,6 +357,12 @@ def setup(env: Env) -> None:
     entry = ensure_host(client, ENTRY_HOST, [groups["service"]], [], {}, proxyid, tags={"lab": "entry"})
     for name, path in ENTRY_CHECKS:
         ensure_http_check(client, entry, ENTRY_HOST, name, f"https://{env.hostname}{path}")
+    # 監視の一揃い（変更設計書 2026-10-31-Zabbixの監視の一揃い）: 既定の「Zabbix server」ホストの直し、追加のアイテムとトリガー、ダッシュボード
+    from . import zabbix_monitors as mon
+    if env.zabbix_vm:
+        mon.fix_zabbix_server_host(client)
+    mon.ensure_specs(client)
+    mon.ensure_dashboard(client, list(groups.values()))
     ok(f"Zabbix の設定がそろいました（web: http://127.0.0.1:{env.zabbix_local_port}/ Admin。ホスト: VM {len(infra.nodes)} 台 ＋ 踏み台は自動登録、"
        f"{K8S_HOST}、{ENTRY_HOST}）" if env.zabbix_vm else f"Zabbix の設定がそろいました（{env.zabbix_api_url}）")
 

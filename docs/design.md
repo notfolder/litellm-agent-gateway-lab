@@ -1532,5 +1532,11 @@ spec 12.2 節。静的キーの権限は 21.5 節の表。GCS は「均一なバ
 | VM | agent 2（公式リポジトリ 7.0。arm64 は `ubuntu-arm64/`）を能動で。`HostMetadata=litellm-lab-node`（踏み台は `litellm-lab-bastion`）。自動登録のアクション（条件 24 / 演算子 2）がグループ `litellm-lab/vm` と `Linux by Zabbix agent active` を付ける |
 | k3s | 公式 Helm チャート `zabbix-helm-chrt` 1.2.4（`--repo https://cdn.zabbix.com/zabbix/integrations/kubernetes-helm/7.0`、名前空間 `monitoring`）: zabbix-proxy（能動、サーバーは踏み台）と kube-state-metrics。チャートの agent は入れない（VM の agent 2 と 10050 とノード名が重なる）。ホスト `litellm-lab-k8s`（プロキシ経由、`Kubernetes cluster state by HTTP`、マクロ `{$KUBE.API.URL}` `{$KUBE.API.TOKEN}`（Secret `zabbix-service-account`）`{$KUBE.STATE.ENDPOINT.NAME}=zabbix-kube-state-metrics`） |
 | 入口 | ホスト `litellm-lab-entry`（プロキシ経由）に HTTP agent のアイテム `lab.http[liveliness]` / `lab.http[readiness]`（`https://<ホスト名>/health/*`、1 分、200 以外は値なし）と `nodata(...,180s)=1` のトリガー |
+| 監視の一揃い（`labtool/zabbix_monitors.py`） | ホスト `litellm-lab-k8s` に、kube-state-metrics に従属するアイテム（Ready のノードの数、圧迫・cordon のノードの数、CPU とメモリの要求と割り当て可能な量、Pending の Pod、OOM、LiteLLM の自動増減の現在と上限、litellm-lab の失敗した Job、監査ログの整形の最後の成功と作成時刻）、Kubernetes の API を読む HTTP アイテム（Metrics API、CloudNativePG の Cluster と Backup、cert-manager の Certificate）と従属アイテム、計算アイテム（要求の比、証明書の残り日数）、コンテナの発見ルール（Metrics API。メモリと CPU の使用量・上限・上限比）。トリガーと閾値は `.history/2026-10-31-Zabbixの監視の一揃い/変更仕様書.md` 1 章。差の判定は説明欄の `lab-spec:<ハッシュ>` |
+| 追加の権限 | ClusterRole `litellm-lab-zabbix-extra`（Metrics API、CloudNativePG、cert-manager の読み取り）を ServiceAccount `zabbix-service-account` に付ける（チャートの値の追加の権限は YAML が壊れるので使わない） |
+| 制御部分 | k3s の `/etc/rancher/k3s/config.yaml.d/50-lab-metrics.yaml` でコントローラーとスケジューラーを `bind-address=0.0.0.0` にし（変われば k3s を 1 台ずつ再起動）、nftables で 3 台の間の 10257 / 10259 を通す。テンプレートの発見がコントローラーとスケジューラーのホストを作る |
+| 「Zabbix server」ホスト | 検証のサーバーの既定のホストから `Linux by Zabbix agent` を外す（コンテナの中に agent は居ない）。Zabbix の健全性だけ残る |
+| ダッシュボード | 「litellm-lab」: 深刻度ごとの障害、障害の一覧、ノード数・Pending・PostgreSQL の台数・証明書の残り日数・要求の比、VM の CPU・メモリ・ディスクのグラフ、コンテナのメモリの上限比。宣言のハッシュはグローバルマクロ `{$LAB.DASHBOARD.HASH}` |
+| 障害の知らせ | 検証では送らない（画面だけ）。本番は既存の Zabbix サーバーの通知の設定に任せる |
 | 冪等 | すべて `*.get` → 無ければ `create`、違えば `update`。マクロの更新はこちらが管理する鍵だけ差し替える |
-| 残課題 | LiteLLM の `/metrics`（公式文書では Enterprise）と PostgreSQL の指標（9187）の取り込み、ノードのテンプレートの扱い（`.history/BACKLOG.md`） |
+| 残課題 | LiteLLM の `/metrics`（公式文書では Enterprise）の取り込み（`.history/BACKLOG.md`） |
