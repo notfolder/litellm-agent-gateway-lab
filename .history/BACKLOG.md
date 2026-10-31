@@ -31,15 +31,17 @@
 - [ ] spec 9.3 の未確認: OAuth のコールバックが別 Pod でも成功する、chatgpt/ のトークン共有の競合、入口のタイムアウト、無停止のバージョンアップ、Jev 有無の遅延と負荷時の挙動（追加 2026-10-12、重要 低）
 
 ## AWS 構成
-概要: .history/2026-10-24-AWS構成/変更仕様書.md（ブランチ `feature/aws-target`）
+概要: .history/2026-11-01-0025-AWSアカウント制限とサポート対応/summary.md（ブランチ `feature/aws-target`。仕様と設計は `.history/2026-10-24-AWS構成/`）
 
 - [ ] 変更仕様書の「13. 前提」（リージョン東京、検証の AWS 環境は GOVERNANCE と Google SSO）をユーザーに確認し、確定したら 0.2 の決定事項に移す（追加 2026-10-24、重要 高）
   - 2026-10-24: 回答待ちのまま実装に入った。コードは東京・GOVERNANCE・Google SSO の前提（`.env` で変えられる）
+- [ ] AWS サポートの 3 ケース（179284818700912 アカウントと請求、179285325800171 EC2 の上限、179340373000600 Bedrock の技術ケース）の返答に対応して、計算資源の上限 0 と Bedrock の Error 002 を解除してもらう（追加 2026-11-01、重要 高）
+  - 読み方: `aws support describe-cases --region us-east-1 --include-communications`。11/7 ごろまで返答が無ければ re:Post 投稿か Business Support+ のチャット・電話。経緯は summary.md
 - [ ] AWS に配備して試す（資格情報の用意が先。手順は変更設計書 7 章）: `LAB_TARGET=aws` で `./lab up` → `test-smoke` → `test-idempotency` → `test-audit` → `test-failover`（litellm-drain、aurora-failover、valkey-failover）→ `test-judge`（Haiku 4.5 の審査官の評価セットの差を記録）→ `./lab down` で計算資源を消して作り直し、S3 と Aurora のデータが残ることを確かめる（追加 2026-10-24、重要 高）
-  - 2026-10-24: IAM Identity Center を東京に有効化（単一リージョン、組織インスタンス。Organizations も同時に作成）、利用者 `notfolder` と許可セット `AdministratorAccess`（セッション 12 時間）を作ってアカウントに割り当てた。残りは招待メールの承諾・MFA、`aws configure sso`、Bedrock のモデルアクセス
-  - 2026-10-24: `aws configure sso`（プロファイル `litellm-lab`）まで完了。Bedrock はアカウント全体が `Error 002: Access to Bedrock models is not allowed for this account`（Nova でも、東京・バージニアでも同じ。SCP は既定のみ）で、Anthropic の利用目的フォームも「not authorized」。サポートケース 179284818700912（アカウントと請求 / Account / Other Account Issues、英語、ウェブ）で解除を依頼中。解除後に利用目的フォーム（個人開発者、GitHub の URL、Software as a Service、Internal users）を送り直す
-  - 2026-10-24 23:48: 配備は CloudFormation の 4 スタックまで通った（cert は ACM 発行済み、Cloudflare に検証用 CNAME 追加済み、network、data）。EKS のノードが EC2 の vCPU 上限 0（オンデマンド Standard・スポットとも。既定は 5）で起動できず `FleetQuotaExceeded`。Service Quotas に 16 vCPU の引き上げを申請（ID 4a733396241d475f8b46f02a9a2973f8cLD9swzf、PENDING）。待つ間は `./lab down` で compute だけ削除済み（cert・network・data は残る）。支払いカードの期限切れを更新済み（反映に最長 1 日）。承認されたら `./lab up` で EKS から再開 → ALB の DNS 名を Cloudflare に CNAME（DNS のみ）で追加
-  - 2026-10-25 00:19: ユーザー指示「`./lab down` で消えない有料リソースがあるのは困る」により、`./lab down` を「compute・data・network のスタックと残留物（S3、秘密情報、スナップショット、ECR、EFS、ロググループ）をすべて消す」に変更（コミット b60c0f9）。実機で流して、AWS に残るのは cert の ACM 証明書（無料）、CDK の bootstrap（CDKToolkit。数 KB の S3 と空の ECR）、Identity Center、Cloudflare の CNAME だけになったことを確認。再開時は `./lab up` が 4 スタックの作成からやり直す（bootstrap と証明書は済んでいる）
+  - 再開手順: 実績用 ElastiCache を消す → Anthropic の利用目的フォームを送り直す → `./lab up`（bootstrap と ACM 証明書は済み）→ Cloudflare に ALB の CNAME（DNS のみ）
+- [ ] Business Support+ のトライアルを Basic に戻す（10/31 加入。60 日を過ぎると月 29 ドル。制限が先に解ければその時点で）（追加 2026-11-01、期限 2026-12-28、重要 高）
+- [ ] 11 月分の請求明細で Business Support+ の請求と返金（マイナス計上）が出ているか確かめる（10 月分の日割りが 2 か月の 1 か月目に数えられていないかも）（追加 2026-11-01、期限 2026-12-10、重要 低）
+- [ ] 制限の解除後に、実績用の ElastiCache `litellm-lab-activity`（約 15 ドル/月）を消す: `aws elasticache delete-replication-group --replication-group-id litellm-lab-activity` → `delete-cache-subnet-group`（既定 VPC は残してよい）（追加 2026-11-01、重要 高）
 - [ ] Pod Identity のロールごとの権限（許した操作ができ、許していない操作が拒否される）を、クラスタの中で各 ServiceAccount の Pod から試す試験を `./lab test-audit` に足す（Mac からは IAM ロールを借りられないので今は省いている。変更設計書 10 章）（追加 2026-10-24、重要 中）
 - [ ] Codex 用のモデル（Bedrock Mantle の gpt-oss か GPT-5.x、Bedrock の Claude の変換経由、Azure OpenAI）を決める。決まるまで AWS でも `chatgpt/` を使う（トークンは EFS の PVC で共有）（追加 2026-10-24、重要 中）
 - [ ] 配備の後、AWS の試験の結果と費用の実測を変更設計書に書き足し、変更仕様書 12 章・変更設計書 12 章の表に従って `docs/spec.md` と `docs/design.md` に反映する（追加 2026-10-24、重要 中）
@@ -47,7 +49,7 @@
 ## VM 3 台構成（`LAB_TARGET=aws-ec2` / `gcp-vm`）
 概要: .history/2026-10-31-1220-内部LBとVM側の防御とZabbix/summary.md（ブランチ `feature/aws-ec2-pair`。ワークツリー `~/orca/workspaces/litellm-agent-gateway-lab/feature-aws-target-2`）
 
-- [x] (2026-11-01) 障害の試験の `entry-node`（Traefik の載った台を止める）と `worker-node`（足す台を止める）の目安を決めて反映する — ほかの台を止める場面と同じ 120 秒、GCP 180 秒（ユーザーの判断 1A）。（GCP の実測: entry-node 131.5 秒、worker-node 61.9 秒。どちらも目安 60 秒。案: 台の停止と同じ 120 / 180 秒、primary を先に移す手順、そのまま。`labtool/failover.py` の `LIMITS`、変更仕様書 2026-10-31 R22、変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 7 章）（追加 2026-10-31、重要 高）
+- [ ] orca の作業ツリー `~/orca/workspaces/litellm-agent-gateway-lab/feature-aws-target-2` とローカルブランチ `feature/aws-ec2-pair` を消す（PR #6 で main に取り込み済み、未コミットの変更なし）。11/1 時点でそこで Claude のセッションが動いているので、ユーザーがそのセッションを閉じて「消して」と伝えてから消す（`git worktree remove` → `git branch -d`）（追加 2026-11-01、重要 低）
 - [ ] Mac の k3d を `core.K3S_IMAGE` v1.36.5-k3s1 で作り直して試験が通ることを確かめる（GCP の版上げの計測の後に上げた。k3d では未確認）（追加 2026-10-31、重要 低）
 
 - [ ] k3s の版上げの試験の残り（`.history/2026-10-26-k3s版上げ/変更仕様書.md` 4 章）: パッチの更新、飛ばす・下げる指示、途中で止めて再実行、上げた後の `./lab up`、1 台の作り直し、足す台がある構成（agent の入れ直し。2026-10-31 に実装、未計測）。GCP の v1.35.5 → v1.36.5 の `--measure`（3 台 235 秒、失敗 593/4,680 件、幅 88.3 秒）と Traefik のチャート 40 への対処は 2026-10-31 に済み（変更設計書 2026-10-31 15.1 節）（追加 2026-10-26、重要 高）
