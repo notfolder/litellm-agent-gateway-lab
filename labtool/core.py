@@ -41,7 +41,7 @@ NS = "litellm-lab"
 HELM_RELEASE = "litellm"
 LITELLM_CHART = "oci://ghcr.io/berriai/litellm-helm"
 DEFAULT_LITELLM_VERSION = "v1.104.2"
-K3S_IMAGE = "rancher/k3s:v1.35.5-k3s1"
+K3S_IMAGE = "rancher/k3s:v1.36.5-k3s1"
 
 # イメージの置き場（クラスタとは別に作り、クラスタを消しても残す）
 REGISTRY_NAME = "litellm-registry.localhost"  # 自作イメージを push する
@@ -311,6 +311,11 @@ class Env:
     def vm_bastion_host(self) -> str:
         """踏み台の SSH の宛先（公開 IP かホスト名。managed は provision が中継の VM の公開 IP を書く）。"""
         return self.get("LAB_VM_BASTION_HOST", "").strip()
+
+    @property
+    def vm_bastion_ssh_user(self) -> str:
+        """踏み台の SSH の利用者（空なら VM と同じ）。"""
+        return self.get("LAB_VM_BASTION_SSH_USER", "").strip() or self.vm_ssh_user
 
     @property
     def vm_bastion_cidr(self) -> str:

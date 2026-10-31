@@ -956,9 +956,11 @@ def destroy(env: Env) -> None:
     _delete_load_balancer(env, None)
     ids = [_to_node(i).id for i in _instances(env)] + [_to_node(i).id for i in _instances(env, role="proxy")]
     _delete_instances(env, ids)
-    for role_name in [f"projects/{project}/roles/{names['node_role']}",
+    from google.api_core import exceptions as gexc
+    for role_name in [f"projects/{project}/roles/{names['node_role']}",   # 前の版の VM 用ロール（残っていれば）
                       *(_custom_role_name(env, r) for r in CUSTOM_ROLES)]:
-        with contextlib.suppress(_NotFound()):
+        # 削除済み（7 日は残る）のロールをもう一度消すと FailedPrecondition（already deleted）になる（配備で判明 2026-10-31）
+        with contextlib.suppress(gexc.NotFound, gexc.FailedPrecondition):
             iam.delete_role(request={"name": role_name})
     fws = compute.FirewallsClient()
     for key in ("fw_web", "fw_internal", "fw_ssh", "fw_proxy", "fw_egress_deny", "fw_egress_internal"):

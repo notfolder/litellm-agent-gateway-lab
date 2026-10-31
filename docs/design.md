@@ -1504,16 +1504,31 @@ spec 12.2 節。静的キーの権限は 21.5 節の表。GCS は「均一なバ
 
 ### 21.10 配備と試験の結果（GCP、2026-10-31）
 
-`LAB_TARGET=gcp-vm`、managed で中継の VM を作り（`LAB_EGRESS_PROXY_VM=true`）、3 台の直接の外向きを遮断し、Mac も中継経由。AWS は EC2 の vCPU 上限で未配備。詳細と手戻りは `.history/2026-10-30-既存資源からの構築と出口プロキシ/変更設計書.md` 14 章。
+`LAB_TARGET=gcp-vm`、managed で中継（踏み台、Zabbix サーバー）の VM を作り（`LAB_EGRESS_PROXY_VM=true`、`LAB_ZABBIX_VM=true`）、Mac も中継経由。
+3 台の直接の外向きは nftables が遮断。AWS は EC2 の vCPU 上限で未配備。手戻りと詳細は `.history/2026-10-31-内部LBとVM側の防御とZabbix/変更設計書.md` 15 章
+（それ以前の配備は `.history/2026-10-30-既存資源からの構築と出口プロキシ/変更設計書.md` 14 章）。
 
 | 試験 | 結果 |
 |---|---|
-| `./lab up`（managed） | 14 回目で全段階を通過（手戻り 13 件: GCS の均一アクセスと IAM の条件、SA 直後の 404、削除済みロール、SSH の banner、mitmproxy 10 の証明書、Mac の CA、公開 IP の問い合わせ、ホスト鍵、転送の順、tar の形式、registry の OOM、ビルドへの中継、GCS の保持ヘッダ、操作者の IAM）。最後の 1 回は約 15 分 |
-| 外向きの遮断 | 台からの直接の HTTPS はタイムアウト、中継経由は通る。中継の記録に、バケット・Google の API・イメージの置き場・apt・pip・Let's Encrypt・Cloudflare・k3s・Helm のチャートの全部が現れた |
-| `./lab up`（provided に切り替え） | 何も作らず全段階を 89 秒で通過 |
+| `./lab up`（managed） | 13 回目で全段階を通過（手戻り 12 件: 踏み台の 3128、Zabbix の arm64 リポジトリと設定、docker0 の転送、NetworkPolicy の移行 Job、DNS のキャッシュ、cert-manager の再帰リゾルバ、Mac の CA の束、Zabbix のサインインとセッション、helm の `--ca-file`、ServiceLB の送信元）。最後の 1 回は約 13 分 |
+| VM 側の守り | 台から別の台の 22 は拒否、10250 / 6443 は通る。直接の外向き HTTPS はタイムアウト、中継経由は 200。管理系の経路は台からロードバランサ経由で 403、踏み台と Mac（踏み台経由）から 307。`/v1/models` はどこからも 401（キー無し）。ラベル無しの Pod から Pooler・PostgreSQL・Valkey へ届かず、LiteLLM からは届く |
+| Zabbix | 6 ホスト（VM 3 台と踏み台は自動登録、Kubernetes、入口）すべてに最新値。web は踏み台経由の転送口 |
 | `test-smoke` | 75 件すべて OK |
-| `test-idempotency` | 62 項目を比較して 2 回目で変化なし（142 秒） |
-| `test-audit` | 32 件中 31 件 OK（NG は Gmail 未サインインの「MCP の記録」）。原本と閲覧記録はどの資格情報でも消せない（オブジェクト単位の保持） |
-| `test-failover` | pg-switchover 0 / pg-pod 0 / pg-node 111.9 秒 / valkey-pod 0 / valkey-node 0 は目安の中。**entry-node は 227.2 秒と 139.7 秒で目安（120 秒）を超えた**（中継なしの前回は 76.8 / 87.5 秒）。監査ログの欠けは 0〜27 件（上限 240） |
-| VM 上のビルド | LiteLLM と監査アプリのイメージを node1（arm64）の Docker でビルドして push（Mac の Docker 無し） |
-| 片付け | provided の `./lab down`: 3 台の k3s を外し、保持の無いディレクトリの 468 版を消した（VM・バケット・浮動 IP は残る）。managed の `./lab down`: バケット（保持を外して 804 版）、サービスアカウント、VM 4 台、カスタムロール、ファイアウォール、ネットワーク、静的 IP がすべて消え、API での確認で有料の物は残っていない |
+| `test-idempotency` | 64 項目を比較して 2 回目で変化なし（2 回目は 148 秒） |
+| `test-audit` | 32 件中 31 件 OK（NG は Gmail 未サインインの「MCP の記録」）。ローリング更新の間の要求 99 件は欠け 0 件 |
+| `test-failover` | pg-switchover 0 / pg-pod 0 / pg-node 123.8 秒（目安 180）/ valkey-pod 0 / valkey-node 0。**entry-node（Traefik の載った台を停止）は回復まで 131.5 秒、失敗が続いた時間 82.1 秒で目安 60 秒を超過**。止めた台に PostgreSQL のレプリカ・Valkey の primary・LiteLLM の Pod も載り、503（DB と Valkey の切り替え）と 502 が混ざる。監査ログの欠けは 6 場面とも 0 件 |
+| `./lab down`（provided）→ `./lab up`（provided） | down は k3s と agent を外し保持の無いディレクトリの 332 版を消す。up は何も作らず、踏み台経由の SSH で全段階を通過（流し直しは 163 秒） |
+| `./lab upgrade-k8s v1.36.5+k3s1 --measure` | 3 台が 235 秒で上がった（1 台 70〜80 秒。Traefik の台が最後）。要求 4,680 件のうち失敗 593 件（状態 0 / 503）、失敗が散らばった幅 88.3 秒。k3s 1.36 の Traefik チャート（40）は Service の鍵が変わるので両方書く |
+| 片付け | provided の `./lab down` → managed の `./lab down`（ロードバランサの部品、VM 4 台、バケット、SA、ロール、ネットワーク）。結果は変更設計書 15.1 節 |
+
+### 21.11 監視（Zabbix。`labtool/zabbix.py`、`./lab zabbix`）
+
+| 部品 | 内容 |
+|---|---|
+| サーバー | managed（`LAB_ZABBIX_VM=true`）: 踏み台の VM に Docker Compose（`postgres:16-alpine`、`zabbix-server-pgsql:ubuntu-7.0-latest`、`zabbix-web-nginx-pgsql:ubuntu-7.0-latest`）。web は 127.0.0.1:8080 だけに開き、Mac は転送口 `http://127.0.0.1:18080/`。provided: 既存サーバー（`LAB_ZABBIX_SERVER`、`LAB_ZABBIX_API_URL`、`LAB_ZABBIX_API_TOKEN`） |
+| 初回の設定 | Admin の初期パスワードを変え（`.env` の `LAB_ZABBIX_ADMIN_PASSWORD`）、API トークンを作って `.env` に書く。パスワードを変えるとセッションが切れるので入り直す。失敗の文言は小文字で判定し、違うと分かったら止める（5 回でブロック） |
+| VM | agent 2（公式リポジトリ 7.0。arm64 は `ubuntu-arm64/`）を能動で。`HostMetadata=litellm-lab-node`（踏み台は `litellm-lab-bastion`）。自動登録のアクション（条件 24 / 演算子 2）がグループ `litellm-lab/vm` と `Linux by Zabbix agent active` を付ける |
+| k3s | 公式 Helm チャート `zabbix-helm-chrt` 1.2.4（`--repo https://cdn.zabbix.com/zabbix/integrations/kubernetes-helm/7.0`、名前空間 `monitoring`）: zabbix-proxy（能動、サーバーは踏み台）と kube-state-metrics。チャートの agent は入れない（VM の agent 2 と 10050 とノード名が重なる）。ホスト `litellm-lab-k8s`（プロキシ経由、`Kubernetes cluster state by HTTP`、マクロ `{$KUBE.API.URL}` `{$KUBE.API.TOKEN}`（Secret `zabbix-service-account`）`{$KUBE.STATE.ENDPOINT.NAME}=zabbix-kube-state-metrics`） |
+| 入口 | ホスト `litellm-lab-entry`（プロキシ経由）に HTTP agent のアイテム `lab.http[liveliness]` / `lab.http[readiness]`（`https://<ホスト名>/health/*`、1 分、200 以外は値なし）と `nodata(...,180s)=1` のトリガー |
+| 冪等 | すべて `*.get` → 無ければ `create`、違えば `update`。マクロの更新はこちらが管理する鍵だけ差し替える |
+| 残課題 | LiteLLM の `/metrics`（公式文書では Enterprise）と PostgreSQL の指標（9187）の取り込み、ノードのテンプレートの扱い（`.history/BACKLOG.md`） |

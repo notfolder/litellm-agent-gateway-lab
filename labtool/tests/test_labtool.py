@@ -818,6 +818,25 @@ class CloudLayerTest(unittest.TestCase):
         infra.bastion_cidr = "10.60.0.21/32"
         self.assertEqual(vm.admin_cidrs(env, infra), ["10.60.0.21/32", "203.0.113.5/32"])   # 基盤の値が .env より優先
 
+    def test_ssh_goes_through_the_bastion_in_provided(self):
+        """provided では 3 台の 22 は踏み台からだけ通るので、SSH は踏み台を ProxyCommand で経由して内部 IP に届く。
+        managed と踏み台そのものは直接（2026-10-31 に判明）。"""
+        from labtool import clouds, vm
+        node = clouds.Node(id="asia-northeast1-b/n1", index=1, private_ip="10.60.0.10", public_ip="35.0.0.1", zone="z")
+        prov = VmTargetTest().vm("gcp-vm", LAB_INFRA="provided", LAB_VM_BASTION_HOST="203.0.113.9", LAB_VM_BASTION_CIDR="10.60.0.20/32")
+        cmd = vm.ssh_base(prov, node)
+        self.assertEqual(cmd[-1], "ubuntu@10.60.0.10")
+        proxy = next(a for a in cmd if a.startswith("ProxyCommand="))
+        self.assertIn("ubuntu@203.0.113.9", proxy)
+        self.assertIn("-W %h:%p", proxy)
+        self.assertIn("HostKeyAlias=bastion", proxy)
+        self.assertEqual(vm.ssh_base(VmTargetTest().vm("gcp-vm"), node)[-1], "ubuntu@35.0.0.1")   # managed は直接
+        bastion = clouds.Node(id="bastion", index=0, private_ip="10.60.0.20", public_ip="203.0.113.9", zone="")
+        self.assertEqual(vm.ssh_base(prov, bastion)[-1], "ubuntu@203.0.113.9")
+        self.assertFalse(any(a.startswith("ProxyCommand=") for a in vm.ssh_base(prov, bastion)))
+        other = VmTargetTest().vm("gcp-vm", LAB_INFRA="provided", LAB_VM_BASTION_HOST="jump.example.test", LAB_VM_BASTION_SSH_USER="ops")
+        self.assertIn("ops@jump.example.test", next(a for a in vm.ssh_base(other, node) if a.startswith("ProxyCommand=")))
+
     def test_cloudflare_zone_candidates(self):
         """A レコードを作るときのゾーン名の候補: ホスト名から長い順に、TLD だけは除く。"""
         from labtool import vm

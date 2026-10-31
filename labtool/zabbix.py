@@ -284,7 +284,14 @@ def ensure_chart(env: Env, server: str) -> None:
     if current.get("labValuesHash") == values_hash:
         ok(f"Zabbix の Helm のリリースは最新です（値のハッシュ {values_hash}）")
         return
-    # リポジトリは登録せず --repo で直接取る（helm repo update は --ca-file を受けない。stages._ensure_chart と同じ形）
+    # リポジトリは登録せず --repo で直接取る（helm repo update は --ca-file を受けない。stages._ensure_chart と同じ形）。
+    # 前の版が登録した同じ URL のリポジトリが残っていると、helm がそこに保存した古い CA のパスを使って失敗するので消す（2026-10-31）
+    repos = output(helm("repo", "list", "-o", "json"), check=False)
+    if CHART_REPO in repos:
+        import json as _json
+        for r in _json.loads(repos):
+            if r.get("url", "").rstrip("/") == CHART_REPO.rstrip("/"):
+                run(helm("repo", "remove", r["name"]), quiet=True, check=False)
     run(helm("upgrade", "--install", RELEASE, CHART, "--repo", CHART_REPO, "--version", CHART_VERSION,
              "-n", NAMESPACE, "--create-namespace", "-f", str(values_file), "--set-string", f"labValuesHash={values_hash}",
              "--wait", "--timeout", "10m"))

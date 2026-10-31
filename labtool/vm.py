@@ -164,15 +164,39 @@ def ensure_ssh_key(env: Env) -> str:
     return output(["ssh-keygen", "-y", "-f", str(key)]).strip()
 
 
+def via_bastion(env: Env, node: Node) -> bool:
+    """3 台への SSH を踏み台経由（ProxyCommand）にするか。provided では VM の 22 は踏み台からだけ通る（nftables）ので、
+    3 台には踏み台を経由して内部 IP で届く（公開 IP が無くてもよい）。managed は操作者の IP も通すので直接。
+    踏み台そのもの（index 0）はいつも直接（配備で判明 2026-10-31）。"""
+    return env.is_provided and node.index != 0 and bool(env.vm_bastion_host)
+
+
+def _common_ssh_options(env: Env, alias: str) -> list[str]:
+    # known_hosts は IP でなく台の識別子で引く（台を作り直しても識別子は同じ。公開 IP は止めて起こすと変わる）
+    # 相手が黙って消えたときに待ち続けないよう、生存確認を入れる（nftables を入れた直後に切断を検知できなかった。2026-10-31）
+    return ["-i", str(env.vm_ssh_key), "-o", f"UserKnownHostsFile={KNOWN_HOSTS}", "-o", "StrictHostKeyChecking=accept-new",
+            "-o", f"HostKeyAlias={alias}", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4"]
+
+
 def ssh_base(env: Env, node: Node, *extra: str) -> list[str]:
+    if via_bastion(env, node):
+        if not node.private_ip:
+            raise LabError(f"ノード {node.id} に内部 IP がありません")
+        jump = " ".join(["ssh", *_common_ssh_options(env, "bastion"), "-W", "%h:%p",
+                         f"{env.vm_bastion_ssh_user}@{env.vm_bastion_host}"])
+        return ["ssh", *_common_ssh_options(env, host_alias(node)), "-o", f"ProxyCommand={jump}",
+                *extra, f"{env.vm_ssh_user}@{node.private_ip}"]
     if not node.public_ip:
         raise LabError(f"ノード {node.id} に公開 IP がありません（起動を待つか、外向きの IP を確かめてください）")
-    # known_hosts は IP でなく台の識別子で引く（GCP は浮動 IP を取った台の公開 IP が静的 IP に入れ替わり、障害で別の台に移る）
-    # 相手が黙って消えたときに待ち続けないよう、生存確認を入れる（nftables を入れた直後に切断を検知できなかった。2026-10-31）
-    return ["ssh", "-i", str(env.vm_ssh_key), "-o", f"UserKnownHostsFile={KNOWN_HOSTS}", "-o", "StrictHostKeyChecking=accept-new",
-            "-o", f"HostKeyAlias={host_alias(node)}", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", "-o", "LogLevel=ERROR",
-            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
-            *extra, f"{env.vm_ssh_user}@{node.public_ip}"]
+    return ["ssh", *_common_ssh_options(env, host_alias(node)), *extra, f"{env.vm_ssh_user}@{node.public_ip}"]
+
+
+def ssh_reachable(env: Env, node: Node) -> bool:
+    """SSH でログインできるか（直接なら先に 22 が開いているかを見る。踏み台経由ならログインだけ）。"""
+    if via_bastion(env, node):
+        return bool(node.private_ip) and _ssh_ok(env, node)
+    return bool(node.public_ip) and _port_open(node.public_ip, 22) and _ssh_ok(env, node)
 
 
 def host_alias(node: Node) -> str:
@@ -268,8 +292,7 @@ def bastion_node(infra: Infra) -> Node:
         return infra.proxy
     if not infra.bastion_host:
         raise LabError("踏み台がありません（LAB_VM_BASTION_HOST。managed は LAB_EGRESS_PROXY_VM=true で中継の VM が兼ねる）")
-    return Node(id=f"bastion/{infra.bastion_host}", index=0, private_ip=infra.bastion_cidr.split("/")[0],
-                public_ip=infra.bastion_host, zone="")
+    return Node(id="bastion", index=0, private_ip=infra.bastion_cidr.split("/")[0], public_ip=infra.bastion_host, zone="")
 
 
 def try_load_infra(env: Env) -> Infra | None:
@@ -330,7 +353,7 @@ def _ssh_ok(env: Env, node: Node) -> bool:
 
 def wait_ssh(env: Env, nodes: list[Node], infra: Infra | None = None, timeout: int = 600) -> None:
     def reachable() -> bool:
-        if all(n.public_ip and _port_open(n.public_ip, 22) and _ssh_ok(env, n) for n in nodes):
+        if all(ssh_reachable(env, n) for n in nodes):
             return True
         if infra is not None:
             refresh_public_ips(env, infra)
@@ -374,7 +397,7 @@ def ensure_forward(env: Env, infra: Infra, avoid: str | None = None) -> None:
     if forward_alive() and (avoid is None or forward_target() != avoid):
         return
     refresh_public_ips(env, infra)
-    nodes = [n for n in infra.nodes if n.id != avoid and n.public_ip and _port_open(n.public_ip, 22) and _ssh_ok(env, n)]
+    nodes = [n for n in infra.nodes if n.id != avoid and ssh_reachable(env, n)]
     if not nodes:
         raise LabError("SSH で届くノードがありません（./lab cluster で作るか、起動を待ってください）")
     # 止めるのは 6443 の転送だけ（入口と Zabbix の転送は踏み台経由で別。障害の試験で台を止めるたびに入口の転送まで
@@ -715,7 +738,7 @@ def uninstall(env: Env, infra: Infra) -> None:
               "rm -f /var/lib/lab/ready /var/lib/lab/hooks.sh /etc/keepalived/keepalived.conf; echo uninstalled")
     for node in infra.nodes:
         refresh_public_ips(env, infra)
-        if node.public_ip and _port_open(node.public_ip, 22) and _ssh_ok(env, node):
+        if ssh_reachable(env, node):
             run_on(env, node, script, timeout=600)
             info(f"{node.id} の k3s を外しました")
         else:
