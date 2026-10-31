@@ -45,9 +45,12 @@
 - [ ] 配備の後、AWS の試験の結果と費用の実測を変更設計書に書き足し、変更仕様書 12 章・変更設計書 12 章の表に従って `docs/spec.md` と `docs/design.md` に反映する（追加 2026-10-24、重要 中）
 
 ## VM 3 台構成（`LAB_TARGET=aws-ec2` / `gcp-vm`）
-概要: .history/2026-10-30-既存資源からの構築と出口プロキシ/変更設計書.md 14 章（ブランチ `feature/aws-ec2-pair`。ワークツリー `~/orca/workspaces/litellm-agent-gateway-lab/feature-aws-target-2`）
+概要: .history/2026-10-31-1220-内部LBとVM側の防御とZabbix/summary.md（ブランチ `feature/aws-ec2-pair`。ワークツリー `~/orca/workspaces/litellm-agent-gateway-lab/feature-aws-target-2`）
 
-- [ ] k3s の版上げの試験（`.history/2026-10-26-k3s版上げ/変更仕様書.md` 4 章）: 配備と障害の試験の後に `./lab upgrade-k8s <次のマイナー版> --measure`、パッチの更新、飛ばす・下げる指示、途中で止めて再実行、上げた後の `./lab up`（`K3S_IMAGE` の案内）、1 台の作り直し、AMI の固定の確認（nodes スタックに差分が出ない）。配備で確かめることは変更設計書 6 章（`config.yaml` の `server:` が再起動で無視されるか、drain の時間、`K3S_TOKEN` が消えても server が起きるか、Traefik の値の形、Elastic IP の移動）（追加 2026-10-26、重要 高）
+- [ ] 障害の試験の `entry-node`（Traefik の載った台を止める）の目安を決めて反映する（GCP の実測 131.5 秒、目安 60 秒。案: 台の停止と同じ 120 / 180 秒、primary を先に移す手順、そのまま。`labtool/failover.py` の `LIMITS`、変更仕様書 2026-10-31 R22）（追加 2026-10-31、重要 高）
+- [ ] Mac の k3d を `core.K3S_IMAGE` v1.36.5-k3s1 で作り直して試験が通ることを確かめる（GCP の版上げの計測の後に上げた。k3d では未確認）（追加 2026-10-31、重要 低）
+
+- [ ] k3s の版上げの試験の残り（`.history/2026-10-26-k3s版上げ/変更仕様書.md` 4 章）: パッチの更新、飛ばす・下げる指示、途中で止めて再実行、上げた後の `./lab up`、1 台の作り直し。GCP の v1.35.5 → v1.36.5 の `--measure`（3 台 235 秒、失敗 593/4,680 件、幅 88.3 秒）と Traefik のチャート 40 への対処は 2026-10-31 に済み（変更設計書 2026-10-31 15.1 節）（追加 2026-10-26、重要 高）
 - [ ] AMI を新しくする手順（1 台ずつ作り直す）。`resolve_ami` が配備済みの AMI を固定で返すので、放っておくと AMI が古くなる。案: `./lab upgrade-ami` で台ごとに drain → `recreate_node`（managed）→ SSH で初期化（CloudFormation の 3 台を別々の論理 ID にしてあるので、1 台ずつ `Replace` する手立てが要る）（追加 2026-10-26、重要 低）
 - [ ] 審査官を Claude Haiku 4.5 にしたときの事例試験の不一致 14 事例（社内宛てを止める、設定ファイルを求めない）を見て、審査官の指示文を詰めるか期待値を見直す（`tests/review-scenarios/`。`./lab test-judge` の記録）（追加 2026-10-30、重要 低）
 - [ ] `aws-ec2` の配備と試験（EC2 の vCPU 上限の解除後）。2026-10-31 の変更（provision/setup の分離、1 バケットの Object Lock と IAM の接頭辞のポリシー、キーペアの取り込み、中継の VM とセキュリティグループの egress、S3 ドライバの registry）も AWS では未確認。GCP で直した共通部分（公開 IP の引き直し、known_hosts の識別子、冪等性、監査の試験の入口）は AWS でも効くが、AWS 固有（awscli の snap、netplan の 2 つ目の IP、Elastic IP）は未確認（追加 2026-10-30、重要 高） 2026-10-31 の内部 NLB（固定の内部 IP、ターゲットグループ 2 つ、ヘルスチェック）、ロール無しの EC2、セキュリティグループの単純化も未確認
