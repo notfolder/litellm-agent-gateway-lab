@@ -22,6 +22,12 @@
 
 ## AWS 構成
 
+- [x] (2026-11-03) AWS サポートの 3 ケース（179284818700912、179285325800171、179340373000600）で計算資源の上限 0 と Bedrock の Error 002 を解除してもらい、Anthropic の利用目的フォームを送って Sonnet 4.5・Haiku 4.5 が応答することを確かめ、お礼を返信して 3 件とも閉じた（ユーザー回答 1A）。経緯:
+  - 読み方: `aws support describe-cases --region us-east-1 --include-communications`。11/7 ごろまで返答が無ければ re:Post 投稿か Business Support+ のチャット・電話。経緯は summary.md
+  - 2026-11-01 00:47 JST: 技術ケース 179340373000600 に AI/ML チームの担当者が付き、モデルの利用の申請を社内チームに回した（状態は Amazon の対応待ち）。返答には計算資源の上限 0 への言及が無い。ほかの 2 ケースは担当者が付いていないまま。同日、計算資源の上限 0 も同じ審査に入れるよう技術ケースに返信した
+  - 2026-11-03 18:45 JST: 技術ケースに「Bedrock の利用を戻した」と返信が来た。19:10 に確かめたところ、Bedrock は Sonnet 4.5・Nova Micro が応答し、Haiku 4.5 は Anthropic の利用目的フォームを求められた（送信待ち）。EC2 の上限もオンデマンド 64・スポット 256・Fargate 64 vCPU に戻っていた（上限の申請は CASE_OPENED のまま、ほかの 2 ケースは担当者が付いていないまま）
+  - 2026-11-03 20:21 JST: Anthropic の利用目的フォームをコンソールから送信（ユーザー許可）。15 分後に Sonnet 4.5・Haiku 4.5 とも応答。21:01 にお礼を返信して 3 件を閉じた（上限の申請も CASE_CLOSED）
+- [x] (2026-11-03) 実績用の ElastiCache `litellm-lab-activity` とサブネットグループを削除（制限の解除を受けて。ユーザー回答 2A。既定 VPC は残した）
 - [x] (2026-10-24) ElastiCache の `durability: sync` は `cache.t4g.micro` で使えなかった（Graviton `.large` 以上とクラスターモード有効が必須）。`min-replicas-to-write 1` に変更（ユーザー回答 1A）
 - [x] (2026-10-24) 変更設計書 `.history/2026-10-24-AWS構成/変更設計書.md` を書く
 - [x] (2026-10-24) 実装: `LAB_TARGET` の切り替え、`labtool/aws.py`、`cdk/`、S3 の資格情報チェーンとバケット名の接頭辞、ESO、ALB の Ingress、Bedrock のモデル登録、障害試験の AWS の場面。単体テスト（labtool 52、監査 19、監査ログ 12）と CDK の synth が通り、Mac の `./lab up` を流し直して確認

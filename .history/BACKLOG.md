@@ -34,14 +34,10 @@
 
 - [ ] 変更仕様書の「13. 前提」（リージョン東京、検証の AWS 環境は GOVERNANCE と Google SSO）をユーザーに確認し、確定したら 0.2 の決定事項に移す（追加 2026-10-24、重要 高）
   - 2026-10-24: 回答待ちのまま実装に入った。コードは東京・GOVERNANCE・Google SSO の前提（`.env` で変えられる）
-- [ ] AWS サポートの 3 ケース（179284818700912 アカウントと請求、179285325800171 EC2 の上限、179340373000600 Bedrock の技術ケース）の返答に対応して、計算資源の上限 0 と Bedrock の Error 002 を解除してもらう（追加 2026-11-01、重要 高）
-  - 読み方: `aws support describe-cases --region us-east-1 --include-communications`。11/7 ごろまで返答が無ければ re:Post 投稿か Business Support+ のチャット・電話。経緯は summary.md
-  - 2026-11-01 00:47 JST: 技術ケース 179340373000600 に AI/ML チームの担当者が付き、モデルの利用の申請を社内チームに回した（状態は Amazon の対応待ち）。返答には計算資源の上限 0 への言及が無い。ほかの 2 ケースは担当者が付いていないまま。同日、計算資源の上限 0 も同じ審査に入れるよう技術ケースに返信した
 - [ ] AWS に配備して試す（資格情報の用意が先。手順は変更設計書 7 章）: `LAB_TARGET=aws` で `./lab up` → `test-smoke` → `test-idempotency` → `test-audit` → `test-failover`（litellm-drain、aurora-failover、valkey-failover）→ `test-judge`（Haiku 4.5 の審査官の評価セットの差を記録）→ `./lab down` で計算資源を消して作り直し、S3 と Aurora のデータが残ることを確かめる（追加 2026-10-24、重要 高）
   - 再開手順: 実績用 ElastiCache を消す → Anthropic の利用目的フォームを送り直す → `./lab up`（bootstrap と ACM 証明書は済み）→ Cloudflare に ALB の CNAME（DNS のみ）
 - [ ] Business Support+ のトライアルを Basic に戻す（10/31 加入。60 日を過ぎると月 29 ドル。制限が先に解ければその時点で）（追加 2026-11-01、期限 2026-12-28、重要 高）
 - [ ] 11 月分の請求明細で Business Support+ の請求と返金（マイナス計上）が出ているか確かめる（10 月分の日割りが 2 か月の 1 か月目に数えられていないかも）（追加 2026-11-01、期限 2026-12-10、重要 低）
-- [ ] 制限の解除後に、実績用の ElastiCache `litellm-lab-activity`（約 15 ドル/月）を消す: `aws elasticache delete-replication-group --replication-group-id litellm-lab-activity` → `delete-cache-subnet-group`（既定 VPC は残してよい）（追加 2026-11-01、重要 高）
 - [ ] Pod Identity のロールごとの権限（許した操作ができ、許していない操作が拒否される）を、クラスタの中で各 ServiceAccount の Pod から試す試験を `./lab test-audit` に足す（Mac からは IAM ロールを借りられないので今は省いている。変更設計書 10 章）（追加 2026-10-24、重要 中）
 - [ ] Codex 用のモデル（Bedrock Mantle の gpt-oss か GPT-5.x、Bedrock の Claude の変換経由、Azure OpenAI）を決める。決まるまで AWS でも `chatgpt/` を使う（トークンは EFS の PVC で共有）（追加 2026-10-24、重要 中）
 - [ ] 配備の後、AWS の試験の結果と費用の実測を変更設計書に書き足し、変更仕様書 12 章・変更設計書 12 章の表に従って `docs/spec.md` と `docs/design.md` に反映する（追加 2026-10-24、重要 中）
