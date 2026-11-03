@@ -280,6 +280,10 @@ def helm_overrides(env: Env, image_repo: str, image_tag: str, config_hash: str, 
         "AUDIT_FLUSH_SECONDS": env.get("LAB_AUDIT_FLUSH_SECONDS", "10"),
         # DB 移行は自前の Job で流すので、Pod の起動時には流さない（チャートは移行の Job を使うときしか入れない）
         "DISABLE_SCHEMA_UPDATE": "true",
+        # Redis の遮断器を切る。LiteLLM（1.104〜1.106 で確認）の遮断器は、HALF_OPEN の試しの呼び出しが接続の失敗以外
+        # （降格した旧 primary の READONLY、NOREPLICAS など）で失敗すると成功も失敗も記録せず、HALF_OPEN のまま
+        # Redis への呼び出しを捨て続ける（2026-11-03 の AWS の Valkey のフェイルオーバーで発生。変更設計書 2026-10-24-AWS構成 9.3）
+        "REDIS_CIRCUIT_BREAKER_ENABLED": "false",
     }
     if pooler:
         # PgBouncer の transaction モードでは準備済みの問い合わせを使わない（LiteLLM が URL に pgbouncer=true を足す）
