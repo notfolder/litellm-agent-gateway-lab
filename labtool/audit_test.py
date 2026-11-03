@@ -509,6 +509,9 @@ def failover_audit_check(env: Env):
         for r in results:
             missing = [cid for cid in r["call_ids"] if cid not in got]
             r["audit_missing"] = len(missing)
+            # 欠けた要求の ID と、場面を起こしてからの秒（原因を調べるため。結果のファイルに残る）
+            offsets = r.get("call_offsets", {})
+            r["audit_missing_detail"] = sorted(((offsets.get(c), c) for c in missing), key=lambda x: (x[0] is None, x[0]))[:300]
             allowed = r["scenario"].endswith("-node")
             # ノードを止めた場面: 欠けは止める直前の書き出し前の分に限る（件数の上限で判定。1 秒 20 件 × 間隔）
             limit = int(20 * (flush + 2)) if allowed else 0

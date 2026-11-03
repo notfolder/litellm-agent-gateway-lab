@@ -877,17 +877,22 @@ def nodepool_manifest(env: Env) -> str:
     return yaml.safe_dump(doc, sort_keys=False)
 
 
+EFS_TOKEN_PV = "lab-chatgpt-token"
+
+
 def efs_manifests(out: dict) -> str:
-    """chatgpt/ のトークンを全 Pod で共有する EFS の StorageClass と PVC（アクセスポイントで動的に切り出す）。"""
+    """chatgpt/ のトークンを全 Pod で共有する EFS の PV と PVC。data スタックの固定のアクセスポイントを静的に割り当てる
+    （動的に切り出すと、クラスタを作り直すたびに別の場所になり、LiteLLM が更新したトークンを失う。2026-11-03）。"""
     docs = [
-        {"apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
-         "metadata": {"name": "lab-efs"},
-         "provisioner": "efs.csi.aws.com",
-         "parameters": {"provisioningMode": "efs-ap", "fileSystemId": out["EfsFileSystemId"],
-                        "directoryPerms": "700", "uid": "1000", "gid": "1000", "basePath": "/lab"}},
+        {"apiVersion": "v1", "kind": "PersistentVolume",
+         "metadata": {"name": EFS_TOKEN_PV},
+         "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteMany"],
+                  "persistentVolumeReclaimPolicy": "Retain", "storageClassName": "",
+                  "csi": {"driver": "efs.csi.aws.com",
+                          "volumeHandle": f"{out['EfsFileSystemId']}::{out['EfsTokenAccessPointId']}"}}},
         {"apiVersion": "v1", "kind": "PersistentVolumeClaim",
          "metadata": {"name": "chatgpt-token", "namespace": "litellm-lab"},
-         "spec": {"accessModes": ["ReadWriteMany"], "storageClassName": "lab-efs",
+         "spec": {"accessModes": ["ReadWriteMany"], "storageClassName": "", "volumeName": EFS_TOKEN_PV,
                   "resources": {"requests": {"storage": "1Gi"}}}},
     ]
     return yaml.safe_dump_all(docs, sort_keys=False)

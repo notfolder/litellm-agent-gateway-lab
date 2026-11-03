@@ -10,11 +10,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from . import render
 from .core import (
@@ -386,24 +388,19 @@ def database_resource_id(env: Env, out: dict) -> str:
 
 
 # ---- ChatGPT のトークンを共有ボリュームへ ----
-def sync_chatgpt_token(env: Env) -> None:
-    """Mac の auth.json を、全 Pod で共有する EFS の PVC（chatgpt-token）に写す。使い捨ての Pod でコピーする。
-    写した中身のハッシュを PVC の注釈に残し、同じなら写さない（./lab up を何度流しても何も変えない）。"""
-    import hashlib
-    from .core import NS, kn, output, wait_until
-    token = env.chatgpt_token_file
-    digest = hashlib.sha256(token.read_bytes()).hexdigest()[:32]
-    annotation = "litellm-lab/token-sha256"
-    copied = output(kn("get", "pvc", "chatgpt-token", "-o",
-                       "jsonpath={.metadata.annotations.litellm-lab/token-sha256}"), check=False).strip()
-    if copied == digest:
-        ok("ChatGPT のトークンは共有ボリュームに写し済みです")
-        return
-    pod = "chatgpt-token-sync"
-    run(kn("delete", "pod", pod, "--ignore-not-found", "--wait=true"), quiet=True)
+TOKEN_POD = "chatgpt-token-sync"
+TOKEN_MARK = "/token/.synced-from-mac"     # 最後に Mac から写した auth.json のハッシュ（ボリュームの中に残す）
+TOKEN_ANNOTATION = "litellm-lab/token-sha256"
+
+
+@contextlib.contextmanager
+def _token_pod(env: Env):
+    """共有ボリューム（PVC chatgpt-token）を /token に付けた使い捨ての Pod。終わったら消す。"""
+    from .core import NS, kn, wait_until
+    run(kn("delete", "pod", TOKEN_POD, "--ignore-not-found", "--wait=true"), quiet=True)
     manifest = {
         "apiVersion": "v1", "kind": "Pod",
-        "metadata": {"name": pod, "namespace": NS},
+        "metadata": {"name": TOKEN_POD, "namespace": NS},
         "spec": {"restartPolicy": "Never",
                  "containers": [{"name": "sync", "image": "public.ecr.aws/docker/library/busybox:1.37",
                                  "command": ["sleep", "600"],
@@ -412,13 +409,76 @@ def sync_chatgpt_token(env: Env) -> None:
     }
     run(kn("apply", "-f", "-"), input=json.dumps(manifest), quiet=True)
     try:
-        wait_until(300, "トークンをコピーする Pod の起動", kn("wait", "--for=condition=Ready", f"pod/{pod}", "--timeout=5s"))
-        run(kn("cp", str(token), f"{pod}:/token/auth.json"), quiet=True)
-        run(kn("exec", pod, "--", "chmod", "600", "/token/auth.json"), quiet=True)
-        run(kn("annotate", "pvc", "chatgpt-token", f"{annotation}={digest}", "--overwrite"), quiet=True)
-        ok("ChatGPT のトークンを共有ボリュームに写しました")
+        wait_until(300, "トークンを扱う Pod の起動", kn("wait", "--for=condition=Ready", f"pod/{TOKEN_POD}", "--timeout=5s"))
+        yield TOKEN_POD
     finally:
-        run(kn("delete", "pod", pod, "--ignore-not-found", "--wait=false", "--grace-period=1"), quiet=True)
+        run(kn("delete", "pod", TOKEN_POD, "--ignore-not-found", "--wait=false", "--grace-period=1"), quiet=True)
+
+
+def sync_chatgpt_token(env: Env) -> None:
+    """Mac の auth.json を、全 Pod で共有する EFS の PVC（chatgpt-token）に写す。
+    LiteLLM はトークンを更新すると、使い捨てのリフレッシュトークンをボリュームにだけ書く。だから写すのは
+    「ボリュームにトークンが無い」か「Mac の auth.json が、最後に写したときから変わった（サインインし直した）」ときだけにする。
+    それ以外はボリュームのトークン（更新済みかもしれない）を使い続ける。写した中身のハッシュはボリュームの中（TOKEN_MARK）と
+    PVC の注釈に残し、注釈が同じなら Pod も作らない（./lab up を何度流しても何も変えない）。"""
+    import hashlib
+    from .core import kn, output
+    token = env.chatgpt_token_file
+    digest = hashlib.sha256(token.read_bytes()).hexdigest()[:32]
+    noted = output(kn("get", "pvc", "chatgpt-token", "-o",
+                      "jsonpath={.metadata.annotations.litellm-lab/token-sha256}"), check=False).strip()
+    if noted == digest:
+        ok("ChatGPT のトークンは共有ボリュームにあります（Mac の auth.json は前に写したときから変わっていません）")
+        return
+    with _token_pod(env) as pod:
+        state = output(kn("exec", pod, "--", "sh", "-c",
+                          f"test -s /token/auth.json && echo has || echo none; cat {TOKEN_MARK} 2>/dev/null"),
+                       check=False).split()
+        has_token, marked = (state[0] == "has") if state else False, (state[1] if len(state) > 1 else "")
+        if has_token and marked == digest:
+            ok("ChatGPT のトークンは共有ボリュームのものを使います（Mac の auth.json は前に写したときから変わっていません）")
+        else:
+            run(kn("cp", str(token), f"{pod}:/token/auth.json"), quiet=True)
+            run(kn("exec", pod, "--", "sh", "-c", f"chmod 600 /token/auth.json && echo {digest} > {TOKEN_MARK}"), quiet=True)
+            ok("ChatGPT のトークンを共有ボリュームに写しました"
+               + ("（Mac でサインインし直したため）" if has_token else "（ボリュームが空だったため）"))
+        run(kn("annotate", "pvc", "chatgpt-token", f"{TOKEN_ANNOTATION}={digest}", "--overwrite"), quiet=True)
+
+
+def pull_chatgpt_token(env: Env) -> None:
+    """共有ボリュームのトークン（LiteLLM が更新したもの）を Mac の auth.json に戻す。./lab down が EFS を消す前に呼ぶ。
+    戻さないと、Mac に残るのは使えなくなったリフレッシュトークンで、次の ./lab up で LiteLLM が起動しない（2026-11-03）。"""
+    import tempfile
+    from .core import kn
+    token = env.chatgpt_token_file
+    if not succeeds_quiet(kn("get", "pvc", "chatgpt-token")):
+        return
+    with _token_pod(env) as pod, tempfile.TemporaryDirectory() as tmp:
+        got = Path(tmp) / "auth.json"
+        if run(kn("cp", f"{pod}:/token/auth.json", str(got)), check=False, quiet=True).returncode != 0 or not got.exists():
+            warn("共有ボリュームに ChatGPT のトークンがありません（Mac の auth.json はそのまま）")
+            return
+        try:
+            data = json.loads(got.read_text())
+        except ValueError:
+            warn("共有ボリュームの ChatGPT のトークンが読めません（Mac の auth.json はそのまま）")
+            return
+        if not data.get("refresh_token"):
+            warn("共有ボリュームの ChatGPT のトークンにリフレッシュトークンがありません（Mac の auth.json はそのまま）")
+            return
+        if token.exists() and token.read_bytes() == got.read_bytes():
+            ok("ChatGPT のトークンは Mac と共有ボリュームで同じです")
+            return
+        token.parent.mkdir(parents=True, exist_ok=True)
+        tmp_dest = token.with_suffix(".json.tmp")
+        tmp_dest.write_bytes(got.read_bytes())
+        tmp_dest.chmod(0o600)
+        tmp_dest.replace(token)
+        ok(f"共有ボリュームの ChatGPT のトークン（LiteLLM が更新したもの）を Mac に戻しました（{token}）")
+
+
+def succeeds_quiet(cmd: list[str]) -> bool:
+    return run(cmd, check=False, quiet=True, timeout=60).returncode == 0
 
 
 # ---- フェイルオーバー（障害の試験。変更仕様書 7.2 節） ----

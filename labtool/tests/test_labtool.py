@@ -413,7 +413,8 @@ class AwsTargetTest(unittest.TestCase):
     OUT = {"AuroraWriterEndpoint": "pg.cluster-x.ap-northeast-1.rds.amazonaws.com",
            "AuroraSecretName": "litellm-lab/aurora", "ValkeyPrimaryEndpoint": "master.v.cache.amazonaws.com",
            "ValkeyPort": "6379", "ValkeyAuthSecretName": "litellm-lab/valkey-auth",
-           "CertificateArn": "arn:aws:acm:ap-northeast-1:1:certificate/abc", "EfsFileSystemId": "fs-1"}
+           "CertificateArn": "arn:aws:acm:ap-northeast-1:1:certificate/abc", "EfsFileSystemId": "fs-1",
+           "EfsTokenAccessPointId": "fsap-1"}
 
     def aws(self, **extra):
         e = env(LAB_TARGET="aws", LAB_AWS_HOSTNAME="lab.example.test", TYPESAFE_API_KEY="t", **extra)
@@ -543,7 +544,10 @@ class AwsTargetTest(unittest.TestCase):
         reqs = {r["key"]: r["values"] for r in np["spec"]["template"]["spec"]["requirements"]}
         self.assertEqual(reqs["kubernetes.io/arch"], ["arm64"])
         efs = list(yaml.safe_load_all(render.efs_manifests(self.OUT)))
-        self.assertEqual(efs[0]["parameters"]["fileSystemId"], "fs-1")
+        # data スタックの固定のアクセスポイントを静的に割り当てる（クラスタを作り直しても同じ場所）
+        self.assertEqual(efs[0]["spec"]["csi"]["volumeHandle"], "fs-1::fsap-1")
+        self.assertEqual(efs[0]["spec"]["persistentVolumeReclaimPolicy"], "Retain")
+        self.assertEqual(efs[1]["spec"]["volumeName"], efs[0]["metadata"]["name"])
         self.assertEqual(efs[1]["spec"]["accessModes"], ["ReadWriteMany"])
         sas = list(yaml.safe_load_all(render.service_accounts_manifest()))
         self.assertEqual({d["metadata"]["name"] for d in sas}, {"audit-compactor", "audit-viewer"})
