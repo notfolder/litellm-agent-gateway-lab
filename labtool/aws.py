@@ -163,12 +163,19 @@ def empty_bucket(s3, bucket: str) -> int:
     """バケットの全オブジェクトの全版（削除マーカーも）を消す。GOVERNANCE の Object Lock は保持を越えて消す
     （操作者に s3:BypassGovernanceRetention が要る）。消した版の数を返す。aws-ec2 の削除（labtool/clouds/aws_ec2.py）も使う。"""
     n = 0
+    # 保持を越える指定は Object Lock のあるバケットだけに付ける（無いバケットに付けると InvalidArgument。2026-11-04）
+    try:
+        s3.get_object_lock_configuration(Bucket=bucket)
+        bypass = {"BypassGovernanceRetention": True}
+    except s3.exceptions.ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "ObjectLockConfigurationNotFoundError":
+            raise
+        bypass = {}
     for page in s3.get_paginator("list_object_versions").paginate(Bucket=bucket):
         objs = [{"Key": o["Key"], "VersionId": o["VersionId"]}
                 for k in ("Versions", "DeleteMarkers") for o in page.get(k, [])]
         for i in range(0, len(objs), 1000):
-            s3.delete_objects(Bucket=bucket, Delete={"Objects": objs[i:i + 1000], "Quiet": True},
-                              BypassGovernanceRetention=True)
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": objs[i:i + 1000], "Quiet": True}, **bypass)
             n += len(objs[i:i + 1000])
     return n
 
@@ -208,6 +215,18 @@ def purge_retained(env: Env) -> None:
         if snap["DBClusterIdentifier"].startswith(env.aws_prefix):
             rds.delete_db_cluster_snapshot(DBClusterSnapshotIdentifier=snap["DBClusterSnapshotIdentifier"])
             info(f"Aurora のスナップショット {snap['DBClusterSnapshotIdentifier']} を消しました")
+    # ElastiCache も、data スタックを消すときに CloudFormation が最後のスナップショットを取る（2026-11-04 に残っていた）
+    ec = client(env, "elasticache")
+    for snap in ec.describe_snapshots()["Snapshots"]:
+        name = snap["SnapshotName"]
+        owners = (name, snap.get("ReplicationGroupId") or "", snap.get("CacheClusterId") or "")
+        if not any(o.startswith(env.aws_prefix) for o in owners):   # 自動の分は名前が automatic. で始まる
+            continue
+        try:
+            ec.delete_snapshot(SnapshotName=name)
+            info(f"ElastiCache のスナップショット {name} を消しました")
+        except ec.exceptions.ClientError as e:
+            warn(f"ElastiCache のスナップショット {name} を消せませんでした（{e.response['Error']['Code']}）")
     ecr = client(env, "ecr")
     for repo in ("litellm-lab", "audit-lab"):
         try:
@@ -348,9 +367,13 @@ def ensure_app_secret(env: Env) -> dict:
     return data
 
 
-def load_app_secret(env: Env) -> None:
-    """アプリの秘密情報を Env に載せる（bootstrap や試験が、マスターキーと利用者のキーを使うため）。"""
+def load_app_secret(env: Env, required: bool = True) -> None:
+    """アプリの秘密情報を Env に載せる（bootstrap や試験が、マスターキーと利用者のキーを使うため）。
+    .env に同じ名前の値（Mac の環境のキーなど）があっても、Secrets Manager の値で上書きする。
+    required=False なら、まだ作っていないとき（初回の ./lab up の secrets より前）は何もしない。"""
     data = read_json_secret(env, app_secret_name(env))
+    if not data and not required:
+        return
     if not data:
         raise LabError(f"Secrets Manager に {app_secret_name(env)} がありません。先に ./lab secrets を流してください")
     for k, v in data.items():
@@ -364,9 +387,18 @@ def database_resource_id(env: Env, out: dict) -> str:
 
 # ---- ChatGPT のトークンを共有ボリュームへ ----
 def sync_chatgpt_token(env: Env) -> None:
-    """Mac の auth.json を、全 Pod で共有する EFS の PVC（chatgpt-token）に写す。使い捨ての Pod でコピーする。"""
-    from .core import NS, kn, wait_until
+    """Mac の auth.json を、全 Pod で共有する EFS の PVC（chatgpt-token）に写す。使い捨ての Pod でコピーする。
+    写した中身のハッシュを PVC の注釈に残し、同じなら写さない（./lab up を何度流しても何も変えない）。"""
+    import hashlib
+    from .core import NS, kn, output, wait_until
     token = env.chatgpt_token_file
+    digest = hashlib.sha256(token.read_bytes()).hexdigest()[:32]
+    annotation = "litellm-lab/token-sha256"
+    copied = output(kn("get", "pvc", "chatgpt-token", "-o",
+                       "jsonpath={.metadata.annotations.litellm-lab/token-sha256}"), check=False).strip()
+    if copied == digest:
+        ok("ChatGPT のトークンは共有ボリュームに写し済みです")
+        return
     pod = "chatgpt-token-sync"
     run(kn("delete", "pod", pod, "--ignore-not-found", "--wait=true"), quiet=True)
     manifest = {
@@ -383,9 +415,10 @@ def sync_chatgpt_token(env: Env) -> None:
         wait_until(300, "トークンをコピーする Pod の起動", kn("wait", "--for=condition=Ready", f"pod/{pod}", "--timeout=5s"))
         run(kn("cp", str(token), f"{pod}:/token/auth.json"), quiet=True)
         run(kn("exec", pod, "--", "chmod", "600", "/token/auth.json"), quiet=True)
+        run(kn("annotate", "pvc", "chatgpt-token", f"{annotation}={digest}", "--overwrite"), quiet=True)
         ok("ChatGPT のトークンを共有ボリュームに写しました")
     finally:
-        run(kn("delete", "pod", pod, "--ignore-not-found", "--wait=false"), quiet=True)
+        run(kn("delete", "pod", pod, "--ignore-not-found", "--wait=false", "--grace-period=1"), quiet=True)
 
 
 # ---- フェイルオーバー（障害の試験。変更仕様書 7.2 節） ----
@@ -430,7 +463,13 @@ def drain_litellm_node(env: Env) -> str:
     if not nodes:
         raise LabError("LiteLLM の Pod が載っているノードが見つかりません")
     node = nodes[0]
-    run(kc("drain", node, "--ignore-daemonsets", "--delete-emptydir-data", "--timeout=180s"), quiet=True)
+    # 移す先のノードが無ければ Auto Mode が足す（約 2 分）。PDB（maxUnavailable 1）で 1 つずつ移り、LiteLLM の起動も待つので
+    # 180 秒では足りなかった（2026-11-03）。失敗したらノードを戻してから止める
+    try:
+        run(kc("drain", node, "--ignore-daemonsets", "--delete-emptydir-data", "--timeout=600s"), quiet=True)
+    except Exception:
+        uncordon(node)
+        raise
     return node
 
 
@@ -439,18 +478,29 @@ def uncordon(node: str) -> None:
 
 
 def wait_for_cname(env: Env, alb_host: str) -> None:
-    """手持ちの DNS の CNAME（ホスト名 → ALB）が引けるまで待つ。引けない間は手順を知らせる。"""
+    """手持ちの DNS の CNAME（ホスト名 → ALB）が引けるまで待つ。引けない間は手順を知らせる。
+
+    名前が引けるだけでは足りない（前の構成の古いレコードが残っていることがある）。ホスト名の IP が
+    ALB の IP と重なるまで待つ。ALB の名前は作成から数分は引けないので、その間も待つ。
+    """
     import socket
+
+    def addrs(name: str) -> set[str]:
+        try:
+            return {a[4][0] for a in socket.getaddrinfo(name, 443, proto=socket.IPPROTO_TCP)}
+        except socket.gaierror:
+            return set()
+
     host = env.aws_hostname
     start = time.monotonic()
     told = False
     while True:
-        try:
-            socket.getaddrinfo(host, 443)
-            ok(f"{host} が解決できました")
+        got, alb = addrs(host), addrs(alb_host)
+        if got and alb and got & alb:
+            ok(f"{host} が ALB に解決できました")
             return
-        except socket.gaierror:
-            pass
+        if got and alb and not told:
+            warn(f"{host} は ALB 以外（{', '.join(sorted(got))}）に解決されます。古いレコードを書き換えてください")
         if not told:
             warn(f"手持ちの DNS に CNAME を足してください: {host}  →  {alb_host}\n"
                  "  （反映されるまで待ちます。Ctrl-C で中断しても、もう一度 ./lab up を流せば続きから進みます）")

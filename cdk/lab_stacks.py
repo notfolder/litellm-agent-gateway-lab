@@ -103,7 +103,8 @@ class DataStack(cdk.Stack):
             image_scan_on_push=False, empty_on_delete=True, removal_policy=cdk.RemovalPolicy.DESTROY,
             lifecycle_rules=[ecr.LifecycleRule(max_image_count=10)]) for name in ("litellm-lab", "audit-lab")}
         # アプリの秘密情報 {prefix}/app は ./lab secrets（labtool/aws.py）が作って育てる。ここでは読む権限だけを配る
-        app_secret_arn = self.format_arn(service="secretsmanager", resource="secret", resource_name=f"{prefix}/app-*")
+        app_secret_arn = self.format_arn(service="secretsmanager", resource="secret", resource_name=f"{prefix}/app-*",
+                                        arn_format=cdk.ArnFormat.COLON_RESOURCE_NAME)
         self.roles["external-secrets"].add_to_policy(iam.PolicyStatement(
             actions=["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
             resources=[app_secret_arn, self.aurora.secret.secret_arn, self.valkey_auth.secret_arn]))

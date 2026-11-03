@@ -318,10 +318,9 @@ def helm_overrides(env: Env, image_repo: str, image_tag: str, config_hash: str, 
                 "AUDIT_S3_KEY_PREFIX": raw_prefix,
                 "AUDIT_S3_RETENTION_DAYS": retention["RAW_RETENTION_DAYS"],
                 "AUDIT_S3_RETENTION_MODE": retention["RETENTION_MODE"],
-                # boto3 1.36 以降の既定（送信時のチェックサム、aws-chunked）を GCS の XML API が署名不一致で拒む。
-                # S3 互換のストレージ向けの公式の回避策（AWS S3 には害が無い。配備で判明 2026-10-30）
-                "AWS_REQUEST_CHECKSUM_CALCULATION": "when_required",
-                "AWS_RESPONSE_CHECKSUM_VALIDATION": "when_required",
+                # boto3 のチェックサムの扱い（GCS は when_required、AWS S3 は既定。s3_checksum_mode）
+                "AWS_REQUEST_CHECKSUM_CALCULATION": s3_checksum_mode(env),
+                "AWS_RESPONSE_CHECKSUM_VALIDATION": s3_checksum_mode(env),
             })
             # イメージはクラスタの中の置き場（registry）から。chatgpt/ のトークンは置かない（共有ファイルシステムが無い。
             # 変更仕様書 2026-10-25-EC2三台構成 4.2 節）ので hostPath を外し、退避先だけにする
@@ -795,10 +794,18 @@ def vm_judge_model(env: Env) -> str:
     return env.get("LAB_VM_JUDGE_MODEL") or DEFAULT_VM_JUDGE_MODEL
 
 
+def s3_checksum_mode(env: Env) -> str:
+    """boto3 の AWS_REQUEST_CHECKSUM_CALCULATION / AWS_RESPONSE_CHECKSUM_VALIDATION の値。
+    boto3 1.36 以降の既定（送信時のチェックサム、aws-chunked）を GCS の XML API が署名不一致で拒むので、S3 互換のストレージ
+    （GCS、Mac の RustFS）は when_required にする。AWS S3 は逆に、保持（Object Lock）の掛かるバケットへの書き込みに
+    チェックサムを求める（無いと InvalidRequest。2026-11-03 の EKS 版の配備で判明）ので、既定の when_supported のまま。"""
+    return "when_supported" if env.on_aws else "when_required"
+
+
 def audit_s3_settings(env: Env) -> dict[str, str]:
     """監査の Pod（整形の CronJob、検索アプリ、試験の Job）に渡す S3 互換の設定（接続先、リージョン、バケット名の接頭辞）。
     Mac は RustFS、EKS 版は AWS S3（Pod Identity）、VM の環境はクラウドのバケット（静的キー）。"""
-    base = retention_settings(env)
+    base = retention_settings(env) | {"S3_CHECKSUM": s3_checksum_mode(env)}
     if env.is_aws:
         return base | {"S3_ENDPOINT": "", "S3_REGION": env.aws_region, "S3_BUCKET_PREFIX": env.get("LAB_AWS_BUCKET_PREFIX", ""),
                        "S3_BUCKET": ""}
@@ -929,14 +936,15 @@ def external_secrets_manifest(env: Env, out: dict) -> str:
     litellm = _external_secret("litellm-secrets", extract=app, data=[
         {"secretKey": "REDIS_PASSWORD", "remoteRef": {"key": redis}},
     ], template={
+        # ESO のテンプレートは無い項目を .KEY で参照するとエラーで止まる（missingkey=error）。無いかもしれない項目は index で引く。
         # 取り出した項目はそのまま渡し、Google の SSO 用の名前（GOOGLE_CLIENT_*）を OAuth クライアントから作る
         "LITELLM_MASTER_KEY": "{{ .LITELLM_MASTER_KEY }}",
         "LITELLM_SALT_KEY": "{{ .LITELLM_SALT_KEY }}",
         "REDIS_PASSWORD": "{{ .REDIS_PASSWORD }}",
-        "GOOGLE_CLIENT_ID": "{{ .GOOGLE_OAUTH_CLIENT_ID | default \"\" }}",
-        "GOOGLE_CLIENT_SECRET": "{{ .GOOGLE_OAUTH_CLIENT_SECRET | default \"\" }}",
-        "GOOGLE_OAUTH_CLIENT_ID": "{{ .GOOGLE_OAUTH_CLIENT_ID | default \"\" }}",
-        "GOOGLE_OAUTH_CLIENT_SECRET": "{{ .GOOGLE_OAUTH_CLIENT_SECRET | default \"\" }}",
+        "GOOGLE_CLIENT_ID": "{{ index . \"GOOGLE_OAUTH_CLIENT_ID\" | default \"\" }}",
+        "GOOGLE_CLIENT_SECRET": "{{ index . \"GOOGLE_OAUTH_CLIENT_SECRET\" | default \"\" }}",
+        "GOOGLE_OAUTH_CLIENT_ID": "{{ index . \"GOOGLE_OAUTH_CLIENT_ID\" | default \"\" }}",
+        "GOOGLE_OAUTH_CLIENT_SECRET": "{{ index . \"GOOGLE_OAUTH_CLIENT_SECRET\" | default \"\" }}",
     })
     docs = [
         litellm,
@@ -949,8 +957,8 @@ def external_secrets_manifest(env: Env, out: dict) -> str:
     ]
     if env.has_google() or env.get("LAB_AUDIT_OIDC_CLIENT_ID"):
         docs.append(_external_secret("audit-viewer-oidc", extract=app, template={
-            "AUDIT_OIDC_CLIENT_ID": "{{ .LAB_AUDIT_OIDC_CLIENT_ID | default .GOOGLE_OAUTH_CLIENT_ID }}",
-            "AUDIT_OIDC_CLIENT_SECRET": "{{ .LAB_AUDIT_OIDC_CLIENT_SECRET | default .GOOGLE_OAUTH_CLIENT_SECRET }}"}))
+            "AUDIT_OIDC_CLIENT_ID": "{{ index . \"LAB_AUDIT_OIDC_CLIENT_ID\" | default (index . \"GOOGLE_OAUTH_CLIENT_ID\") }}",
+            "AUDIT_OIDC_CLIENT_SECRET": "{{ index . \"LAB_AUDIT_OIDC_CLIENT_SECRET\" | default (index . \"GOOGLE_OAUTH_CLIENT_SECRET\") }}"}))
     if env.has_google():
         docs.append(_external_secret("workspace-mcp", data=pick("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET")))
     return yaml.safe_dump_all(docs, sort_keys=False)
@@ -985,6 +993,9 @@ def alb_ingress_manifest(env: Env, out: dict, viewer: bool) -> str:
     paths = []
     for provider in PASSTHROUGH_PROVIDERS:
         paths += [path(f"/{provider}", action("deny-passthrough")), path(f"/{provider}/*", action("deny-passthrough"))]
+    # ALB の * は / もまたぐ（Traefik の ^/[^/]+/mcp/?$ と違う）ので、OAuth の発見用の URL
+    # （/.well-known/oauth-protected-resource/<サーバー名>/mcp。Codex が GET で読む）を先に LiteLLM へ通す（2026-11-03）
+    paths.append(path("/.well-known/*", svc("litellm", 4000)))
     paths.append(path("/*/mcp", action("mcp-get-not-allowed")))
     if viewer:
         paths += [path("/lab-audit", svc("audit-viewer", 8000)), path("/lab-audit/*", svc("audit-viewer", 8000))]
@@ -1147,6 +1158,14 @@ def admin_only_manifest(env: Env) -> str:
                                   "middlewares": [{"name": ADMIN_MIDDLEWARE}],
                                   "services": [{"name": "litellm", "port": 4000}]}]}}
     return yaml.safe_dump_all([middleware, route], sort_keys=False)
+
+
+def without_traefik(manifest_text: str) -> str:
+    """Traefik の資源（traefik.io の IngressRoute、Middleware など）を除く。EKS には Traefik が無く、入口は ALB の Ingress
+    （alb_ingress_manifest）が受け持つ。"""
+    docs = [d for d in yaml.safe_load_all(manifest_text)
+            if d and not str(d.get("apiVersion", "")).startswith("traefik.io/")]
+    return yaml.safe_dump_all(docs, sort_keys=False)
 
 
 def add_admin_middleware(manifest_text: str, names: list[str] | None = None) -> str:

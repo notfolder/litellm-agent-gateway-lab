@@ -502,6 +502,8 @@ class AwsTargetTest(unittest.TestCase):
         self.assertIn("/anthropic/*", paths)
         self.assertLess(paths.index("/anthropic/*"), paths.index("/*/mcp"))
         self.assertLess(paths.index("/*/mcp"), paths.index("/lab-audit/*"))
+        # OAuth の発見用の URL（/.well-known/.../<サーバー名>/mcp）は MCP の GET の 405 より先に LiteLLM へ
+        self.assertLess(paths.index("/.well-known/*"), paths.index("/*/mcp"))
         self.assertEqual(paths[-1], "/*")
         self.assertTrue(all(f"/{p}/*" in paths for p in render.PASSTHROUGH_PROVIDERS))
         params = next(d for d in docs if d["kind"] == "IngressClassParams")
@@ -664,6 +666,12 @@ class VmTargetTest(unittest.TestCase):
         self.assertEqual(store["spec"]["configuration"]["destinationPath"], "s3://lab-bucket/pg-backup/litellm-pg")
         self.assertNotIn("endpointURL", store["spec"]["configuration"])
         self.assertNotIn("endpointCA", store["spec"]["configuration"])   # 中継が無ければ CA の参照は無い
+    def test_without_traefik_drops_ingressroute_for_aws(self):
+        text = (ROOT / "k8s" / "audit-viewer.yaml").read_text()
+        kinds = [d["kind"] for d in yaml.safe_load_all(render.without_traefik(text)) if d]
+        self.assertIn("Deployment", kinds)
+        self.assertNotIn("IngressRoute", kinds)
+
     def test_tls_ingressroutes_copy_routes_to_websecure(self):
         text = (Path(__file__).resolve().parents[2] / "k8s" / "ingress.yaml").read_text()
         docs = list(yaml.safe_load_all(render.tls_ingressroutes(text)))

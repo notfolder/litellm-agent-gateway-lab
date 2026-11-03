@@ -98,11 +98,16 @@ def run_audit_job(env: Env, name: str, args: list[str], secret: str, memory: str
                         {"name": "AUDIT_S3_BUCKET", "value": s3cfg["S3_BUCKET"]},
                         {"name": "AUDIT_ACCESS_RETENTION_DAYS", "value": s3cfg["ACCESS_RETENTION_DAYS"]},
                         {"name": "AUDIT_RETENTION_MODE", "value": s3cfg["RETENTION_MODE"]},
-                        {"name": "AWS_REQUEST_CHECKSUM_CALCULATION", "value": "when_required"},
-                        {"name": "AWS_RESPONSE_CHECKSUM_VALIDATION", "value": "when_required"}],
+                        {"name": "AWS_REQUEST_CHECKSUM_CALCULATION", "value": s3cfg["S3_CHECKSUM"]},
+                        {"name": "AWS_RESPONSE_CHECKSUM_VALIDATION", "value": s3cfg["S3_CHECKSUM"]}],
                 "envFrom": [{"secretRef": {"name": secret}}],
                 "resources": {"requests": {"memory": "256Mi"}, "limits": {"memory": memory}},
             }]}}}}
+    if env.is_aws:
+        # AWS には静的キーの Secret が無い。S3 へは整形の CronJob・検索アプリと同じ ServiceAccount（Pod Identity）で入る
+        pod_spec = manifest["spec"]["template"]["spec"]
+        pod_spec["serviceAccountName"] = secret.removesuffix("-s3")
+        pod_spec["containers"][0]["envFrom"] = [{"secretRef": {"name": secret, "optional": True}}]
     manifest = render.add_egress([manifest], env)[0]
     run(kn("apply", "-f", "-"), input=json.dumps(manifest), quiet=True)
 
@@ -165,7 +170,7 @@ def _cleanup_test_user(env: Env, key: str) -> None:
 
 def audit_test(env: Env) -> None:
     set_buckets(env)
-    if env.is_aws and not env.get("LITELLM_MASTER_KEY"):
+    if env.is_aws:
         from . import aws
         aws.load_app_secret(env)
     global TEST_USER

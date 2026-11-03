@@ -49,7 +49,8 @@ def cloud_user_client(env: Env, user: str):
     access, secret = user_credentials(env, user)
     return boto3.client("s3", region_name=env.vm_region, aws_access_key_id=access, aws_secret_access_key=secret,
                         endpoint_url=cloud.s3_endpoint(env) or None,
-                        config=Config(retries={"max_attempts": 3}, **CHECKSUM_WHEN_REQUIRED))
+                        # AWS S3 は保持の掛かるバケットへの書き込みにチェックサムを求める（render.s3_checksum_mode）
+                        config=Config(retries={"max_attempts": 3}, **({} if env.on_aws else CHECKSUM_WHEN_REQUIRED)))
 
 
 @contextlib.contextmanager
