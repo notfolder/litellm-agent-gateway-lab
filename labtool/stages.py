@@ -205,6 +205,7 @@ def cluster(env: Env) -> None:
         run(["k3d", "cluster", "create", "--config", str(cfg)])
 
     wait_until(180, "全ノードの Ready", kc("wait", "--for=condition=Ready", "nodes", "--all", "--timeout=5s"))
+    ensure_coredns()
 
     kapply(files=[K8S / "traefik-config.yaml"], namespaced=False)
     wait_until(300, "Traefik の起動", kc("-n", "kube-system", "rollout", "status", "deploy/traefik", "--timeout=5s"))
@@ -286,6 +287,7 @@ def _cluster_vm(env: Env) -> None:
     vm.ensure_forward(env, infra)
     want = len(infra.all_nodes())
     wait_until(600, f"全ノード（{want} 台）の Ready", lambda: _ready_nodes() >= want)
+    ensure_coredns()
     vm.label_entry_nodes(infra)
     kapply(files=[K8S / "traefik-config-vm.yaml"], namespaced=False)
     vm.wait_traefik(infra)
@@ -355,6 +357,19 @@ def _ensure_chart(release: str, namespace: str, spec: dict, values: dict) -> Non
              "--wait", "--timeout", "10m"))
 
 
+def ensure_coredns() -> None:
+    """k3s に同梱の CoreDNS を render.COREDNS_REPLICAS 台にそろえる（Mac の k3d と VM の環境）。1 台だけだと、載った台が
+    止まったとき名前解決が止まり、LiteLLM が DB に届かないと判断して全台が外れる（2026-11-05 の AWS で回復 102 秒。
+    3 台で 23 秒）。同梱の定義は台数を書かないので、k3s が定義を書き戻しても台数は残る。散らす指定は同梱の定義にある。"""
+    want = str(render.COREDNS_REPLICAS)
+    now = output(kc("-n", "kube-system", "get", "deploy", "coredns", "-o", "jsonpath={.spec.replicas}"), check=False).strip()
+    if now != want:
+        run(kc("-n", "kube-system", "scale", "deploy", "coredns", f"--replicas={want}"), quiet=True)
+        info(f"CoreDNS を {now or '?'} 台から {want} 台にしました")
+    wait_until(300, f"CoreDNS（{want} 台）の起動", kc("-n", "kube-system", "rollout", "status", "deploy/coredns",
+                                                   "--timeout=5s"))
+
+
 def operators(replicas: int = 1, env: Env | None = None) -> None:
     """cert-manager → CloudNativePG のオペレーター → Barman Cloud Plugin（この順。プラグインは証明書を使う）。
     replicas は VM の環境で 2（3 台とも server ノードなので「server ノードに置く」では 1 台に寄らず、
@@ -372,13 +387,16 @@ def operators(replicas: int = 1, env: Env | None = None) -> None:
     wait_until(300, "CloudNativePG のオペレーターの準備", kc("-n", "cnpg-system", "wait", "--for=condition=Available",
                                                          "deploy", "-l", "app.kubernetes.io/name=cloudnative-pg",
                                                          "--timeout=5s"))
-    manifest = BUILD_DIR / f"barman-cloud-{BARMAN_PLUGIN_VERSION}-pinned.yaml"
-    if not manifest.exists():
+    raw = BUILD_DIR / f"barman-cloud-{BARMAN_PLUGIN_VERSION}.yaml"
+    if not raw.exists():
         info(f"Barman Cloud Plugin {BARMAN_PLUGIN_VERSION} のマニフェストを取得します")
         res = http("GET", BARMAN_PLUGIN_URL, timeout=60)
         if res.status != 200:
             raise LabError(f"Barman Cloud Plugin のマニフェストを取得できませんでした（{res.status}）")
-        write_if_changed(manifest, render.pin_deployments(res.body, CONTROL_PLANE))
+        raw.parent.mkdir(parents=True, exist_ok=True)
+        raw.write_text(res.body)
+    manifest = BUILD_DIR / f"barman-cloud-{BARMAN_PLUGIN_VERSION}-pinned.yaml"
+    write_if_changed(manifest, render.barman_plugin_manifest(raw.read_text(), CONTROL_PLANE, replicas))
     if env is not None and env.egress_proxy:
         # Barman のプラグイン自身は外へ出ないが、同じ名前空間の sidecar の設定は ObjectStore（datastores の段階）で渡す
         pass

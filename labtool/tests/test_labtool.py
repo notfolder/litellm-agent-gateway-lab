@@ -402,6 +402,22 @@ class PricingAndPinningTest(unittest.TestCase):
         self.assertEqual(docs[1]["spec"]["template"]["spec"]["nodeSelector"], {"a": "b"})
         self.assertNotIn("spec", docs[0])
 
+    def test_barman_plugin_manifest(self):
+        text = ("kind: Deployment\nmetadata: {name: barman-cloud}\nspec:\n  replicas: 1\n"
+                "  selector: {matchLabels: {app: barman-cloud}}\n  template:\n    spec: {}\n")
+        # VM（2 台）: 台数をそろえ、止まった台を数えずに台ごとに散らす
+        d = next(yaml.safe_load_all(render.barman_plugin_manifest(text, {"a": "b"}, 2)))
+        self.assertEqual(d["spec"]["replicas"], 2)
+        spread = d["spec"]["template"]["spec"]["topologySpreadConstraints"][0]
+        self.assertEqual((spread["topologyKey"], spread["whenUnsatisfiable"], spread["nodeTaintsPolicy"]),
+                         ("kubernetes.io/hostname", "DoNotSchedule", "Honor"))
+        self.assertEqual(spread["labelSelector"]["matchLabels"], {"app": "barman-cloud"})
+        self.assertEqual(d["spec"]["template"]["spec"]["nodeSelector"], {"a": "b"})
+        # Mac（1 台）: 固定だけ
+        d = next(yaml.safe_load_all(render.barman_plugin_manifest(text, {"a": "b"}, 1)))
+        self.assertEqual(d["spec"]["replicas"], 1)
+        self.assertNotIn("topologySpreadConstraints", d["spec"]["template"]["spec"])
+
 
 if __name__ == "__main__":
     unittest.main()
