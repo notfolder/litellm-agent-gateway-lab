@@ -728,11 +728,13 @@ def litellm_priority_class_manifest() -> str:
 # ---- AWS 環境（LAB_TARGET=aws）。変更仕様書 2026-10-24-AWS構成 ----
 # Bedrock のモデル ID の既定（日本内で処理するクロスリージョン推論プロファイル。.env の LAB_BEDROCK_* で変えられる）
 BEDROCK_DEFAULTS = {
-    "claude-sonnet-4-5": ("LAB_BEDROCK_SONNET", "jp.anthropic.claude-sonnet-4-5-20250929-v1:0"),
-    "claude-haiku-4-5": ("LAB_BEDROCK_HAIKU", "jp.anthropic.claude-haiku-4-5-20251001-v1:0"),
-    # Opus は日本内のプロファイルが無いので既定は空（登録しない）。使うなら LAB_BEDROCK_OPUS に Global の ID を入れる
-    "claude-opus-4-6": ("LAB_BEDROCK_OPUS", ""),
+    # Sonnet 5.5 は東京の jp. プロファイルに無いので、jp. にある最新の Sonnet 4.6 にする（出たら 5.5 に移す。ユーザー判断 2026-11-04）
+    "claude-sonnet-4-6": ("LAB_BEDROCK_SONNET", "jp.anthropic.claude-sonnet-4-6"),
+    "claude-haiku-5-5": ("LAB_BEDROCK_HAIKU", "jp.anthropic.claude-haiku-5-5"),
+    "claude-opus-5-5": ("LAB_BEDROCK_OPUS", "jp.anthropic.claude-opus-5-5"),
 }
+# 2 つの審査官の既定（Claude Haiku 4.5 の日本内プロファイル）。判定の精度が変わるので Claude Code のモデルとは別に持つ
+BEDROCK_JUDGE_DEFAULT = "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
 # LiteLLM のパススルー（素通し）の経路。入口で 403 にする（spec 4.2。k8s/ingress.yaml の Traefik の正規表現と同じ一覧）
 PASSTHROUGH_PROVIDERS = [
     "anthropic", "assemblyai", "eu.assemblyai", "azure", "azure_ai", "bedrock", "cohere", "cursor", "fal_ai", "gemini",
@@ -831,15 +833,15 @@ def aws_claude_models(env: Env) -> dict[str, str]:
 
 def aws_judge_model(env: Env) -> str:
     """2 つの審査官の Bedrock のモデル ID（既定は Claude Haiku 4.5 の日本内プロファイル）。"""
-    return env.get("LAB_AWS_JUDGE_MODEL") or BEDROCK_DEFAULTS["claude-haiku-4-5"][1]
+    return env.get("LAB_AWS_JUDGE_MODEL") or BEDROCK_JUDGE_DEFAULT
 
 
 def claude_code_model_env(env: Env) -> dict[str, str]:
     """Claude Code の別名をゲートウェイのモデル名に向ける環境変数。Opus が無ければ Sonnet に落とす。"""
     models = aws_claude_models(env)
-    sonnet = "claude-sonnet-4-5" if "claude-sonnet-4-5" in models else next(iter(models))
-    haiku = "claude-haiku-4-5" if "claude-haiku-4-5" in models else sonnet
-    opus = "claude-opus-4-6" if "claude-opus-4-6" in models else sonnet
+    sonnet = "claude-sonnet-4-6" if "claude-sonnet-4-6" in models else next(iter(models))
+    haiku = "claude-haiku-5-5" if "claude-haiku-5-5" in models else sonnet
+    opus = "claude-opus-5-5" if "claude-opus-5-5" in models else sonnet
     return {"ANTHROPIC_MODEL": sonnet, "ANTHROPIC_DEFAULT_SONNET_MODEL": sonnet,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku, "ANTHROPIC_DEFAULT_OPUS_MODEL": opus,
             "CLAUDE_CODE_SUBAGENT_MODEL": sonnet}

@@ -441,11 +441,13 @@ class AwsTargetTest(unittest.TestCase):
     def test_models_are_bedrock_and_jev_is_off(self):
         cfg = render.litellm_config(self.aws(), has_chatgpt=False)
         models = {m["model_name"]: m["litellm_params"] for m in cfg["model_list"]}
-        self.assertIn("claude-sonnet-4-5", models)
-        self.assertTrue(models["claude-sonnet-4-5"]["model"].startswith("bedrock/jp.anthropic.claude-sonnet-4-5"))
-        self.assertEqual(models["claude-sonnet-4-5"]["aws_region_name"], "ap-northeast-1")
-        self.assertNotIn("claude-opus-4-6", models)          # 日本内のプロファイルが無いので既定では登録しない
+        self.assertIn("claude-sonnet-4-6", models)
+        self.assertTrue(models["claude-sonnet-4-6"]["model"].startswith("bedrock/jp.anthropic.claude-sonnet-4-6"))
+        self.assertEqual(models["claude-sonnet-4-6"]["aws_region_name"], "ap-northeast-1")
+        self.assertTrue(models["claude-haiku-5-5"]["model"].startswith("bedrock/jp.anthropic.claude-haiku-5-5"))
+        self.assertTrue(models["claude-opus-5-5"]["model"].startswith("bedrock/jp.anthropic.claude-opus-5-5"))
         self.assertNotIn("anthropic/*", models)              # Claude Max のトークン転送は使わない
+        # 審査官は Claude Code のモデルと別に Haiku 4.5 のまま（判定の精度が変わるため）
         self.assertTrue(models["review-judge"]["model"].startswith("bedrock/jp.anthropic.claude-haiku-4-5"))
         self.assertTrue(models["isolated-judge"]["model"].startswith("bedrock/jp.anthropic.claude-haiku-4-5"))
         self.assertFalse(cfg["guardrails"][0]["litellm_params"]["use_jev"])   # Jev の鍵があっても使わない
@@ -453,12 +455,11 @@ class AwsTargetTest(unittest.TestCase):
         cfg2 = render.litellm_config(self.aws(), has_chatgpt=True)
         self.assertIn("gpt-5.6-terra", {m["model_name"] for m in cfg2["model_list"]})
 
-    def test_opus_can_be_added_by_env(self):
-        cfg = render.litellm_config(self.aws(LAB_BEDROCK_OPUS="global.anthropic.claude-opus-4-6-v1"), has_chatgpt=False)
-        self.assertIn("claude-opus-4-6", {m["model_name"] for m in cfg["model_list"]})
+    def test_claude_code_aliases(self):
         envs = render.claude_code_model_env(self.aws())
-        self.assertEqual(envs["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-sonnet-4-5")   # 無ければ Sonnet に落とす
-        self.assertEqual(envs["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "claude-haiku-4-5")
+        self.assertEqual(envs["ANTHROPIC_DEFAULT_SONNET_MODEL"], "claude-sonnet-4-6")
+        self.assertEqual(envs["ANTHROPIC_DEFAULT_OPUS_MODEL"], "claude-opus-5-5")
+        self.assertEqual(envs["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "claude-haiku-5-5")
 
     def test_helm_overrides(self):
         local = render.helm_overrides(env(), "r", "t", "h")
@@ -525,7 +526,7 @@ class AwsTargetTest(unittest.TestCase):
         files = render.client_files(self.aws(LAB_USER1_EMAIL="a@example.com", LAB_KEY_USER1_CLAUDE="sk-c", LAB_KEY_USER1_CODEX="sk-x"),
                                     "sk-c", "sk-x", Path("/tmp/c"), Path("/tmp/n"))
         self.assertIn("export ANTHROPIC_BASE_URL='https://lab.example.test'", files["claude.env"])
-        self.assertIn("export ANTHROPIC_DEFAULT_SONNET_MODEL='claude-sonnet-4-5'", files["claude.env"])
+        self.assertIn("export ANTHROPIC_DEFAULT_SONNET_MODEL='claude-sonnet-4-6'", files["claude.env"])
         self.assertIn("lab.example.test", files["claude-settings.json"])
         self.assertIn('base_url = "https://lab.example.test/v1"', files["codex-config.toml"])
         local = render.client_files(env(), "k", "k", Path("/tmp/c"), Path("/tmp/n"))
