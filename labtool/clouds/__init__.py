@@ -220,10 +220,15 @@ def s3_user_policies(env: Env, bucket: str) -> dict[str, dict]:
                     continue
                 resources.append(f"arn:aws:s3:::{bucket}/{logical}/{obj}")
             actions = [a for a in st["Action"] if a not in bucket_actions or a == "s3:*"]
-            if resources and actions:
-                new = {"Effect": "Allow", "Action": actions, "Resource": resources}
-                if new not in statements:
-                    statements.append(new)
+            if not (resources and actions):
+                continue
+            # 操作が同じ文は 1 つにまとめる（IAM ユーザーのインラインポリシーは合計 2,048 文字まで。2026-11-04 の aws-ec2 の
+            # 配備で lab-app が 2,163 文字になり PutUserPolicy が LimitExceeded で拒否された）
+            same = next((s for s in statements if s["Action"] == actions), None)
+            if same is None:
+                statements.append({"Effect": "Allow", "Action": actions, "Resource": resources})
+            else:
+                same["Resource"] += [r for r in resources if r not in same["Resource"]]
         if bucket_level:
             actions = sorted({"s3:ListBucket", "s3:ListBucketMultipartUploads", "s3:GetBucketLocation"}
                              | (bucket_level - {"s3:*", "s3:ListBucket"}))

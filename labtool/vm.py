@@ -964,6 +964,14 @@ def ensure_a_record(env: Env, ip: str, host: str | None = None) -> None:
             break
     if zone is None:
         raise LabError(f"{host} のゾーンが Cloudflare のトークンで見えません（トークンの Zone Resources にそのゾーンが要ります）")
+    # 同じ名前の CNAME があると A を作れない（Cloudflare のエラー 81054）。EKS 版（LAB_TARGET=aws）の ALB 向けに ./lab が作った
+    # CNAME（注記がこのリポジトリの名前で始まる）なら消して置き換える。人が作った CNAME は消さずに知らせる（2026-11-04 の配備で判明）
+    for cname in _cloudflare(env, "GET", f"/zones/{zone['id']}/dns_records?type=CNAME&name={host}")["result"]:
+        if not (cname.get("comment") or "").startswith("litellm-agent-gateway-lab"):
+            raise LabError(f"{host} に ./lab が作っていない CNAME（→ {cname['content']}）があります。"
+                           "A レコードに置き換えてよいか確かめてから、Cloudflare で消してください")
+        _cloudflare(env, "DELETE", f"/zones/{zone['id']}/dns_records/{cname['id']}")
+        info(f"Cloudflare の CNAME を消しました（A レコードに置き換える）: {host} → {cname['content']}")
     records = _cloudflare(env, "GET", f"/zones/{zone['id']}/dns_records?type=A&name={host}")["result"]
     body = {"type": "A", "name": host, "content": ip, "ttl": 1, "proxied": False,
             "comment": "litellm-agent-gateway-lab（./lab が管理）"}

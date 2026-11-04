@@ -52,6 +52,7 @@ REDIS_ERROR = re.compile(
 # 止める場面も、ほかの台を止める場面と同じ目安にする（120 秒、GCP は 180 秒。ユーザーの判断 2026-11-01: 1A）
 GCP_LIMITS = {"pg-node": 180, "valkey-node": 180, "entry-node": 180, "worker-node": 180}
 NODE_DOWN_SECONDS = 120
+LB_HEALTHY_WAIT_SECONDS = 180   # entry-node: 戻った台をロードバランサが健全と見なすまで待つ上限
 
 
 def limit_for(env: Env, scenario: str) -> int:
@@ -345,10 +346,17 @@ def trigger(env: Env, scenario: str, load: Load) -> str:
         node = traefik[0]
         target = vm.node_for_k8s_name(infra, node)
         _stop_node(node, load, env)
-        health = cloud.lb_targets_healthy(env, infra)
+        # 戻った台をロードバランサが健全と見なすのは、ヘルスチェックが続けて通ってから（AWS の NLB は 10 秒 × 2 回）。
+        # 台の Ready の直後に 1 回だけ見ると 2/3 台になる（2026-11-04 の aws-ec2 で判明）ので、全台が健全になるまで待つ
+        t_ready = time.time()
+        while True:
+            health = cloud.lb_targets_healthy(env, infra)
+            if (health and all(health.values())) or time.time() - t_ready > LB_HEALTHY_WAIT_SECONDS:
+                break
+            time.sleep(5)
         load.eip_moved = bool(health) and all(health.values())
         return (f"Traefik の載ったノード {node}（{target.id}）を停止（戻った後のロードバランサの健全性: "
-                f"{sum(health.values())}/{len(health)} 台）")
+                f"{sum(health.values())}/{len(health)} 台、台の Ready から {time.time() - t_ready:.0f} 秒）")
     if scenario == "worker-node":
         # LiteLLM が載った足す台を止める（変更仕様書 2026-10-31-台の増減とLiteLLMのメモリ N13）
         from . import render

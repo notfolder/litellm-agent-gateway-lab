@@ -381,6 +381,51 @@ def _iam_user_name(env: Env, user: str) -> str:
     return f"{env.vm_prefix}-{user}"
 
 
+def _policy_arn(env: Env, name: str) -> str:
+    return f"arn:aws:iam::{identity(env)['account']}:policy/{name}"
+
+
+def _ensure_user_policy(env: Env, iam, name: str, policy: dict) -> None:
+    """利用者の権限を、利用者と同じ名前のカスタマー管理ポリシーにして付ける。インラインポリシーは利用者ごとに合計 2,048 文字までで、
+    lab-app の権限が収まらない（2026-11-04 の aws-ec2 の配備で LimitExceeded）。管理ポリシーは 6,144 文字まで。
+    前の版のインラインポリシー（lab）が残っていれば外す。"""
+    arn = _policy_arn(env, name)
+    doc = json.dumps(policy, sort_keys=True)
+    try:
+        default = iam.get_policy(PolicyArn=arn)["Policy"]["DefaultVersionId"]
+        current = iam.get_policy_version(PolicyArn=arn, VersionId=default)["PolicyVersion"]["Document"]
+        if json.dumps(current, sort_keys=True) != doc:
+            versions = [v for v in iam.list_policy_versions(PolicyArn=arn)["Versions"] if not v["IsDefaultVersion"]]
+            if len(versions) >= 4:   # 版は 5 つまで。古いものから消す
+                oldest = min(versions, key=lambda v: v["CreateDate"])
+                iam.delete_policy_version(PolicyArn=arn, VersionId=oldest["VersionId"])
+            iam.create_policy_version(PolicyArn=arn, PolicyDocument=doc, SetAsDefault=True)
+            info(f"IAM ポリシー {name} を更新しました")
+    except iam.exceptions.NoSuchEntityException:
+        iam.create_policy(PolicyName=name, PolicyDocument=doc, Tags=[{"Key": TAG_KEY, "Value": env.vm_prefix}])
+        info(f"IAM ポリシー {name} を作りました")
+    attached = [p["PolicyArn"] for p in iam.list_attached_user_policies(UserName=name)["AttachedPolicies"]]
+    if arn not in attached:
+        iam.attach_user_policy(UserName=name, PolicyArn=arn)
+        info(f"IAM ユーザー {name} に権限を付けました")
+    for pol in iam.list_user_policies(UserName=name)["PolicyNames"]:
+        iam.delete_user_policy(UserName=name, PolicyName=pol)
+        info(f"IAM ユーザー {name} の前の版のインラインポリシー {pol} を外しました")
+
+
+def _delete_user_policy(env: Env, iam, name: str) -> None:
+    """_ensure_user_policy で作った管理ポリシーを、付けている利用者から外してから消す（版も含めて）。"""
+    arn = _policy_arn(env, name)
+    with contextlib.suppress(iam.exceptions.NoSuchEntityException):
+        for ent in iam.list_entities_for_policy(PolicyArn=arn, EntityFilter="User")["PolicyUsers"]:
+            iam.detach_user_policy(UserName=ent["UserName"], PolicyArn=arn)
+        for v in iam.list_policy_versions(PolicyArn=arn)["Versions"]:
+            if not v["IsDefaultVersion"]:
+                iam.delete_policy_version(PolicyArn=arn, VersionId=v["VersionId"])
+        iam.delete_policy(PolicyArn=arn)
+        info(f"IAM ポリシー {name} を消しました")
+
+
 def ensure_static_keys(env: Env, bucket: str) -> dict[str, tuple[str, str]]:
     """役割ごとの IAM ユーザーと静的キー。権限は毎回そろえ、キーは .env に無い利用者だけ作り直す（秘密は作った瞬間にしか取れない）。"""
     iam = aws.client(env, "iam")
@@ -392,12 +437,7 @@ def ensure_static_keys(env: Env, bucket: str) -> dict[str, tuple[str, str]]:
         except iam.exceptions.NoSuchEntityException:
             iam.create_user(UserName=name, Tags=[{"Key": TAG_KEY, "Value": env.vm_prefix}])
             info(f"IAM ユーザー {name} を作りました")
-        current = None
-        with contextlib.suppress(iam.exceptions.NoSuchEntityException):
-            current = iam.get_user_policy(UserName=name, PolicyName="lab")["PolicyDocument"]
-        if json.dumps(current, sort_keys=True) != json.dumps(policy, sort_keys=True):
-            iam.put_user_policy(UserName=name, PolicyName="lab", PolicyDocument=json.dumps(policy))
-            info(f"IAM ユーザー {name} の権限を更新しました")
+        _ensure_user_policy(env, iam, name, policy)
         key_name, secret_name = render.s3_env_names(user, env)
         if env.get(key_name) and env.get(secret_name):
             continue
@@ -659,6 +699,7 @@ def destroy(env: Env) -> None:
     _delete_bucket(env, _bucket_name(env, identity(env)))
     for user in [*KEY_ROLES, *LEGACY_KEY_USERS]:   # 前の版の名前も残っていれば消す
         name = _iam_user_name(env, user)
+        _delete_user_policy(env, iam, name)
         with contextlib.suppress(iam.exceptions.NoSuchEntityException):
             for k in iam.list_access_keys(UserName=name)["AccessKeyMetadata"]:
                 iam.delete_access_key(UserName=name, AccessKeyId=k["AccessKeyId"])
