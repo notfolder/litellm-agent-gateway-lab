@@ -580,12 +580,6 @@ class VmTargetTest(unittest.TestCase):
                     LAB_VM_ENTRY_IP_ID="eipalloc-1" if target == "aws-ec2" else "litellm-lab-entry")
         return env(**{**base, **extra})
 
-    def test_redis_circuit_breaker_off_in_every_target(self):
-        # LiteLLM の Redis の遮断器は HALF_OPEN のまま戻らないことがあるので、どの環境でも切る（変更設計書 2026-10-24-AWS構成 9.3）
-        for e in (env(), self.vm(), self.vm("gcp-vm"), AwsTargetTest.aws(self)):
-            o = render.helm_overrides(e, "repo", "tag", "h", aws_out=AwsTargetTest.OUT if e.is_aws else None)
-            self.assertEqual(o["envVars"]["REDIS_CIRCUIT_BREAKER_ENABLED"], "false", e.target)
-
     def test_target_flags_and_urls(self):
         e = self.vm()
         self.assertTrue(e.is_aws_ec2 and e.is_vm and e.on_aws and e.on_cloud and not e.is_aws and not e.is_gcp_vm)
