@@ -185,5 +185,84 @@ class SpoolTest(unittest.TestCase):
             self.assertEqual(lines[0]["request_call_id"], "call-1")
 
 
+class HookTest(unittest.TestCase):
+    """成功時の処理の冒頭（async_logging_hook）で記録し、後ろの処理が取り消されても欠けない。"""
+
+    def logger(self, d: str) -> FakeLogger:
+        return FakeLogger(Path(d))
+
+    def test_recorded_even_if_later_callbacks_are_cancelled(self):
+        import asyncio
+
+        async def success_handler(lg, kwargs):
+            # LiteLLM の成功時の処理の形: 全コールバックの async_logging_hook → 遅いコールバック → async_log_success_event
+            kwargs, _ = await lg.async_logging_hook(kwargs, None, "acompletion")
+            await asyncio.sleep(10)   # Redis を待って止まった前のコールバック
+            await lg.async_log_success_event(kwargs, None, None, None)
+
+        async def worker(lg, kwargs):
+            # LoggingWorker は 1 つのまとまりを時間で打ち切る（既定 20 秒。ここでは 0.05 秒）
+            try:
+                await asyncio.wait_for(success_handler(lg, kwargs), timeout=0.05)
+            except asyncio.TimeoutError:
+                pass
+
+        with tempfile.TemporaryDirectory() as d:
+            lg = self.logger(d)
+            asyncio.run(worker(lg, dict(KW, standard_logging_object=slp())))
+            self.assertEqual(lg.buffer.records, 1)
+
+    def test_hook_and_success_event_record_once(self):
+        import asyncio
+
+        async def both(lg, kwargs):
+            kwargs, _ = await lg.async_logging_hook(kwargs, None, "acompletion")
+            await lg.async_log_success_event(dict(kwargs), None, None, None)   # LiteLLM は写しを渡すことがある
+
+        with tempfile.TemporaryDirectory() as d:
+            lg = self.logger(d)
+            asyncio.run(both(lg, dict(KW, standard_logging_object=slp())))
+            self.assertEqual(lg.buffer.records, 1)
+
+    def test_success_event_records_when_hook_had_no_payload(self):
+        import asyncio
+
+        async def run(lg):
+            kwargs = dict(KW)   # 冒頭ではまだ本文が無い
+            kwargs, _ = await lg.async_logging_hook(kwargs, None, "acompletion")
+            kwargs["standard_logging_object"] = slp()
+            await lg.async_log_success_event(kwargs, None, None, None)
+
+        with tempfile.TemporaryDirectory() as d:
+            lg = self.logger(d)
+            asyncio.run(run(lg))
+            self.assertEqual(lg.buffer.records, 1)
+
+    def test_no_log_request_is_not_recorded_by_hook(self):
+        import asyncio
+
+        with tempfile.TemporaryDirectory() as d:
+            lg = self.logger(d)
+            kwargs = {"litellm_call_id": "c", "litellm_params": {"no-log": True}, "standard_logging_object": slp()}
+            asyncio.run(lg.async_logging_hook(kwargs, None, "acompletion"))
+            self.assertEqual(lg.buffer.records, 0)
+
+    def test_stream_recorded_only_when_assembled(self):
+        import asyncio
+
+        async def run(lg):
+            chunk = dict(KW, stream=True, standard_logging_object=slp())
+            await lg.async_logging_hook(chunk, None, "acompletion")   # 途中の断片では記録しない
+            self.assertEqual(lg.buffer.records, 0)
+            done = dict(chunk, async_complete_streaming_response={"choices": []})
+            await lg.async_logging_hook(done, None, "acompletion")
+            await lg.async_log_success_event(done, None, None, None)
+
+        with tempfile.TemporaryDirectory() as d:
+            lg = self.logger(d)
+            asyncio.run(run(lg))
+            self.assertEqual(lg.buffer.records, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

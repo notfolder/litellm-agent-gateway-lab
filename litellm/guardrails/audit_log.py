@@ -38,6 +38,7 @@ from clientkind import client_kind
 SCHEMA = 1
 LOG_PREFIX = "audit_log"
 INTERNAL_MARK = "tool_call_review_internal"   # 審査のガードレールの中の呼び出しに付ける印
+RECORDED_MARK = "audit_log_recorded"          # 成功を記録済みの要求に付ける印（二重の記録を防ぐ）
 JST = timezone(timedelta(hours=9))
 
 
@@ -74,6 +75,17 @@ def is_internal(kwargs: dict, slp: dict) -> bool:
         return True
     call_type = str(slp.get("call_type") or kwargs.get("call_type") or "")
     return "decision" in call_type   # Jev（litellm.adecisions）は no-log が効かないので種類で外す
+
+
+def _no_log(kwargs: dict) -> bool:
+    """LiteLLM が no-log の要求にコールバックを呼ばないのと同じ判定（global_disable_no_log_param なら効かない）。"""
+    if (kwargs.get("litellm_params") or {}).get("no-log", False) is not True:
+        return False
+    try:
+        import litellm
+        return not getattr(litellm, "global_disable_no_log_param", False)
+    except ImportError:
+        return True
 
 
 def _tool_calls(response: Any) -> list[dict]:
@@ -262,28 +274,58 @@ class AuditLogger(CustomLogger):
               f"pod={self.pod}", flush=True)
 
     # ---- LiteLLM のフック ----
+    async def async_logging_hook(self, kwargs, result, call_type):
+        """成功時の処理の冒頭で記録する。
+
+        LiteLLM は成功時の処理（全コールバックの async_logging_hook → async_log_success_event の順）を
+        1 つのまとまりとして記録の係（LoggingWorker）に渡し、既定 20 秒を超えると丸ごと取り消す。
+        Redis が止まっている間などに前のコールバックが待たされると、後ろの async_log_success_event まで
+        届かずに監査ログが欠ける。async_logging_hook は全コールバックの async_log_success_event より先に
+        呼ばれるので、ここで記録する（変更設計書 2026-10-24-AWS構成 9.4）。
+        ストリームは、組み上がった応答が揃ったとき（最後の 1 回）だけ記録する。
+        no-log の要求は、async_log_success_event と同じく記録しない（LiteLLM の should_run_callback と揃える）。"""
+        if _no_log(kwargs):
+            return kwargs, result
+        if kwargs.get("stream") is not True or "async_complete_streaming_response" in kwargs:
+            self._record_once(kwargs)
+        return kwargs, result
+
     async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
-        self._record(kwargs)
+        self._record_once(kwargs)   # async_logging_hook で記録できなかったときの予備
 
     async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
         self._record(kwargs)
 
-    def _record(self, kwargs: dict) -> None:
-        if not self.enabled:
+    def _record_once(self, kwargs: dict) -> None:
+        """同じ要求の成功を 1 回だけ記録する（async_logging_hook と async_log_success_event の両方から呼ぶ）。
+        印は LiteLLM の model_call_details に付ける。後で渡される写しにも残る。"""
+        if kwargs.get(RECORDED_MARK):
             return
+        if self._record(kwargs):
+            kwargs[RECORDED_MARK] = True
+
+    def _record(self, kwargs: dict) -> bool:
+        """記録する。記録したか、記録しないと決めた（審査の中の呼び出し）なら True。
+        本文（standard_logging_object）がまだ無いなど、後でやり直すべきときは False。"""
+        if not self.enabled:
+            return True
         try:
             slp = kwargs.get("standard_logging_object") or {}
-            if not slp or is_internal(kwargs, slp):
-                return
+            if not slp:
+                return False
+            if is_internal(kwargs, slp):
+                return True
             record = build_request_record(kwargs, slp, self.pod)
             body = build_body(record, slp)
             with self.lock:
                 self.buffer.add(float(slp.get("startTime") or time.time()), record, body)
+            return True
         except Exception as e:  # noqa: BLE001 監査ログの失敗で要求を止めない
             import traceback
             where = traceback.extract_tb(e.__traceback__)[-1]
             print(f"{LOG_PREFIX}: 記録を作れませんでした: {type(e).__name__}: {e}（{where.name}:{where.lineno}）",
                   flush=True)
+            return False
 
     def record_review(self, entry: dict) -> None:
         """審査のガードレールから、判定 1 件を受け取る（記録だけ。本文は無い）。"""
