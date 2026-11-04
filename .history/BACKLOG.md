@@ -57,7 +57,7 @@
 - [ ] 検証を amd64 の VM でも流す（今回は arm64 だけ。ビルドは VM 上なのでアーキテクチャの違いは `uname -m` の判別だけだが、`google_workspace_mcp` の amd64 のイメージの有無は未確認）（追加 2026-10-31、重要 低）
 - [ ] Zabbix に LiteLLM の内部指標を取り込む: LiteLLM の `/metrics` は公式文書が Enterprise の機能と表示しているので無償版で出るか確かめ、出なければ `/health` と監査ログの件数で代える。PostgreSQL は CloudNativePG の状態で監視済み（2026-10-31）（追加 2026-10-31、重要 中）
 - [ ] 本物の踏み台での確認: provided の踏み台は操作者が SSH できる前提（`LAB_VM_BASTION_HOST`）。踏み台の SSH が別の経路（Zscaler Private Access など）のときの転送の張り方は未設計（追加 2026-10-31、重要 中）
-- [ ] 台を止める場面で LiteLLM が 1 台に偏る: AWS の `valkey-node` で、止めた台に LiteLLM の 4 台のうち 3 台・Valkey の primary・Pooler の 1 台が載り、回復まで 179.5 秒（目安 120 秒）。分散の指定が `ScheduleAnyway` で、HPA が縮めた直後に偏った。直すか（分散の強さ、最小台数、descheduler など）目安を見直すかを決める（結果は `.history/2026-10-31-内部LBとVM側の防御とZabbix/変更設計書.md` 15.2 節 の 33）（追加 2026-11-04、重要 高） 2026-11-04: 設計を見直す（ユーザー回答 1A）。ヒアリング中
+- [ ] 台を止める場面で LiteLLM 全体が DB に届かなくなる: AWS の `valkey-node` で回復まで 179.5 秒（目安 120 秒）。止めた台に PostgreSQL と Valkey の primary と Pooler の 1 台が載り、別の台の LiteLLM も readiness（DB だけを見る）が 503 になった。同じく両方の primary が載った `pg-node` は 70.5 秒で、差の原因は未特定。原因を切り分けてから設計を見直す（`.history/2026-10-31-内部LBとVM側の防御とZabbix/変更設計書.md` 15.2 節の 33。ユーザー回答 2026-11-04 の 1A は「LiteLLM の偏り」という誤った前提への回答で、前提を訂正して確認中）（追加 2026-11-04、重要 高）
 - [ ] `worker-node` の場面で、止める足す台に LiteLLM が載っていることを確かめてから止める（AWS では 0 台の台を止めた。結果は `.history/2026-10-31-内部LBとVM側の防御とZabbix/変更設計書.md` 15.2 節 の 35）（追加 2026-11-04、重要 低）
 
 ## 冗長化と監査ログ
