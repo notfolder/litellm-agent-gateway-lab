@@ -289,7 +289,14 @@ def _stop_node(node: str, load: Load, env: Env | None = None) -> None:
     if node == SERVER_NODE:
         raise LabError("server ノードは止めません（Kubernetes の制御部分と RustFS が載っている）")
     info(f"ノード {node} を {NODE_DOWN_SECONDS} 秒止めます")
-    run(["docker", "stop", node], quiet=True)
+    # Docker が混んでいると docker stop が「did not receive an exit event」で終了コード 1 を返し、少し遅れて止まることがある
+    # （2026-11-04 に Mac で 3 回）。終了コードではなく、コンテナが実際に止まったかで判断する（最長 60 秒待つ）
+    stopped = run(["docker", "stop", node], check=False, capture=True, quiet=True)
+    deadline = time.time() + 60
+    while output(["docker", "inspect", "-f", "{{.State.Running}}", node], check=False).strip() != "false":
+        if time.time() > deadline:
+            raise LabError(f"ノード {node} を止められませんでした: {(stopped.stderr or '').strip()[:300]}")
+        time.sleep(2)
     try:
         time.sleep(NODE_DOWN_SECONDS)
     finally:
