@@ -95,7 +95,7 @@ flowchart TB
         ACM["ACM 証明書<br/>（cert スタック）"]
         ECR["ECR<br/>litellm-lab / audit-lab"]
         SM["Secrets Manager<br/>app / aurora / valkey-auth"]
-        BED["Bedrock<br/>Claude Sonnet 4.5 / Haiku 4.5（jp. プロファイル）"]
+        BED["Bedrock（jp. プロファイル）<br/>Claude Code: Sonnet 4.6 / Haiku 5.5 / Opus 5.5<br/>審査官: Haiku 4.5"]
         subgraph VPC["VPC 10.60.0.0/16（3 AZ）— network スタック"]
             subgraph PUB["public サブネット × 3"]
                 ALB["ALB（Ingress が作る）<br/>443、パススルーの遮断"]

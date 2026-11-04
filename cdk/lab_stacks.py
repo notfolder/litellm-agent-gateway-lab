@@ -103,7 +103,8 @@ class DataStack(cdk.Stack):
             image_scan_on_push=False, empty_on_delete=True, removal_policy=cdk.RemovalPolicy.DESTROY,
             lifecycle_rules=[ecr.LifecycleRule(max_image_count=10)]) for name in ("litellm-lab", "audit-lab")}
         # アプリの秘密情報 {prefix}/app は ./lab secrets（labtool/aws.py）が作って育てる。ここでは読む権限だけを配る
-        app_secret_arn = self.format_arn(service="secretsmanager", resource="secret", resource_name=f"{prefix}/app-*")
+        app_secret_arn = self.format_arn(service="secretsmanager", resource="secret", resource_name=f"{prefix}/app-*",
+                                        arn_format=cdk.ArnFormat.COLON_RESOURCE_NAME)
         self.roles["external-secrets"].add_to_policy(iam.PolicyStatement(
             actions=["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
             resources=[app_secret_arn, self.aurora.secret.secret_arn, self.valkey_auth.secret_arn]))
@@ -118,6 +119,7 @@ class DataStack(cdk.Stack):
         cdk.CfnOutput(self, "ValkeyPort", value=self.valkey.attr_primary_end_point_port)
         cdk.CfnOutput(self, "ValkeyAuthSecretName", value=self.valkey_auth.secret_name)
         cdk.CfnOutput(self, "EfsFileSystemId", value=self.efs.file_system_id)
+        cdk.CfnOutput(self, "EfsTokenAccessPointId", value=self.token_access_point.access_point_id)
         for key, role in self.roles.items():
             cdk.CfnOutput(self, f"Role{key.title().replace('-', '')}Arn", value=role.role_arn)
 
@@ -263,12 +265,19 @@ class DataStack(cdk.Stack):
     def _efs(self, spec: dict, vpc: ec2.Vpc) -> efs.FileSystem:
         sg = ec2.SecurityGroup(self, "EfsSg", vpc=vpc, description="EFS (lab)")
         sg.add_ingress_rule(ec2.Peer.ipv4(vpc.vpc_cidr_block), ec2.Port.tcp(2049), "from inside the VPC")
-        return efs.FileSystem(
+        fs = efs.FileSystem(
             self, "Efs", vpc=vpc, security_group=sg, encrypted=True,
             vpc_subnets=ec2.SubnetSelection(subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS),
             lifecycle_policy=efs.LifecyclePolicy.AFTER_30_DAYS,
-            removal_policy=cdk.RemovalPolicy.DESTROY,   # 中身は chatgpt/ のトークンだけ（Mac の LAB_DATA_DIR から入れ直せる）
+            removal_policy=cdk.RemovalPolicy.DESTROY,   # 中身は chatgpt/ のトークンだけ（./lab down が消す前に Mac へ戻す）
         )
+        # chatgpt/ のトークンの置き場。data に置いて、compute（クラスタ）を作り直しても同じ場所を使う。LiteLLM が更新した
+        # リフレッシュトークンは使い捨てで入れ替わるので、クラスタごとに場所が変わると Mac の古い写しに戻ってしまう（2026-11-03）
+        self.token_access_point = fs.add_access_point(
+            "ChatgptTokenAp", path="/lab/chatgpt-token",
+            create_acl=efs.Acl(owner_uid="1000", owner_gid="1000", permissions="700"),
+            posix_user=efs.PosixUser(uid="1000", gid="1000"))
+        return fs
 
 
 class ComputeStack(cdk.Stack):

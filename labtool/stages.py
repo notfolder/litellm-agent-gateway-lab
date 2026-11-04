@@ -93,6 +93,14 @@ def ensure_access(env: Env) -> None:
     （切れていれば）張り直す。段階を単独で流すときも、./lab up でも、最初に呼ぶ（基盤が無ければ何もしない）。"""
     if env.is_vm:
         vm.ensure_access(env)
+    elif env.is_aws:
+        # preflight を通らない単独のコマンド（試験など）でも、アカウントとバケットの接頭辞を Env に載せる
+        if not env.values.get("LAB_AWS_ACCOUNT"):
+            account = aws.identity(env)["Account"]
+            env.values["LAB_AWS_ACCOUNT"] = account
+            env.values["LAB_AWS_BUCKET_PREFIX"] = render.bucket_prefix(env, account)
+        # マスターキーと利用者のキーは Secrets Manager にある。.env に別の環境（Mac）の値が残っていても、こちらで上書きする
+        aws.load_app_secret(env, required=False)
 
 
 def _preflight_vm(env: Env) -> None:
@@ -868,6 +876,8 @@ def audit(env: Env) -> None:
         viewer_manifest = render.add_egress_text(render_template(K8S / "audit-viewer.yaml", values), env)
         if env.is_vm:
             viewer_manifest = render.add_admin_middleware(viewer_manifest)   # 検索アプリは踏み台からだけ（変更設計書 2026-10-31 5.1 節）
+        if env.is_aws:
+            viewer_manifest = render.without_traefik(viewer_manifest)   # 経路は ALB の Ingress の /lab-audit
         kapply(manifest=viewer_manifest)
         if env.is_vm:
             kapply(manifest=render.tls_ingressroutes(viewer_manifest))   # HTTPS の経路（web は 443 へ転送される）
@@ -929,7 +939,7 @@ def bootstrap(env: Env) -> None:
     キーの値は .env の固定値を使うので、DB を作り直しても同じキーが作り直される。
     既にあれば作らず、役割と MCP の権限だけを揃える。"""
     step("bootstrap 初期データ")
-    if env.is_aws and not env.get("LITELLM_MASTER_KEY"):
+    if env.is_aws:
         aws.load_app_secret(env)
     # ローリング更新の直後は、終了中の Pod に当たって一時的に失敗することがあるので、少し待つ
     wait_until(60, f"LiteLLM への接続（{env.base_url}）", lambda: http_ok(f"{env.base_url}/health/liveliness"))
@@ -1057,7 +1067,7 @@ def clients(env: Env) -> None:
     .codex-lab-noreview/（審査を外したキーの Codex の CODEX_HOME）。
     どのユーザーのキーを使うかは .env の LAB_CLIENT_USER（1 か 2、既定 1）で選ぶ。"""
     step("clients クライアントの設定")
-    if env.is_aws and not env.get("LITELLM_MASTER_KEY"):
+    if env.is_aws:
         aws.load_app_secret(env)
     user = env.get("LAB_CLIENT_USER", "1")
     if not env.has_users():

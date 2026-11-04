@@ -29,7 +29,7 @@ Summary:
    - User then demanded: 「./lab downでも消えない有料リソースがあるのは困ります。有料リソースは現時点で全て消してください。」 and 「./lab downで消えるようにしておいてください」 → implemented and executed.
    - User asked (research request) whether buying credits/setting budgets could unblock the account restrictions; asked whether to set up a "payment profile" (answer: not needed); asked whether EC2 limits are still 0 (yes).
    - Project rules (CLAUDE.md): respond in Japanese; spec/design docs updated only after implementation+tests; change specs live in `.history/<日付>-<目的>/`; push only with explicit permission; `.history/` fully committed; questions in a numbered 確認事項 with options/recommendation; Google/login/consent buttons pressed by user; estimate-log rules in `~/.claude/estimate-log.md`; `~/.claude` committed only from home-directory sessions.
-   - Security/constraint notes: do not state credential values in chat; `~/.claude` synced files are public (no tokens/passwords/home hostnames); the user's email `notfolder@gmail.com` used only for Identity Center user creation; Cloudflare CNAMEs must be "DNS only" (grey cloud).
+   - Security/constraint notes: do not state credential values in chat; `~/.claude` synced files are public (no tokens/passwords/home hostnames); the user's email `<ユーザー1のメール>` used only for Identity Center user creation; Cloudflare CNAMEs must be "DNS only" (grey cloud).
 
 2. Key Technical Concepts:
    - IAM Identity Center (organization instance, single-region Tokyo, AWS-owned key), user `notfolder`, permission set `AdministratorAccess` (12-hour session), access portal URL `https://d-95679b6df1.awsapps.com/start`, SSO profile `litellm-lab` (`sso_region ap-northeast-1`).

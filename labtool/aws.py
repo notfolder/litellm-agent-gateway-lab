@@ -10,11 +10,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 from . import render
 from .core import (
@@ -163,12 +165,19 @@ def empty_bucket(s3, bucket: str) -> int:
     """バケットの全オブジェクトの全版（削除マーカーも）を消す。GOVERNANCE の Object Lock は保持を越えて消す
     （操作者に s3:BypassGovernanceRetention が要る）。消した版の数を返す。aws-ec2 の削除（labtool/clouds/aws_ec2.py）も使う。"""
     n = 0
+    # 保持を越える指定は Object Lock のあるバケットだけに付ける（無いバケットに付けると InvalidArgument。2026-11-04）
+    try:
+        s3.get_object_lock_configuration(Bucket=bucket)
+        bypass = {"BypassGovernanceRetention": True}
+    except s3.exceptions.ClientError as e:
+        if e.response.get("Error", {}).get("Code") != "ObjectLockConfigurationNotFoundError":
+            raise
+        bypass = {}
     for page in s3.get_paginator("list_object_versions").paginate(Bucket=bucket):
         objs = [{"Key": o["Key"], "VersionId": o["VersionId"]}
                 for k in ("Versions", "DeleteMarkers") for o in page.get(k, [])]
         for i in range(0, len(objs), 1000):
-            s3.delete_objects(Bucket=bucket, Delete={"Objects": objs[i:i + 1000], "Quiet": True},
-                              BypassGovernanceRetention=True)
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": objs[i:i + 1000], "Quiet": True}, **bypass)
             n += len(objs[i:i + 1000])
     return n
 
@@ -208,6 +217,18 @@ def purge_retained(env: Env) -> None:
         if snap["DBClusterIdentifier"].startswith(env.aws_prefix):
             rds.delete_db_cluster_snapshot(DBClusterSnapshotIdentifier=snap["DBClusterSnapshotIdentifier"])
             info(f"Aurora のスナップショット {snap['DBClusterSnapshotIdentifier']} を消しました")
+    # ElastiCache も、data スタックを消すときに CloudFormation が最後のスナップショットを取る（2026-11-04 に残っていた）
+    ec = client(env, "elasticache")
+    for snap in ec.describe_snapshots()["Snapshots"]:
+        name = snap["SnapshotName"]
+        owners = (name, snap.get("ReplicationGroupId") or "", snap.get("CacheClusterId") or "")
+        if not any(o.startswith(env.aws_prefix) for o in owners):   # 自動の分は名前が automatic. で始まる
+            continue
+        try:
+            ec.delete_snapshot(SnapshotName=name)
+            info(f"ElastiCache のスナップショット {name} を消しました")
+        except ec.exceptions.ClientError as e:
+            warn(f"ElastiCache のスナップショット {name} を消せませんでした（{e.response['Error']['Code']}）")
     ecr = client(env, "ecr")
     for repo in ("litellm-lab", "audit-lab"):
         try:
@@ -348,9 +369,13 @@ def ensure_app_secret(env: Env) -> dict:
     return data
 
 
-def load_app_secret(env: Env) -> None:
-    """アプリの秘密情報を Env に載せる（bootstrap や試験が、マスターキーと利用者のキーを使うため）。"""
+def load_app_secret(env: Env, required: bool = True) -> None:
+    """アプリの秘密情報を Env に載せる（bootstrap や試験が、マスターキーと利用者のキーを使うため）。
+    .env に同じ名前の値（Mac の環境のキーなど）があっても、Secrets Manager の値で上書きする。
+    required=False なら、まだ作っていないとき（初回の ./lab up の secrets より前）は何もしない。"""
     data = read_json_secret(env, app_secret_name(env))
+    if not data and not required:
+        return
     if not data:
         raise LabError(f"Secrets Manager に {app_secret_name(env)} がありません。先に ./lab secrets を流してください")
     for k, v in data.items():
@@ -363,15 +388,19 @@ def database_resource_id(env: Env, out: dict) -> str:
 
 
 # ---- ChatGPT のトークンを共有ボリュームへ ----
-def sync_chatgpt_token(env: Env) -> None:
-    """Mac の auth.json を、全 Pod で共有する EFS の PVC（chatgpt-token）に写す。使い捨ての Pod でコピーする。"""
+TOKEN_POD = "chatgpt-token-sync"
+TOKEN_MARK = "/token/.synced-from-mac"     # 最後に Mac から写した auth.json のハッシュ（ボリュームの中に残す）
+TOKEN_ANNOTATION = "litellm-lab/token-sha256"
+
+
+@contextlib.contextmanager
+def _token_pod(env: Env):
+    """共有ボリューム（PVC chatgpt-token）を /token に付けた使い捨ての Pod。終わったら消す。"""
     from .core import NS, kn, wait_until
-    token = env.chatgpt_token_file
-    pod = "chatgpt-token-sync"
-    run(kn("delete", "pod", pod, "--ignore-not-found", "--wait=true"), quiet=True)
+    run(kn("delete", "pod", TOKEN_POD, "--ignore-not-found", "--wait=true"), quiet=True)
     manifest = {
         "apiVersion": "v1", "kind": "Pod",
-        "metadata": {"name": pod, "namespace": NS},
+        "metadata": {"name": TOKEN_POD, "namespace": NS},
         "spec": {"restartPolicy": "Never",
                  "containers": [{"name": "sync", "image": "public.ecr.aws/docker/library/busybox:1.37",
                                  "command": ["sleep", "600"],
@@ -380,12 +409,76 @@ def sync_chatgpt_token(env: Env) -> None:
     }
     run(kn("apply", "-f", "-"), input=json.dumps(manifest), quiet=True)
     try:
-        wait_until(300, "トークンをコピーする Pod の起動", kn("wait", "--for=condition=Ready", f"pod/{pod}", "--timeout=5s"))
-        run(kn("cp", str(token), f"{pod}:/token/auth.json"), quiet=True)
-        run(kn("exec", pod, "--", "chmod", "600", "/token/auth.json"), quiet=True)
-        ok("ChatGPT のトークンを共有ボリュームに写しました")
+        wait_until(300, "トークンを扱う Pod の起動", kn("wait", "--for=condition=Ready", f"pod/{TOKEN_POD}", "--timeout=5s"))
+        yield TOKEN_POD
     finally:
-        run(kn("delete", "pod", pod, "--ignore-not-found", "--wait=false"), quiet=True)
+        run(kn("delete", "pod", TOKEN_POD, "--ignore-not-found", "--wait=false", "--grace-period=1"), quiet=True)
+
+
+def sync_chatgpt_token(env: Env) -> None:
+    """Mac の auth.json を、全 Pod で共有する EFS の PVC（chatgpt-token）に写す。
+    LiteLLM はトークンを更新すると、使い捨てのリフレッシュトークンをボリュームにだけ書く。だから写すのは
+    「ボリュームにトークンが無い」か「Mac の auth.json が、最後に写したときから変わった（サインインし直した）」ときだけにする。
+    それ以外はボリュームのトークン（更新済みかもしれない）を使い続ける。写した中身のハッシュはボリュームの中（TOKEN_MARK）と
+    PVC の注釈に残し、注釈が同じなら Pod も作らない（./lab up を何度流しても何も変えない）。"""
+    import hashlib
+    from .core import kn, output
+    token = env.chatgpt_token_file
+    digest = hashlib.sha256(token.read_bytes()).hexdigest()[:32]
+    noted = output(kn("get", "pvc", "chatgpt-token", "-o",
+                      "jsonpath={.metadata.annotations.litellm-lab/token-sha256}"), check=False).strip()
+    if noted == digest:
+        ok("ChatGPT のトークンは共有ボリュームにあります（Mac の auth.json は前に写したときから変わっていません）")
+        return
+    with _token_pod(env) as pod:
+        state = output(kn("exec", pod, "--", "sh", "-c",
+                          f"test -s /token/auth.json && echo has || echo none; cat {TOKEN_MARK} 2>/dev/null"),
+                       check=False).split()
+        has_token, marked = (state[0] == "has") if state else False, (state[1] if len(state) > 1 else "")
+        if has_token and marked == digest:
+            ok("ChatGPT のトークンは共有ボリュームのものを使います（Mac の auth.json は前に写したときから変わっていません）")
+        else:
+            run(kn("cp", str(token), f"{pod}:/token/auth.json"), quiet=True)
+            run(kn("exec", pod, "--", "sh", "-c", f"chmod 600 /token/auth.json && echo {digest} > {TOKEN_MARK}"), quiet=True)
+            ok("ChatGPT のトークンを共有ボリュームに写しました"
+               + ("（Mac でサインインし直したため）" if has_token else "（ボリュームが空だったため）"))
+        run(kn("annotate", "pvc", "chatgpt-token", f"{TOKEN_ANNOTATION}={digest}", "--overwrite"), quiet=True)
+
+
+def pull_chatgpt_token(env: Env) -> None:
+    """共有ボリュームのトークン（LiteLLM が更新したもの）を Mac の auth.json に戻す。./lab down が EFS を消す前に呼ぶ。
+    戻さないと、Mac に残るのは使えなくなったリフレッシュトークンで、次の ./lab up で LiteLLM が起動しない（2026-11-03）。"""
+    import tempfile
+    from .core import kn
+    token = env.chatgpt_token_file
+    if not succeeds_quiet(kn("get", "pvc", "chatgpt-token")):
+        return
+    with _token_pod(env) as pod, tempfile.TemporaryDirectory() as tmp:
+        got = Path(tmp) / "auth.json"
+        if run(kn("cp", f"{pod}:/token/auth.json", str(got)), check=False, quiet=True).returncode != 0 or not got.exists():
+            warn("共有ボリュームに ChatGPT のトークンがありません（Mac の auth.json はそのまま）")
+            return
+        try:
+            data = json.loads(got.read_text())
+        except ValueError:
+            warn("共有ボリュームの ChatGPT のトークンが読めません（Mac の auth.json はそのまま）")
+            return
+        if not data.get("refresh_token"):
+            warn("共有ボリュームの ChatGPT のトークンにリフレッシュトークンがありません（Mac の auth.json はそのまま）")
+            return
+        if token.exists() and token.read_bytes() == got.read_bytes():
+            ok("ChatGPT のトークンは Mac と共有ボリュームで同じです")
+            return
+        token.parent.mkdir(parents=True, exist_ok=True)
+        tmp_dest = token.with_suffix(".json.tmp")
+        tmp_dest.write_bytes(got.read_bytes())
+        tmp_dest.chmod(0o600)
+        tmp_dest.replace(token)
+        ok(f"共有ボリュームの ChatGPT のトークン（LiteLLM が更新したもの）を Mac に戻しました（{token}）")
+
+
+def succeeds_quiet(cmd: list[str]) -> bool:
+    return run(cmd, check=False, quiet=True, timeout=60).returncode == 0
 
 
 # ---- フェイルオーバー（障害の試験。変更仕様書 7.2 節） ----
@@ -430,7 +523,13 @@ def drain_litellm_node(env: Env) -> str:
     if not nodes:
         raise LabError("LiteLLM の Pod が載っているノードが見つかりません")
     node = nodes[0]
-    run(kc("drain", node, "--ignore-daemonsets", "--delete-emptydir-data", "--timeout=180s"), quiet=True)
+    # 移す先のノードが無ければ Auto Mode が足す（約 2 分）。PDB（maxUnavailable 1）で 1 つずつ移り、LiteLLM の起動も待つので
+    # 180 秒では足りなかった（2026-11-03）。失敗したらノードを戻してから止める
+    try:
+        run(kc("drain", node, "--ignore-daemonsets", "--delete-emptydir-data", "--timeout=600s"), quiet=True)
+    except Exception:
+        uncordon(node)
+        raise
     return node
 
 
@@ -439,18 +538,29 @@ def uncordon(node: str) -> None:
 
 
 def wait_for_cname(env: Env, alb_host: str) -> None:
-    """手持ちの DNS の CNAME（ホスト名 → ALB）が引けるまで待つ。引けない間は手順を知らせる。"""
+    """手持ちの DNS の CNAME（ホスト名 → ALB）が引けるまで待つ。引けない間は手順を知らせる。
+
+    名前が引けるだけでは足りない（前の構成の古いレコードが残っていることがある）。ホスト名の IP が
+    ALB の IP と重なるまで待つ。ALB の名前は作成から数分は引けないので、その間も待つ。
+    """
     import socket
+
+    def addrs(name: str) -> set[str]:
+        try:
+            return {a[4][0] for a in socket.getaddrinfo(name, 443, proto=socket.IPPROTO_TCP)}
+        except socket.gaierror:
+            return set()
+
     host = env.aws_hostname
     start = time.monotonic()
     told = False
     while True:
-        try:
-            socket.getaddrinfo(host, 443)
-            ok(f"{host} が解決できました")
+        got, alb = addrs(host), addrs(alb_host)
+        if got and alb and got & alb:
+            ok(f"{host} が ALB に解決できました")
             return
-        except socket.gaierror:
-            pass
+        if got and alb and not told:
+            warn(f"{host} は ALB 以外（{', '.join(sorted(got))}）に解決されます。古いレコードを書き換えてください")
         if not told:
             warn(f"手持ちの DNS に CNAME を足してください: {host}  →  {alb_host}\n"
                  "  （反映されるまで待ちます。Ctrl-C で中断しても、もう一度 ./lab up を流せば続きから進みます）")

@@ -23,6 +23,12 @@ def down(everything: bool = False) -> None:
     env = Env.load()
     if env.is_aws:
         from . import aws
+        # LiteLLM が更新した ChatGPT のトークンは EFS にだけある。消す前に Mac に戻す（次の ./lab up で使えるように）
+        if env.has_chatgpt():
+            try:
+                aws.pull_chatgpt_token(env)
+            except Exception as e:  # noqa: BLE001 戻せなくても削除は続ける（次の ./lab up でサインインし直せる）
+                warn(f"ChatGPT のトークンを Mac に戻せませんでした（{e}）。次の ./lab up の前に ./lab chatgpt-login が要るかもしれません")
         # Ingress を先に消して ALB を片付けさせる（残っていると compute のスタックの削除が止まる）
         if succeeds(kn("get", "ingress", "litellm"), timeout=60):
             info("ALB の入口（Ingress）を消します")

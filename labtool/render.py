@@ -318,10 +318,9 @@ def helm_overrides(env: Env, image_repo: str, image_tag: str, config_hash: str, 
                 "AUDIT_S3_KEY_PREFIX": raw_prefix,
                 "AUDIT_S3_RETENTION_DAYS": retention["RAW_RETENTION_DAYS"],
                 "AUDIT_S3_RETENTION_MODE": retention["RETENTION_MODE"],
-                # boto3 1.36 以降の既定（送信時のチェックサム、aws-chunked）を GCS の XML API が署名不一致で拒む。
-                # S3 互換のストレージ向けの公式の回避策（AWS S3 には害が無い。配備で判明 2026-10-30）
-                "AWS_REQUEST_CHECKSUM_CALCULATION": "when_required",
-                "AWS_RESPONSE_CHECKSUM_VALIDATION": "when_required",
+                # boto3 のチェックサムの扱い（GCS は when_required、AWS S3 は既定。s3_checksum_mode）
+                "AWS_REQUEST_CHECKSUM_CALCULATION": s3_checksum_mode(env),
+                "AWS_RESPONSE_CHECKSUM_VALIDATION": s3_checksum_mode(env),
             })
             # イメージはクラスタの中の置き場（registry）から。chatgpt/ のトークンは置かない（共有ファイルシステムが無い。
             # 変更仕様書 2026-10-25-EC2三台構成 4.2 節）ので hostPath を外し、退避先だけにする
@@ -729,11 +728,13 @@ def litellm_priority_class_manifest() -> str:
 # ---- AWS 環境（LAB_TARGET=aws）。変更仕様書 2026-10-24-AWS構成 ----
 # Bedrock のモデル ID の既定（日本内で処理するクロスリージョン推論プロファイル。.env の LAB_BEDROCK_* で変えられる）
 BEDROCK_DEFAULTS = {
-    "claude-sonnet-4-5": ("LAB_BEDROCK_SONNET", "jp.anthropic.claude-sonnet-4-5-20250929-v1:0"),
-    "claude-haiku-4-5": ("LAB_BEDROCK_HAIKU", "jp.anthropic.claude-haiku-4-5-20251001-v1:0"),
-    # Opus は日本内のプロファイルが無いので既定は空（登録しない）。使うなら LAB_BEDROCK_OPUS に Global の ID を入れる
-    "claude-opus-4-6": ("LAB_BEDROCK_OPUS", ""),
+    # Sonnet 5.5 は東京の jp. プロファイルに無いので、jp. にある最新の Sonnet 4.6 にする（出たら 5.5 に移す。ユーザー判断 2026-11-04）
+    "claude-sonnet-4-6": ("LAB_BEDROCK_SONNET", "jp.anthropic.claude-sonnet-4-6"),
+    "claude-haiku-5-5": ("LAB_BEDROCK_HAIKU", "jp.anthropic.claude-haiku-5-5"),
+    "claude-opus-5-5": ("LAB_BEDROCK_OPUS", "jp.anthropic.claude-opus-5-5"),
 }
+# 2 つの審査官の既定（Claude Haiku 4.5 の日本内プロファイル）。判定の精度が変わるので Claude Code のモデルとは別に持つ
+BEDROCK_JUDGE_DEFAULT = "jp.anthropic.claude-haiku-4-5-20251001-v1:0"
 # LiteLLM のパススルー（素通し）の経路。入口で 403 にする（spec 4.2。k8s/ingress.yaml の Traefik の正規表現と同じ一覧）
 PASSTHROUGH_PROVIDERS = [
     "anthropic", "assemblyai", "eu.assemblyai", "azure", "azure_ai", "bedrock", "cohere", "cursor", "fal_ai", "gemini",
@@ -795,10 +796,18 @@ def vm_judge_model(env: Env) -> str:
     return env.get("LAB_VM_JUDGE_MODEL") or DEFAULT_VM_JUDGE_MODEL
 
 
+def s3_checksum_mode(env: Env) -> str:
+    """boto3 の AWS_REQUEST_CHECKSUM_CALCULATION / AWS_RESPONSE_CHECKSUM_VALIDATION の値。
+    boto3 1.36 以降の既定（送信時のチェックサム、aws-chunked）を GCS の XML API が署名不一致で拒むので、S3 互換のストレージ
+    （GCS、Mac の RustFS）は when_required にする。AWS S3 は逆に、保持（Object Lock）の掛かるバケットへの書き込みに
+    チェックサムを求める（無いと InvalidRequest。2026-11-03 の EKS 版の配備で判明）ので、既定の when_supported のまま。"""
+    return "when_supported" if env.on_aws else "when_required"
+
+
 def audit_s3_settings(env: Env) -> dict[str, str]:
     """監査の Pod（整形の CronJob、検索アプリ、試験の Job）に渡す S3 互換の設定（接続先、リージョン、バケット名の接頭辞）。
     Mac は RustFS、EKS 版は AWS S3（Pod Identity）、VM の環境はクラウドのバケット（静的キー）。"""
-    base = retention_settings(env)
+    base = retention_settings(env) | {"S3_CHECKSUM": s3_checksum_mode(env)}
     if env.is_aws:
         return base | {"S3_ENDPOINT": "", "S3_REGION": env.aws_region, "S3_BUCKET_PREFIX": env.get("LAB_AWS_BUCKET_PREFIX", ""),
                        "S3_BUCKET": ""}
@@ -824,15 +833,15 @@ def aws_claude_models(env: Env) -> dict[str, str]:
 
 def aws_judge_model(env: Env) -> str:
     """2 つの審査官の Bedrock のモデル ID（既定は Claude Haiku 4.5 の日本内プロファイル）。"""
-    return env.get("LAB_AWS_JUDGE_MODEL") or BEDROCK_DEFAULTS["claude-haiku-4-5"][1]
+    return env.get("LAB_AWS_JUDGE_MODEL") or BEDROCK_JUDGE_DEFAULT
 
 
 def claude_code_model_env(env: Env) -> dict[str, str]:
     """Claude Code の別名をゲートウェイのモデル名に向ける環境変数。Opus が無ければ Sonnet に落とす。"""
     models = aws_claude_models(env)
-    sonnet = "claude-sonnet-4-5" if "claude-sonnet-4-5" in models else next(iter(models))
-    haiku = "claude-haiku-4-5" if "claude-haiku-4-5" in models else sonnet
-    opus = "claude-opus-4-6" if "claude-opus-4-6" in models else sonnet
+    sonnet = "claude-sonnet-4-6" if "claude-sonnet-4-6" in models else next(iter(models))
+    haiku = "claude-haiku-5-5" if "claude-haiku-5-5" in models else sonnet
+    opus = "claude-opus-5-5" if "claude-opus-5-5" in models else sonnet
     return {"ANTHROPIC_MODEL": sonnet, "ANTHROPIC_DEFAULT_SONNET_MODEL": sonnet,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": haiku, "ANTHROPIC_DEFAULT_OPUS_MODEL": opus,
             "CLAUDE_CODE_SUBAGENT_MODEL": sonnet}
@@ -870,17 +879,22 @@ def nodepool_manifest(env: Env) -> str:
     return yaml.safe_dump(doc, sort_keys=False)
 
 
+EFS_TOKEN_PV = "lab-chatgpt-token"
+
+
 def efs_manifests(out: dict) -> str:
-    """chatgpt/ のトークンを全 Pod で共有する EFS の StorageClass と PVC（アクセスポイントで動的に切り出す）。"""
+    """chatgpt/ のトークンを全 Pod で共有する EFS の PV と PVC。data スタックの固定のアクセスポイントを静的に割り当てる
+    （動的に切り出すと、クラスタを作り直すたびに別の場所になり、LiteLLM が更新したトークンを失う。2026-11-03）。"""
     docs = [
-        {"apiVersion": "storage.k8s.io/v1", "kind": "StorageClass",
-         "metadata": {"name": "lab-efs"},
-         "provisioner": "efs.csi.aws.com",
-         "parameters": {"provisioningMode": "efs-ap", "fileSystemId": out["EfsFileSystemId"],
-                        "directoryPerms": "700", "uid": "1000", "gid": "1000", "basePath": "/lab"}},
+        {"apiVersion": "v1", "kind": "PersistentVolume",
+         "metadata": {"name": EFS_TOKEN_PV},
+         "spec": {"capacity": {"storage": "1Gi"}, "accessModes": ["ReadWriteMany"],
+                  "persistentVolumeReclaimPolicy": "Retain", "storageClassName": "",
+                  "csi": {"driver": "efs.csi.aws.com",
+                          "volumeHandle": f"{out['EfsFileSystemId']}::{out['EfsTokenAccessPointId']}"}}},
         {"apiVersion": "v1", "kind": "PersistentVolumeClaim",
          "metadata": {"name": "chatgpt-token", "namespace": "litellm-lab"},
-         "spec": {"accessModes": ["ReadWriteMany"], "storageClassName": "lab-efs",
+         "spec": {"accessModes": ["ReadWriteMany"], "storageClassName": "", "volumeName": EFS_TOKEN_PV,
                   "resources": {"requests": {"storage": "1Gi"}}}},
     ]
     return yaml.safe_dump_all(docs, sort_keys=False)
@@ -929,14 +943,15 @@ def external_secrets_manifest(env: Env, out: dict) -> str:
     litellm = _external_secret("litellm-secrets", extract=app, data=[
         {"secretKey": "REDIS_PASSWORD", "remoteRef": {"key": redis}},
     ], template={
+        # ESO のテンプレートは無い項目を .KEY で参照するとエラーで止まる（missingkey=error）。無いかもしれない項目は index で引く。
         # 取り出した項目はそのまま渡し、Google の SSO 用の名前（GOOGLE_CLIENT_*）を OAuth クライアントから作る
         "LITELLM_MASTER_KEY": "{{ .LITELLM_MASTER_KEY }}",
         "LITELLM_SALT_KEY": "{{ .LITELLM_SALT_KEY }}",
         "REDIS_PASSWORD": "{{ .REDIS_PASSWORD }}",
-        "GOOGLE_CLIENT_ID": "{{ .GOOGLE_OAUTH_CLIENT_ID | default \"\" }}",
-        "GOOGLE_CLIENT_SECRET": "{{ .GOOGLE_OAUTH_CLIENT_SECRET | default \"\" }}",
-        "GOOGLE_OAUTH_CLIENT_ID": "{{ .GOOGLE_OAUTH_CLIENT_ID | default \"\" }}",
-        "GOOGLE_OAUTH_CLIENT_SECRET": "{{ .GOOGLE_OAUTH_CLIENT_SECRET | default \"\" }}",
+        "GOOGLE_CLIENT_ID": "{{ index . \"GOOGLE_OAUTH_CLIENT_ID\" | default \"\" }}",
+        "GOOGLE_CLIENT_SECRET": "{{ index . \"GOOGLE_OAUTH_CLIENT_SECRET\" | default \"\" }}",
+        "GOOGLE_OAUTH_CLIENT_ID": "{{ index . \"GOOGLE_OAUTH_CLIENT_ID\" | default \"\" }}",
+        "GOOGLE_OAUTH_CLIENT_SECRET": "{{ index . \"GOOGLE_OAUTH_CLIENT_SECRET\" | default \"\" }}",
     })
     docs = [
         litellm,
@@ -949,8 +964,8 @@ def external_secrets_manifest(env: Env, out: dict) -> str:
     ]
     if env.has_google() or env.get("LAB_AUDIT_OIDC_CLIENT_ID"):
         docs.append(_external_secret("audit-viewer-oidc", extract=app, template={
-            "AUDIT_OIDC_CLIENT_ID": "{{ .LAB_AUDIT_OIDC_CLIENT_ID | default .GOOGLE_OAUTH_CLIENT_ID }}",
-            "AUDIT_OIDC_CLIENT_SECRET": "{{ .LAB_AUDIT_OIDC_CLIENT_SECRET | default .GOOGLE_OAUTH_CLIENT_SECRET }}"}))
+            "AUDIT_OIDC_CLIENT_ID": "{{ index . \"LAB_AUDIT_OIDC_CLIENT_ID\" | default (index . \"GOOGLE_OAUTH_CLIENT_ID\") }}",
+            "AUDIT_OIDC_CLIENT_SECRET": "{{ index . \"LAB_AUDIT_OIDC_CLIENT_SECRET\" | default (index . \"GOOGLE_OAUTH_CLIENT_SECRET\") }}"}))
     if env.has_google():
         docs.append(_external_secret("workspace-mcp", data=pick("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET")))
     return yaml.safe_dump_all(docs, sort_keys=False)
@@ -985,6 +1000,9 @@ def alb_ingress_manifest(env: Env, out: dict, viewer: bool) -> str:
     paths = []
     for provider in PASSTHROUGH_PROVIDERS:
         paths += [path(f"/{provider}", action("deny-passthrough")), path(f"/{provider}/*", action("deny-passthrough"))]
+    # ALB の * は / もまたぐ（Traefik の ^/[^/]+/mcp/?$ と違う）ので、OAuth の発見用の URL
+    # （/.well-known/oauth-protected-resource/<サーバー名>/mcp。Codex が GET で読む）を先に LiteLLM へ通す（2026-11-03）
+    paths.append(path("/.well-known/*", svc("litellm", 4000)))
     paths.append(path("/*/mcp", action("mcp-get-not-allowed")))
     if viewer:
         paths += [path("/lab-audit", svc("audit-viewer", 8000)), path("/lab-audit/*", svc("audit-viewer", 8000))]
@@ -1147,6 +1165,14 @@ def admin_only_manifest(env: Env) -> str:
                                   "middlewares": [{"name": ADMIN_MIDDLEWARE}],
                                   "services": [{"name": "litellm", "port": 4000}]}]}}
     return yaml.safe_dump_all([middleware, route], sort_keys=False)
+
+
+def without_traefik(manifest_text: str) -> str:
+    """Traefik の資源（traefik.io の IngressRoute、Middleware など）を除く。EKS には Traefik が無く、入口は ALB の Ingress
+    （alb_ingress_manifest）が受け持つ。"""
+    docs = [d for d in yaml.safe_load_all(manifest_text)
+            if d and not str(d.get("apiVersion", "")).startswith("traefik.io/")]
+    return yaml.safe_dump_all(docs, sort_keys=False)
 
 
 def add_admin_middleware(manifest_text: str, names: list[str] | None = None) -> str:

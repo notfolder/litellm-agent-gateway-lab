@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -35,6 +36,18 @@ LIMITS = {"pg-switchover": 60, "pg-pod": 60, "pg-node": 120, "valkey-pod": 60, "
 # 待たせて吸収する（2026-10-12 の実測で、どちらも失敗 0 件）が、直結では新しい primary が立つまでの 15〜50 秒が
 # そのまま失敗になり、最後の失敗まで 54〜77 秒だった（変更仕様書 9.3 節の目安を、1 回目の結果を見て見直した）
 DIRECT_LIMITS = {"pg-switchover": 90, "pg-pod": 90}
+# 回復した後に LiteLLM が Redis（Valkey）に書けるかを、LiteLLM の記録に出る Redis のエラーで確かめる。
+# 2026-11-03 の AWS の Valkey のフェイルオーバーで、要求は失敗 0 件なのに、LiteLLM の Redis の遮断器が閉じなくなり
+# 利用料の集計を Redis に積めない状態が続いた（要求の経路は Redis を通らないので、要求の成否では見えない）。
+# 切り替えの直後は、レプリカが同期し直すまで min-replicas-to-write で書き込みが断られる（NOREPLICAS。2026-11-04 の実測で
+# 約 2 分 20 秒）ので、エラーが出ること自体は許し、REDIS_CLEAN_SECONDS 秒続けてエラーが出なくなるまでの時間を測る。
+# 集計を Redis に積む処理は約 60 秒ごとなので、それより長い間を「出なくなった」とみなす
+REDIS_CLEAN_SECONDS = 75
+REDIS_DEADLINE_SECONDS = 600
+REDIS_ERROR = re.compile(
+    r"circuit breaker is open|Got exception from REDIS|to Redis\. .*Error|Error \d+ connecting to|Connection closed by server"
+    r"|NOREPLICAS|READONLY",
+    re.IGNORECASE)
 # GCP の VM 3 台: 台を止める場面の目安を広げる（ユーザーの判断 2026-10-30: 2A）。入口の台（entry-node）と足す台（worker-node）を
 # 止める場面も、ほかの台を止める場面と同じ目安にする（120 秒、GCP は 180 秒。ユーザーの判断 2026-11-01: 1A）
 GCP_LIMITS = {"pg-node": 180, "valkey-node": 180, "entry-node": 180, "worker-node": 180}
@@ -152,6 +165,41 @@ def valkey_primary(env: Env) -> str:
     from .stages import sentinel_masters
     masters = sentinel_masters(env)
     return masters[0].split(".")[0] if masters else ""
+
+
+def _redis_error_times(env: Env, since: str) -> list[float]:
+    """since（UTC の ISO 8601）以降の LiteLLM の記録から、Redis のエラーの行の時刻（UNIX 秒）を集める。
+    LiteLLM の記録の行頭は UTC の HH:MM:SS なので、日付は今日（UTC）とみなす。"""
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    times: list[float] = []
+    for pod in output(kn("get", "pods", "-l", "app.kubernetes.io/name=litellm", "-o", "name"), check=False).split():
+        for line in output(kn("logs", pod, f"--since-time={since}"), check=False).splitlines():
+            m = re.match(r"(\d{2}:\d{2}:\d{2}) ", line)
+            if m and REDIS_ERROR.search(line):
+                times.append(datetime.fromisoformat(f"{today}T{m.group(1)}+00:00").timestamp())
+    return times
+
+
+def wait_redis_clean(env: Env, t0: float) -> dict:
+    """要求を流して LiteLLM に Redis を使わせながら、Redis のエラーが REDIS_CLEAN_SECONDS 秒続けて出なくなるまで待つ。
+    返す値: エラーの行数（t0 以降）、最後のエラーまでの秒（t0 から）、出なくなったか。"""
+    from datetime import datetime, timezone
+    since = datetime.fromtimestamp(t0, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    load = Load(env)
+    start = time.time()
+    times: list[float] = []
+    while True:
+        for _ in range(5):
+            load._one(time.time())
+            time.sleep(3)
+        times = _redis_error_times(env, since)
+        last = max(times) if times else t0
+        now = time.time()
+        if now - start >= REDIS_CLEAN_SECONDS and now - last >= REDIS_CLEAN_SECONDS:
+            return {"lines": len(times), "last_error_seconds": round(last - t0, 1) if times else 0.0, "clean": True}
+        if now - t0 > REDIS_DEADLINE_SECONDS:
+            return {"lines": len(times), "last_error_seconds": round(last - t0, 1), "clean": False}
 
 
 def litellm_restarts() -> dict[str, int]:
@@ -342,6 +390,7 @@ def run_scenario(env: Env, scenario: str) -> dict:
         if callable(load.cleanup):
             load.cleanup()
     wait_healthy(env)
+    redis = wait_redis_clean(env, t0)
     restarts_after = litellm_restarts()
     fails = [s for s in samples if s.start >= t0 and s.status != 200]
     recovery = (max(s.start for s in fails) - t0) if fails else 0.0
@@ -360,14 +409,17 @@ def run_scenario(env: Env, scenario: str) -> dict:
         "statuses": sorted({s.status for s in fails}), "recovery_seconds": round(recovery, 1),
         "failure_window_seconds": round(window, 1), "limit_seconds": LIMITS[scenario],
         "litellm_restart_loops": repeated, "valkey_masters": masters,
+        "redis_error_lines": redis["lines"], "redis_last_error_seconds": redis["last_error_seconds"],
+        "redis_clean": redis["clean"],
         "pg_primary_after": pg_after, "valkey_primary_after": vk_after,
         "call_ids": [s.call_id for s in samples if s.status == 200 and s.call_id],
+        "call_offsets": {s.call_id: round(s.start - t0, 1) for s in samples if s.status == 200 and s.call_id},
         "t0": t0,
     }
     limit = limit_for(env, scenario)
     result["limit_seconds"] = limit
     result["passed"] = (recovery <= limit and not repeated and result["valkey_masters"] == 1
-                        and baseline_fail == 0)
+                        and baseline_fail == 0 and redis["clean"])
     if scenario == "entry-node":
         # 止めた台が戻ったあと、ロードバランサが 3 台とも健全と見ていること（trigger が確かめた値）
         result["eip_moved"] = bool(getattr(load, "eip_moved", False))
@@ -375,7 +427,8 @@ def run_scenario(env: Env, scenario: str) -> dict:
     (ok if result["passed"] else warn)(
         f"{scenario}: 要求 {result['requests']} 件のうち失敗 {result['failed']} 件"
         f"（状態 {result['statuses']}）、回復まで {result['recovery_seconds']} 秒（目安 {limit} 秒以内）、"
-        f"失敗が続いた時間 {result['failure_window_seconds']} 秒")
+        f"失敗が続いた時間 {result['failure_window_seconds']} 秒、Redis のエラー {redis['lines']} 行"
+        f"（最後は {redis['last_error_seconds']} 秒後。{'その後は出ていない' if redis['clean'] else f'{REDIS_DEADLINE_SECONDS} 秒たっても続く'}）")
     return result
 
 
@@ -404,7 +457,7 @@ def failover(env: Env, scenarios: list[str], audit_check=None) -> None:
         audit_check(results)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = BUILD_DIR / f"failover-{stamp}.json"
-    summary = [{k: v for k, v in r.items() if k != "call_ids"} for r in results]
+    summary = [{k: v for k, v in r.items() if k not in ("call_ids", "call_offsets")} for r in results]
     out.write_text(json.dumps({"target": env.target, "db_pooler": env.get("LAB_DB_POOLER", "pooler"),
                                "results": summary},
                               ensure_ascii=False, indent=2) + "\n")
