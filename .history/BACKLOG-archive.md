@@ -54,3 +54,4 @@
 - [x] (2026-10-31) Zabbix の「Kubernetes nodes by HTTP」テンプレートの扱い — ノード名のホストが VM のホストとぶつかるので使わず、kube-state-metrics の自前のアイテム（Ready・圧迫・cordon・要求の比）で代えた（`.history/2026-10-31-Zabbixの監視の一揃い/`）
 - [x] (2026-11-01) 障害の試験の `entry-node`（Traefik の載った台を止める）と `worker-node`（足す台を止める）の目安を決めて反映する — ほかの台を止める場面と同じ 120 秒、GCP 180 秒（ユーザーの判断 1A）。（GCP の実測: entry-node 131.5 秒、worker-node 61.9 秒。どちらも目安 60 秒。案: 台の停止と同じ 120 / 180 秒、primary を先に移す手順、そのまま。`labtool/failover.py` の `LIMITS`、変更仕様書 2026-10-31 R22、変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 7 章）（追加 2026-10-31、重要 高）
 - [x] (2026-11-01) orca の作業ツリー `feature-aws-target-2` とローカルブランチ `feature/aws-ec2-pair` の削除（ユーザーが orca 側で整理。`git worktree list` は main だけ、ブランチも無いことを確認）
+- [x] (2026-11-04) Mac の k3d を `core.K3S_IMAGE` v1.36.5-k3s1 で作り直して試験が通ることを確かめる（`./lab rebuild` で作り直し、`test-failover` の `valkey-pod` が通った。DB の移行の Job が初回のイメージ取得で 300 秒を超えたので `./lab up` を流し直した）
