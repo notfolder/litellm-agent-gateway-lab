@@ -1473,3 +1473,28 @@ class CloudLayerTest(unittest.TestCase):
             HELM_EXTRA.clear()
             core.MAC_PROXY_CHECK = True
         os.unlink(ca)
+
+class RemoteLoadTest(unittest.TestCase):
+    """障害の試験の負荷を中継の VM から送る（.history/2026-11-05-障害試験の負荷をVPCの中から/）。"""
+
+    def test_sample_from_line(self):
+        from labtool import failover
+        s = failover._sample_from_line(json.dumps({"start": 1.5, "sent": 1.6, "elapsed": 0.2, "status": 503,
+                                                   "call_id": "c1", "detail": "no available server"}))
+        self.assertEqual((s.start, s.sent, s.elapsed, s.status, s.call_id, s.detail),
+                         (1.5, 1.6, 0.2, 503, "c1", "no available server"))
+        self.assertIsNone(failover._sample_from_line("Traceback (most recent call last):"))
+
+    def test_make_load_chooses_mac_without_relay(self):
+        from labtool import failover
+        # Mac、provided、中継の VM が無い managed は Mac から送る
+        self.assertIs(type(failover.make_load(env())), failover.Load)
+        self.assertIs(type(failover.make_load(env(LAB_TARGET="aws-ec2", LAB_INFRA="provided",
+                                                   LAB_VM_PROXY_NODE="i-1"))), failover.Load)
+        self.assertIs(type(failover.make_load(env(LAB_TARGET="aws-ec2"))), failover.Load)
+
+    def test_remote_load_script_is_stdlib_only(self):
+        from labtool import failover
+        text = failover.REMOTE_LOAD_SCRIPT.read_text()
+        imports = set(re.findall(r"^import (\w+)", text, re.M)) | set(re.findall(r"^from (\w+)", text, re.M))
+        self.assertLessEqual(imports, {"json", "sys", "threading", "time", "urllib"})

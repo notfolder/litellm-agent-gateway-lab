@@ -190,7 +190,7 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
     restarts_before = failover.litellm_restarts()
     upgraded: list[str] = []
     t0 = _time.time()
-    load = failover.Load(env) if measure else None
+    load = failover.make_load(env) if measure else None
     if load is not None:
         load.__enter__()
         _time.sleep(10)   # 平常時の様子

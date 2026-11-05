@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import threading
 import time
 import urllib.error
@@ -149,6 +150,65 @@ class Load:
         with self._lock:
             fails = [s.start for s in self.samples if s.status != 200]
         return max(fails) if fails else None
+
+
+REMOTE_LOAD_SCRIPT = BUILD_DIR.parent / "tests" / "failover-load" / "remote_load.py"
+REMOTE_LOAD_PATH = "/tmp/lab-failover-load.py"
+
+
+def _sample_from_line(line: str) -> Sample | None:
+    """中継の VM の送り手が書く 1 行（JSON）を Sample に戻す。読めない行は None。"""
+    try:
+        d = json.loads(line)
+        return Sample(float(d["start"]), int(d["status"]), d.get("call_id", ""), sent=float(d.get("sent", 0.0)),
+                      elapsed=float(d.get("elapsed", 0.0)), detail=d.get("detail", ""))
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+@dataclass
+class RemoteLoad(Load):
+    """負荷を VPC の中（中継の VM）から入口の内部ロードバランサへ送る（VM の managed。変更設計書
+    .history/2026-11-05-障害試験の負荷をVPCの中から/ 2 章）。Mac → 踏み台の SSH の転送を通らないので、転送の側の失敗が混ざらない。"""
+
+    node: object = None
+
+    def run(self) -> None:
+        from . import vm
+        vm.run_on(self.env, self.node, f"cat > {REMOTE_LOAD_PATH}", input_bytes=REMOTE_LOAD_SCRIPT.read_bytes())
+        proc = subprocess.Popen([*vm.ssh_base(self.env, self.node), "python3", "-u", REMOTE_LOAD_PATH],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        # マスターキーは標準入力で渡す（引数にもファイルにも残さない）
+        proc.stdin.write(json.dumps({"url": f"https://{self.env.hostname}", "key": self.env.get("LITELLM_MASTER_KEY"),
+                                     "rate": self.rate}) + "\n")
+        proc.stdin.flush()
+        reader = threading.Thread(target=self._read, args=(proc,), daemon=True)
+        reader.start()
+        self._stop.wait()
+        try:
+            proc.stdin.close()   # 送り手は新しい要求をやめ、送り中の要求を待って終わる
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        reader.join(timeout=5)
+
+    def _read(self, proc) -> None:
+        for line in proc.stdout:
+            s = _sample_from_line(line)
+            if s is not None:
+                with self._lock:
+                    self.samples.append(s)
+
+
+def make_load(env: Env) -> Load:
+    """VM の managed で中継の VM があれば中継の VM から、それ以外は Mac から送る（変更仕様書の決定 2）。"""
+    if env.is_vm and not env.is_provided and env.get("LAB_VM_PROXY_NODE"):
+        from . import vm
+        infra = vm.load_infra(env)
+        if infra.proxy is not None:
+            info("障害の試験の負荷は中継の VM から入口（内部ロードバランサ）へ送ります")
+            return RemoteLoad(env, node=infra.proxy)
+    return Load(env)
 
 
 # ---- 状態 ----
@@ -397,7 +457,7 @@ def run_scenario(env: Env, scenario: str) -> dict:
     if scenario == "valkey-node" and not env.is_vm:
         _move_valkey_primary_off_server(env)
     restarts_before = litellm_restarts()
-    with Load(env) as load:
+    with make_load(env) as load:
         time.sleep(10)  # 平常時の様子
         baseline_fail = len(load.failures_after(0))
         t0 = time.time()
