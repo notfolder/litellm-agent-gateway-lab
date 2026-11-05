@@ -408,6 +408,7 @@ class PricingAndPinningTest(unittest.TestCase):
         # VM（2 台）: 台数をそろえ、止まった台を数えずに台ごとに散らす
         d = next(yaml.safe_load_all(render.barman_plugin_manifest(text, {"a": "b"}, 2)))
         self.assertEqual(d["spec"]["replicas"], 2)
+        self.assertEqual(d["spec"]["strategy"], {"type": "Recreate"})
         spread = d["spec"]["template"]["spec"]["topologySpreadConstraints"][0]
         self.assertEqual((spread["topologyKey"], spread["whenUnsatisfiable"], spread["nodeTaintsPolicy"]),
                          ("kubernetes.io/hostname", "DoNotSchedule", "Honor"))

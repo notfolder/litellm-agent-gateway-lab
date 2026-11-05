@@ -661,6 +661,9 @@ def barman_plugin_manifest(manifest_text: str, node_selector: dict, replicas: in
     for d in docs:
         if d.get("kind") == "Deployment" and d["metadata"].get("name") == "barman-cloud" and replicas > 1:
             d["spec"]["replicas"] = replicas
+            # 待機の台は ready にならない（リーダーだけが gRPC の口を開く）。1 台ずつ入れ替える更新では、古いリーダーが
+            # 動いている間は新しい台が ready にならず先へ進めないので、全台を止めてから作り直す（2026-11-05 の AWS で判明）
+            d["spec"]["strategy"] = {"type": "Recreate"}
             labels = d["spec"]["selector"]["matchLabels"]
             d["spec"]["template"]["spec"]["topologySpreadConstraints"] = [{
                 "maxSkew": 1, "topologyKey": "kubernetes.io/hostname", "whenUnsatisfiable": "DoNotSchedule",

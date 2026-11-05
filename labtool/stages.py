@@ -401,8 +401,13 @@ def operators(replicas: int = 1, env: Env | None = None) -> None:
         # Barman のプラグイン自身は外へ出ないが、同じ名前空間の sidecar の設定は ObjectStore（datastores の段階）で渡す
         pass
     kapply(files=[manifest], namespaced=False)
-    wait_until(300, "Barman Cloud Plugin の準備", kc("-n", "cnpg-system", "rollout", "status", "deploy/barman-cloud",
-                                                  "--timeout=5s"))
+    # 2 台のときは待機の 1 台が ready にならないので、rollout status ではなく「全台が新しい版で、1 台以上が ready」を待つ
+    def _barman_ready() -> bool:
+        st = json_output(kc("-n", "cnpg-system", "get", "deploy", "barman-cloud", "-o", "json")) or {}
+        s, spec = st.get("status", {}), st.get("spec", {})
+        return (s.get("observedGeneration") == st.get("metadata", {}).get("generation")
+                and s.get("updatedReplicas", 0) == spec.get("replicas") and s.get("readyReplicas", 0) >= 1)
+    wait_until(300, "Barman Cloud Plugin の準備", _barman_ready)
 
 
 def _build_and_push(name: str, tag: str, context, build_args: list[str], env: Env | None = None) -> dict:
