@@ -632,7 +632,7 @@ B が本番でも要るのは、従量課金でも請求書の金額が A の合
 | 項目 | 選択 |
 |---|---|
 | コンテナ実行環境 | OrbStack（個人利用。業務利用時は Colima に置き換え）。メモリの上限 12 GB |
-| Kubernetes | k3d（サーバー 1 ＋ エージェント 2）。metrics-server と Traefik が標準搭載 |
+| Kubernetes | k3d（サーバー 1 ＋ エージェント 2）。metrics-server と Traefik が標準搭載。名前解決（CoreDNS）は 3 台にそろえる |
 | LiteLLM | 公式 Helm チャート（一体型）。レプリカ 2、HPA 2〜4 |
 | DB / キャッシュ | PostgreSQL 17（CloudNativePG、3 台）と Pooler（PgBouncer）、Valkey 9.0（3 台）と Sentinel（3 台）。いずれもクラスタ内 |
 | オブジェクトストレージ | RustFS（S3 互換。監査ログと DB のバックアップ） |
@@ -963,7 +963,7 @@ Mac の検証環境（8 章）と同じ中身を、マネージドサービス�
 |---|---|
 | クラウドの部品 | 計算資源（VM 3 台）とオブジェクトストレージ（バケット 1 つ）以外を使わない。付随する物（ネットワーク、内部ロードバランサ、役割ごとの静的キー）は使う。VM にクラウドの権限は付けない（VM はクラウドの API を呼ばない）。パラメータストア、Secret Manager、Session Manager、IAP、Bedrock、Vertex AI は使わない |
 | クラウド | AWS（EC2 と S3、東京）と GCP（Compute Engine と Cloud Storage、東京）。クラウドごとに違ってよいのは「計算資源とネットワークを作るところ」だけで、VM の中と Kubernetes の中は 1 つのコード |
-| 可用性 | 1 台が落ちても処理が続く（k3s の server 3 台、PostgreSQL 3 台、Valkey と Sentinel 3 台）。足す台は何台落ちても処理が続く（受けられる量が減るだけ）。入口は内部ロードバランサ（L4、TCP の素通し。AWS は内部 NLB、GCP は内部パススルー ネットワーク ロードバランサ）の固定の内部 IP。ヘルスチェック（TCP 80）で落ちた台を外す。利用者は VPC の内側からこの IP（ホスト名）を呼ぶ |
+| 可用性 | 1 台が落ちても処理が続く（k3s の server 3 台、PostgreSQL 3 台、Valkey と Sentinel 3 台）。足す台は何台落ちても処理が続く（受けられる量が減るだけ）。入口は内部ロードバランサ（L4、TCP の素通し。AWS は内部 NLB、GCP は内部パススルー ネットワーク ロードバランサ）の固定の内部 IP。ヘルスチェック（TCP 80）で落ちた台を外す。利用者は VPC の内側からこの IP（ホスト名）を呼ぶ。1 台が止まったときに全体を止める 1 台だけの部品を要求の経路に置かない（名前解決の CoreDNS は 3 台、PostgreSQL のバックアップのプラグインとオペレーターは 2 台、入口の Traefik には CPU とメモリの予約を付ける）。LiteLLM の readiness は DB を見るまま（PostgreSQL の切り替えの間は 503 を返す） |
 | 台の増減 | 台は 2 種類。今の 3 台（k3s の server。etcd、PostgreSQL、Valkey を持つ）は数を変えない。足す台（k3s の agent。LiteLLM と入口の Traefik だけを動かし、DB は持たない）は 0 台から何台でも。人が `.env` を直して `./lab up` を流す（managed は `LAB_VM_WORKERS` の台数、provided は担当部署が作ってロードバランサに登録した VM の識別子を `LAB_VM_WORKER_NODES` に）。減らすときは入口から外し、Pod を他の台へ逃がし、クラスタから外し、k3s・nftables・Zabbix agent を外す（managed は VM の削除まで、provided は担当部署への依頼を表示）。足す・減らすは利用者の要求を止めない。加える前に台の CPU とメモリを読み、LiteLLM を 1 つも置けない台は加えずに止める。Pod を逃がす処理が 10 分で終わらなければ止めて台を残す。負荷に応じて VM を自動では増やさない |
 | 入口と LiteLLM の数 | 入口の Traefik は全台に 1 つずつ。LiteLLM の自動増減の下限は 2、最大数は `./lab up` のたびに台ごとに数え直す（割り当て可能な量から LiteLLM 以外の Pod の予約を引いた空きについて「CPU の空き ÷ CPU の予約」と「メモリの空き ÷ メモリの上限」の小さい方を出し、全台を足す）。1 台分の余裕は空けず、LiteLLM の優先度をほかの Pod より低くして、置き場所が足りないときはほかの Pod が LiteLLM を退かせる。OS と k3s 本体の分は置き場所から除く（今の 3 台 CPU 0.5 個・メモリ 2 GiB、足す台 CPU 0.25 個・メモリ 1 GiB） |
 | LiteLLM のメモリ | 予約と上限を `.env`（`LAB_LITELLM_MEMORY_REQUEST` / `LAB_LITELLM_MEMORY_LIMIT`、既定 512 MiB / 1 GiB）で変えられる。運用中に変えて `./lab up` を流すと 1 つずつ入れ替え、最大数を数え直す（メモリを増やせば最大数は減る）。最低の 2 つを置けない値なら変えずに止める。公式の本番向けの手引きは 1 つ 4 GiB で、本番では 1 つ 6〜8 GB まで増える（ユーザーの実測）ので、本番の VM は CPU 4 個・メモリ 32 GB で頼む |
@@ -998,7 +998,7 @@ Mac の検証環境（8 章）と同じ中身を、マネージドサービス�
 | 項目 | 確かめ方 |
 |---|---|
 | 構築 | `./lab up` が managed（作って組み立てる）と provided（既存の物の上に組み立てる）の両方で通り、2 回目で何も変わらない（`test-idempotency`） |
-| 疎通・監査・障害 | `test-smoke`、`test-audit`、`test-failover`（Mac の 5 場面 ＋ `entry-node`: Traefik の Pod が載る台を止め、ロードバランサが外すまで ＋ `worker-node`: LiteLLM が載った足す台を止める。足す台があるときだけ。どちらもほかの台を止める場面と同じく 120 秒以内、GCP は 180 秒以内） |
+| 疎通・監査・障害 | `test-smoke`、`test-audit`、`test-failover`（Mac の 5 場面 ＋ `entry-node`: Traefik の Pod が載る台を止め、ロードバランサが外すまで ＋ `worker-node`: LiteLLM が載った足す台を止める。足す台があるときだけ。どちらもほかの台を止める場面と同じく 120 秒以内、GCP は 180 秒以内）。managed では、障害の試験の負荷を中継の VM（VPC の中）から入口へ送る |
 | 台の増減 | 要求を流しながら足す台を 1 台足す・減らす・LiteLLM のメモリの上限を変えるとき、失敗が 0 件。Traefik とロードバランサの健全な台が全台数、LiteLLM の最大数が数え直され、Zabbix の決めた台数が変わり、減らした台の Zabbix のホストが消える。置けない値では変えずに止まる。それぞれの後の 2 回目の `./lab up` で何も変わらない |
 | 守り | 台から別の台の 22 は拒否、10250 は通る。台からの直接の外向き HTTPS はタイムアウトし中継経由は通る（Pod からも）。管理系の経路は踏み台からだけ通り（台からロードバランサ経由は 403）、利用者の API はどこからも通る。ラベルの無い Pod から Pooler・PostgreSQL・Valkey へ届かず、LiteLLM からは届く |
 | 操作者の経路 | Mac から `https://<LAB_LOCAL_HOSTNAME>:18443/health/liveliness` が 200。証明書の SAN に 2 名 |
