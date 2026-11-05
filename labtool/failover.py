@@ -77,6 +77,9 @@ class Sample:
     status: int
     call_id: str = ""
     pod: str = ""
+    sent: float = 0.0       # 実際に送り始めた時刻（start は送ると決めた時刻。送り手が詰まると後ろにずれる）
+    elapsed: float = 0.0    # 応答（または失敗）までの秒数
+    detail: str = ""        # 失敗の中身（応答の先頭か例外の種類）
 
 
 @dataclass
@@ -97,17 +100,23 @@ class Load:
             data=json.dumps({"model": "fake-tools", "messages": [{"role": "user", "content": "failover"}]}).encode(),
             headers={"Authorization": f"Bearer {self.env.get('LITELLM_MASTER_KEY')}",
                      "content-type": "application/json"})
-        status, call_id = 0, ""
+        status, call_id, detail = 0, "", ""
+        sent = time.time()
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 resp.read()
                 status, call_id = resp.status, resp.headers.get("x-litellm-call-id", "")
         except urllib.error.HTTPError as e:
             status, call_id = e.code, e.headers.get("x-litellm-call-id", "") if e.headers else ""
-        except Exception:  # noqa: BLE001 接続できない・時間切れは 0 として数える
-            status = 0
+            try:
+                detail = e.read()[:160].decode(errors="replace")
+            except Exception:  # noqa: BLE001
+                detail = ""
+        except Exception as e:  # noqa: BLE001 接続できない・時間切れは 0 として数える
+            status, detail = 0, f"{type(e).__name__}: {str(e)[:120]}"
         with self._lock:
-            self.samples.append(Sample(start, status, call_id))
+            self.samples.append(Sample(start, status, call_id, sent=sent, elapsed=round(time.time() - sent, 2),
+                                       detail=detail))
 
     def run(self) -> None:
         interval = 1.0 / self.rate
@@ -402,6 +411,10 @@ def run_scenario(env: Env, scenario: str) -> dict:
             if time.time() - t0 >= 60 and (last is None or time.time() - last >= 20):
                 break
         samples = list(load.samples)
+        # 要求ごとの記録を残す（原因を後から調べるため。判定には使わない。2026-11-05）
+        raw = BUILD_DIR / f"failover-samples-{scenario}-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        raw.write_text(json.dumps([{"start": round(x.start, 2), "sent": round(x.sent, 2), "elapsed": x.elapsed,
+                                    "status": x.status, "detail": x.detail} for x in samples], ensure_ascii=False))
         if callable(load.cleanup):
             load.cleanup()
     wait_healthy(env)
