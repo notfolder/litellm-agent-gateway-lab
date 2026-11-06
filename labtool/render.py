@@ -651,6 +651,30 @@ def pin_deployments(manifest_text: str, node_selector: dict) -> str:
     return yaml.safe_dump_all(docs, sort_keys=False)
 
 
+def barman_plugin_manifest(manifest_text: str, node_selector: dict, replicas: int) -> str:
+    """Barman Cloud Plugin の公式のマニフェストを server ノードに置き、replicas が 2 以上なら台数をそろえて台ごとに散らす。
+    1 台だけだと、載った台が止まったとき CloudNativePG が PostgreSQL の切り替えを始めない（2026-11-05 の AWS で約 60 秒遅れた。
+    変更設計書 .history/2026-11-05-1台だけの部品の冗長化/ 2 章）。プラグインはリーダーを 1 台選び、残りは待機する。
+    散らす指定は止まった台（taint の付いた台）を数えない（nodeTaintsPolicy: Honor）。数えると、止まった台の分だけ偏りと
+    みなされ、作り直す Pod が置けなくなる。止まった台からの退避（30 秒）は VM の kube-apiserver の既定（vm/node-init.sh）。"""
+    docs = [d for d in yaml.safe_load_all(pin_deployments(manifest_text, node_selector)) if d]
+    for d in docs:
+        if d.get("kind") == "Deployment" and d["metadata"].get("name") == "barman-cloud" and replicas > 1:
+            d["spec"]["replicas"] = replicas
+            # 待機の台は ready にならない（リーダーだけが gRPC の口を開く）。1 台ずつ入れ替える更新では、古いリーダーが
+            # 動いている間は新しい台が ready にならず先へ進めないので、全台を止めてから作り直す（2026-11-05 の AWS で判明）
+            d["spec"]["strategy"] = {"type": "Recreate"}
+            labels = d["spec"]["selector"]["matchLabels"]
+            d["spec"]["template"]["spec"]["topologySpreadConstraints"] = [{
+                "maxSkew": 1, "topologyKey": "kubernetes.io/hostname", "whenUnsatisfiable": "DoNotSchedule",
+                "nodeTaintsPolicy": "Honor", "labelSelector": {"matchLabels": dict(labels)}}]
+    return yaml.safe_dump_all(docs, sort_keys=False)
+
+
+# CoreDNS（k3s に同梱）の台数。同梱の定義は台数を書かず、台ごとに必ず散らす指定（DoNotSchedule）を持つので、
+# 台数だけを ./lab up でそろえる（変更設計書 .history/2026-11-05-1台だけの部品の冗長化/ 1 章）
+COREDNS_REPLICAS = 3
+
 
 # ---- 台の増減と LiteLLM のメモリ（変更設計書 .history/2026-10-31-台の増減とLiteLLMのメモリ/ 4 章） ----
 CONTROL_PLANE_SELECTOR = {"node-role.kubernetes.io/control-plane": "true"}

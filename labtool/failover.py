@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import threading
 import time
 import urllib.error
@@ -52,6 +53,7 @@ REDIS_ERROR = re.compile(
 # 止める場面も、ほかの台を止める場面と同じ目安にする（120 秒、GCP は 180 秒。ユーザーの判断 2026-11-01: 1A）
 GCP_LIMITS = {"pg-node": 180, "valkey-node": 180, "entry-node": 180, "worker-node": 180}
 NODE_DOWN_SECONDS = 120
+LB_HEALTHY_WAIT_SECONDS = 180   # entry-node: 戻った台をロードバランサが健全と見なすまで待つ上限
 
 
 def limit_for(env: Env, scenario: str) -> int:
@@ -76,6 +78,9 @@ class Sample:
     status: int
     call_id: str = ""
     pod: str = ""
+    sent: float = 0.0       # 実際に送り始めた時刻（start は送ると決めた時刻。送り手が詰まると後ろにずれる）
+    elapsed: float = 0.0    # 応答（または失敗）までの秒数
+    detail: str = ""        # 失敗の中身（応答の先頭か例外の種類）
 
 
 @dataclass
@@ -96,17 +101,23 @@ class Load:
             data=json.dumps({"model": "fake-tools", "messages": [{"role": "user", "content": "failover"}]}).encode(),
             headers={"Authorization": f"Bearer {self.env.get('LITELLM_MASTER_KEY')}",
                      "content-type": "application/json"})
-        status, call_id = 0, ""
+        status, call_id, detail = 0, "", ""
+        sent = time.time()
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 resp.read()
                 status, call_id = resp.status, resp.headers.get("x-litellm-call-id", "")
         except urllib.error.HTTPError as e:
             status, call_id = e.code, e.headers.get("x-litellm-call-id", "") if e.headers else ""
-        except Exception:  # noqa: BLE001 接続できない・時間切れは 0 として数える
-            status = 0
+            try:
+                detail = e.read()[:160].decode(errors="replace")
+            except Exception:  # noqa: BLE001
+                detail = ""
+        except Exception as e:  # noqa: BLE001 接続できない・時間切れは 0 として数える
+            status, detail = 0, f"{type(e).__name__}: {str(e)[:120]}"
         with self._lock:
-            self.samples.append(Sample(start, status, call_id))
+            self.samples.append(Sample(start, status, call_id, sent=sent, elapsed=round(time.time() - sent, 2),
+                                       detail=detail))
 
     def run(self) -> None:
         interval = 1.0 / self.rate
@@ -139,6 +150,65 @@ class Load:
         with self._lock:
             fails = [s.start for s in self.samples if s.status != 200]
         return max(fails) if fails else None
+
+
+REMOTE_LOAD_SCRIPT = BUILD_DIR.parent / "tests" / "failover-load" / "remote_load.py"
+REMOTE_LOAD_PATH = "/tmp/lab-failover-load.py"
+
+
+def _sample_from_line(line: str) -> Sample | None:
+    """中継の VM の送り手が書く 1 行（JSON）を Sample に戻す。読めない行は None。"""
+    try:
+        d = json.loads(line)
+        return Sample(float(d["start"]), int(d["status"]), d.get("call_id", ""), sent=float(d.get("sent", 0.0)),
+                      elapsed=float(d.get("elapsed", 0.0)), detail=d.get("detail", ""))
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+@dataclass
+class RemoteLoad(Load):
+    """負荷を VPC の中（中継の VM）から入口の内部ロードバランサへ送る（VM の managed。変更設計書
+    .history/2026-11-05-障害試験の負荷をVPCの中から/ 2 章）。Mac → 踏み台の SSH の転送を通らないので、転送の側の失敗が混ざらない。"""
+
+    node: object = None
+
+    def run(self) -> None:
+        from . import vm
+        vm.run_on(self.env, self.node, f"cat > {REMOTE_LOAD_PATH}", input_bytes=REMOTE_LOAD_SCRIPT.read_bytes())
+        proc = subprocess.Popen([*vm.ssh_base(self.env, self.node), "python3", "-u", REMOTE_LOAD_PATH],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        # マスターキーは標準入力で渡す（引数にもファイルにも残さない）
+        proc.stdin.write(json.dumps({"url": f"https://{self.env.hostname}", "key": self.env.get("LITELLM_MASTER_KEY"),
+                                     "rate": self.rate}) + "\n")
+        proc.stdin.flush()
+        reader = threading.Thread(target=self._read, args=(proc,), daemon=True)
+        reader.start()
+        self._stop.wait()
+        try:
+            proc.stdin.close()   # 送り手は新しい要求をやめ、送り中の要求を待って終わる
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        reader.join(timeout=5)
+
+    def _read(self, proc) -> None:
+        for line in proc.stdout:
+            s = _sample_from_line(line)
+            if s is not None:
+                with self._lock:
+                    self.samples.append(s)
+
+
+def make_load(env: Env) -> Load:
+    """VM の managed で中継の VM があれば中継の VM から、それ以外は Mac から送る（変更仕様書の決定 2）。"""
+    if env.is_vm and not env.is_provided and env.get("LAB_VM_PROXY_NODE"):
+        from . import vm
+        infra = vm.load_infra(env)
+        if infra.proxy is not None:
+            info("障害の試験の負荷は中継の VM から入口（内部ロードバランサ）へ送ります")
+            return RemoteLoad(env, node=infra.proxy)
+    return Load(env)
 
 
 # ---- 状態 ----
@@ -288,7 +358,14 @@ def _stop_node(node: str, load: Load, env: Env | None = None) -> None:
     if node == SERVER_NODE:
         raise LabError("server ノードは止めません（Kubernetes の制御部分と RustFS が載っている）")
     info(f"ノード {node} を {NODE_DOWN_SECONDS} 秒止めます")
-    run(["docker", "stop", node], quiet=True)
+    # Docker が混んでいると docker stop が「did not receive an exit event」で終了コード 1 を返し、少し遅れて止まることがある
+    # （2026-11-04 に Mac で 3 回）。終了コードではなく、コンテナが実際に止まったかで判断する（最長 60 秒待つ）
+    stopped = run(["docker", "stop", node], check=False, capture=True, quiet=True)
+    deadline = time.time() + 60
+    while output(["docker", "inspect", "-f", "{{.State.Running}}", node], check=False).strip() != "false":
+        if time.time() > deadline:
+            raise LabError(f"ノード {node} を止められませんでした: {(stopped.stderr or '').strip()[:300]}")
+        time.sleep(2)
     try:
         time.sleep(NODE_DOWN_SECONDS)
     finally:
@@ -345,10 +422,17 @@ def trigger(env: Env, scenario: str, load: Load) -> str:
         node = traefik[0]
         target = vm.node_for_k8s_name(infra, node)
         _stop_node(node, load, env)
-        health = cloud.lb_targets_healthy(env, infra)
+        # 戻った台をロードバランサが健全と見なすのは、ヘルスチェックが続けて通ってから（AWS の NLB は 10 秒 × 2 回）。
+        # 台の Ready の直後に 1 回だけ見ると 2/3 台になる（2026-11-04 の aws-ec2 で判明）ので、全台が健全になるまで待つ
+        t_ready = time.time()
+        while True:
+            health = cloud.lb_targets_healthy(env, infra)
+            if (health and all(health.values())) or time.time() - t_ready > LB_HEALTHY_WAIT_SECONDS:
+                break
+            time.sleep(5)
         load.eip_moved = bool(health) and all(health.values())
         return (f"Traefik の載ったノード {node}（{target.id}）を停止（戻った後のロードバランサの健全性: "
-                f"{sum(health.values())}/{len(health)} 台）")
+                f"{sum(health.values())}/{len(health)} 台、台の Ready から {time.time() - t_ready:.0f} 秒）")
     if scenario == "worker-node":
         # LiteLLM が載った足す台を止める（変更仕様書 2026-10-31-台の増減とLiteLLMのメモリ N13）
         from . import render
@@ -373,7 +457,7 @@ def run_scenario(env: Env, scenario: str) -> dict:
     if scenario == "valkey-node" and not env.is_vm:
         _move_valkey_primary_off_server(env)
     restarts_before = litellm_restarts()
-    with Load(env) as load:
+    with make_load(env) as load:
         time.sleep(10)  # 平常時の様子
         baseline_fail = len(load.failures_after(0))
         t0 = time.time()
@@ -387,6 +471,10 @@ def run_scenario(env: Env, scenario: str) -> dict:
             if time.time() - t0 >= 60 and (last is None or time.time() - last >= 20):
                 break
         samples = list(load.samples)
+        # 要求ごとの記録を残す（原因を後から調べるため。判定には使わない。2026-11-05）
+        raw = BUILD_DIR / f"failover-samples-{scenario}-{time.strftime('%Y%m%d-%H%M%S')}.json"
+        raw.write_text(json.dumps([{"start": round(x.start, 2), "sent": round(x.sent, 2), "elapsed": x.elapsed,
+                                    "status": x.status, "detail": x.detail} for x in samples], ensure_ascii=False))
         if callable(load.cleanup):
             load.cleanup()
     wait_healthy(env)

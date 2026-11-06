@@ -46,6 +46,17 @@ spec:
             readTimeout: 600s
             writeTimeout: 600s
             idleTimeout: 600s
+    # CPU とメモリの要求を付ける（付けないと BestEffort になり、CPU が混むと真っ先に取り分を失う）。生存確認は時間切れ 5 秒・
+    # 6 回失敗（約 1 分応答しなければ再起動）に緩める。台を 1 台止めた場面で、止めていない台の Traefik が生存確認（2 秒・3 回）に
+    # 応答できずに再起動させられ、起動直後の証明書を読み込む前の応答で失敗が続いた（2026-11-05 の AWS。変更設計書
+    # .history/2026-11-05-入口のTraefikの資源と生存確認/）
+    resources:
+      requests:
+        cpu: 100m
+        memory: 64Mi
+    livenessProbe:
+      timeoutSeconds: 5
+      failureThreshold: 6
     # アクセスログ（入口で返した状態コードと、どの Pod に送ったかを残す。502 などの切り分けに使う）
     logs:
       access:
