@@ -1689,3 +1689,12 @@ class LitellmMetricsZabbixTest(unittest.TestCase):
                 self.assertIn(ref, after, t["description"])
         self.assertIn("Running", mon.JS_LITELLM_PODS_LLD)
         self.assertEqual(lite["rule"]["enabled_lifetime_type"], 2)
+
+
+class ChangedHostKeyTest(unittest.TestCase):
+    def test_alias_from_ssh_error(self):
+        from labtool import vm
+        err = ("@@@@\nHost key for bastion has changed and you have requested strict checking.\nHost key verification failed.\n")
+        self.assertEqual(vm.changed_host_alias(err), "bastion")
+        self.assertEqual(vm.changed_host_alias("Host key for i-0abc has changed and"), "i-0abc")
+        self.assertIsNone(vm.changed_host_alias("Permission denied"))

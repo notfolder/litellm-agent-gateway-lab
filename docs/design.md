@@ -219,6 +219,8 @@ flowchart TB
 - アクセスログを有効にする。ヘッダーは記録しない（キーやトークンを残さないため）
 - 設定ファイルはチャート 40（k3s 1.36）の鍵で書き、`stages.apply_traefik_config` が HelmChart `kube-system/traefik` の `spec.chart` からチャートの主版を読んで当てる。41 以上（k3s 1.37）なら `render.traefik_config` が `logs.access` → `accessLog`、`logs.general` → `log`、`fields` の `defaultmode` → `defaultMode` に書き換える（チャート 41.0.0 の改名。どちらのチャートも知らない鍵を最上位に認めないので両方は書かない）。VM の環境も同じ
 - server ノードに置く（障害の試験で止めるのは agent ノードだけ）
+- VM の環境（`k8s/traefik-config-vm.yaml`）は 80 番を 443 番へ転送する（`ports.web.http.redirections`。チャート 39 以降の位置。GET には 301、ほかは 308）
+- 版上げの間は `stages.TraefikChartWatch` が 3 秒ごとに `spec.chart` を読み、変わったらすぐ新しいチャートの鍵で当て直す（k3s は上げた台の起動時にチャートを書き換え、helm-controller は古い鍵のまま入れ替える。見張らないと台ごとの当て直しまで約 1.5 分アクセスログの指定が無い定義になる。見張ると Traefik の入れ替えはチャートの変化ごとに 1 回で済む）
 
 ### 5.3 公開する経路とパススルーの遮断（`k8s/ingress.yaml`）
 
@@ -1430,7 +1432,7 @@ flowchart TB
         PR["provision（managed だけ）<br/>ネットワーク（通す規則だけ）→ 22 / 中継の許可 → バケット → 静的キー → VM 3 台 → 内部ロードバランサ → 中継（踏み台）の VM<br/>→ .env に書く → 中継の VM を SSH で初期化（mitmproxy、nftables、Zabbix サーバー）して CA を取る"]
         LI["load_infra（.env の識別子 → API）→ 止まっている台があれば止める → ensure_access（managed は 22 の許可を直す）→ 減らした足す台を外す（21.12 節）"]
         IN["init_nodes: cluster/k3s/token・version（無ければ作る）→ 足す台の CPU とメモリの確認 → 1 番 → 2 番 → 3 番 → 足す台 を SSH で初期化（nftables、agent 2、k3s）→ 6443 の転送"]
-        KS["全台の Ready → CoreDNS を 3 台に → 入口の印 → Traefik（全台に 1 つ、hostPort 80/443、1 台ずつ入れ替え）→ 入口の 443 の転送（踏み台経由）→ namespace → NetworkPolicy → SA → 中継の CA → registry → cert-manager（中継と再帰リゾルバ）・CNPG・Barman（各 2 台）→ ClusterIssuer"]
+        KS["全台の Ready → CoreDNS を 3 台に → metrics-server を 2 台に（台ごとに散らす、PDB）→ 入口の印 → Traefik（全台に 1 つ、hostPort 80/443、1 台ずつ入れ替え）→ 入口の 443 の転送（踏み台経由）→ namespace → NetworkPolicy → SA → 中継の CA → registry → cert-manager（中継と再帰リゾルバ）・CNPG・Barman（各 2 台）→ ClusterIssuer"]
         PR --> LI --> IN --> KS
     end
     C --> I["images<br/>VM の Docker でビルド（文脈は tar で SSH）→ 127.0.0.1:30500 に push"]
@@ -1439,6 +1441,7 @@ flowchart TB
 ```
 
 - 止まっている台（AWS の `stopping` / `stopped`、GCP の `STOPPING` / `TERMINATED` / `SUSPENDING` / `SUSPENDED`）があれば、待たずに止める（`clouds.require_running`）。メッセージに台の番号と識別子・状態、起こすコマンド（AWS は `aws ec2 start-instances`、GCP は `gcloud compute instances start`）を出す。`./lab up` は止まった台を起こさない（一部の台にだけ設定を当てると、戻った台との食い違いが残るため）。managed の AWS は台の作成で `instance_running` を待つ前にも確かめる。`./lab down`・障害の試験・`upgrade-k8s` は確かめない
+- SSH でホスト鍵が変わっていれば、変わった相手（台か踏み台か。ssh の「Host key for <名前> has changed」）の `known_hosts` の行を消して受け入れる（台を作り直した、managed の中継の VM を消して provided の踏み台にした）。managed の `./lab down` は中継の VM（踏み台）の鍵を忘れる
 - A レコードを作る前に、同じホスト名に CNAME があり、その注記が `litellm-agent-gateway-lab` で始まる（`./lab` が作った。EKS 版の ALB 向けなど）なら消す。注記の無い CNAME は消さずに止める（Cloudflare は同じ名前の CNAME と A レコードを並べられない）
 
 ### 21.4 VM の初期化（`vm/node-init.sh`、SSH で `sudo bash -s`）
@@ -1455,7 +1458,7 @@ flowchart TB
 5. `ready` があれば Docker を再起動して抜ける（2 回目以降。1〜4.5 は毎回直す）
 6. apt で curl、docker.io
 7. containerd のミラー（`lab-registry:5000` → 自分の NodePort）
-8. k3s: 参加先（今の 3 台）を探し、`config.yaml` を書き、インストールスクリプト。server は `sh -s - server`（`INSTALL_K3S_VERSION`、`K3S_TOKEN`。中継の環境変数は `k3s.service.env` に写る）。worker は `config.yaml` に `server`、`token`（600）、`node-label: litellm-lab/role=worker` を書いて `sh -s - agent`（インストールスクリプトは再実行のたびにサービスの環境ファイルを作り直すので、トークンを環境変数で渡すと版上げで消える）
+8. k3s: 参加先（今の 3 台）を探し、`config.yaml` を書き、インストールスクリプト。server は `sh -s - server`（`INSTALL_K3S_VERSION`、`K3S_TOKEN`。中継の環境変数は `k3s.service.env` に写る）。worker は `config.yaml` に `server`、`token`（600）、`node-label: litellm-lab/role=worker` を書いて `sh -s - agent`（インストールスクリプトは再実行のたびにサービスの環境ファイルを作り直すので、トークンを環境変数で渡すと版上げで消える）。どちらも取得の一時的な失敗で止まらないよう、15 秒おきに 3 回までやり直す（`install_k3s`）
 9. `touch /var/lib/lab/ready`
 
 クラウド固有の手順は無い（VM はクラウドの API を呼ばない）。中継（踏み台）の VM は `vm/proxy-init.sh`: mitmproxy（PyPI、`--mode regular`、3128）、nftables（22 は操作者と VPC、3128 は VPC と操作者、10051 は VPC、Zabbix の web は 127.0.0.1 だけ）、`LAB_ZABBIX_VM=true` なら Docker Compose（`postgres:16`、`zabbix-server-pgsql`、`zabbix-web-nginx-pgsql` 7.0）と agent 2。
@@ -1576,7 +1579,7 @@ spec 12.2 節。静的キーの権限は 21.5 節の表。GCS は「均一なバ
 | ダッシュボード | 「litellm-lab」: 深刻度ごとの障害、障害の一覧、ノード数・決めた台数・LiteLLM の上限・Pending・PostgreSQL の台数・証明書の残り日数・要求の比、VM（今の 3 台、足す台、踏み台）の CPU・メモリ・ディスクのグラフ、コンテナのメモリの上限比。宣言のハッシュはグローバルマクロ `{$LAB.DASHBOARD.HASH}` |
 | 障害の知らせ | 検証では送らない（画面だけ）。本番は既存の Zabbix サーバーの通知の設定に任せる |
 | 冪等 | すべて `*.get` → 無ければ `create`、違えば `update`。マクロの更新はこちらが管理する鍵だけ差し替える |
-| 残課題 | LiteLLM の `/metrics`（公式文書では Enterprise）の取り込み（`.history/BACKLOG.md`） |
+| LiteLLM の指標（`zabbix_monitors.litellm_specs`） | LiteLLM の `callbacks` に `prometheus`（無償版で出る）、`require_auth_for_metrics_endpoint: false`（外からは Traefik が踏み台だけに絞る）。指標は Pod ごとに数えられるので、ホスト `litellm-lab-k8s` に Kubernetes の API で LiteLLM の Pod を見つける発見ルールを置き、プロトタイプで各 Pod の `http://<Pod の IP>:4000/metrics` を 1 分ごとに読む。要求の数・失敗した要求の数・待ち時間の合計と数・LLM の送り先の失敗の数を、数え上げの合計 → 毎秒の変化にして Pod ごとに持ち、計算アイテムで全 Pod を足し（`sum(last_foreach(...))`）、失敗の割合と平均の待ち時間を出す。トリガーは「失敗した要求の割合が 5 分続けて 5% を超えた」「LLM の送り先の失敗が 5 分続いている」（警告）。見えなくなった Pod のアイテムはすぐ止め、1 時間後に消す |
 
 ### 21.12 台の増減と LiteLLM の数（`vm.remove_leaving_workers`、`stages.litellm_max_replicas`）
 
@@ -1591,7 +1594,8 @@ spec 12.2 節。静的キーの権限は 21.5 節の表。GCS は「均一なバ
 | LiteLLM の資源 | Helm の上書きの値の `resources`（CPU の予約 250m、メモリは `.env`） |
 | 最大数 | Ready で cordon されていないノードごとに、割り当て可能な量から LiteLLM 以外の Pod（終わった Pod を除く）の予約を引き、`min(floor(CPU の空き ÷ 0.25), floor(メモリの空き ÷ メモリの上限))` を足す（`render.litellm_slots`）。`autoscaling.maxReplicas` に渡す。2 未満なら止めて台ごとの空きを出す。その時点の配置で数えるので、作ったばかりの 1 回目は後の段（Zabbix、監査ログの検索アプリ）の Pod を数える前で 1 つ多くなり、2 回目から落ち着く（最大数だけが変わる Helm の更新では Pod は作り直されない） |
 | 優先度 | PriorityClass `litellm-lab-scalable`（値 −100、`preemptionPolicy: Never`）。チャートに値が無く Helm 4 の後処理はプラグインが要るので、`helm upgrade` の後に Deployment に `priorityClassName` を付ける（違うときだけ。Helm はこの欄を描かないので次の upgrade でも残る） |
-| 版上げ | `vm.upgrade_order`: 今の 3 台（SSH の転送先は 3 台の最後）→ 足す台。足す台は `sh -s - agent` で入れ直す。台ごとに Ready と版を待って uncordon した後と、全台の後に、Traefik の設定を動いているチャートの鍵で当て直す（上げた台の k3s が同梱のチャートを書き換えることがある。1.36 → 1.37 で 40 → 41）。全台の後は Traefik が全台で新しい定義になるのを待つ |
+| 版上げ | `vm.upgrade_order`: 今の 3 台（SSH の転送先は 3 台の最後）→ 足す台。前に etcd のスナップショットを server の台（上げる順の server のうち最後）で取る。足す台は `sh -s - agent` で入れ直す。上げている間はチャートの変化を見張って当て直し（5.2 節）、台ごとに Ready と版を待って uncordon した後と、全台の後にも当て直す（上げた台の k3s が同梱のチャートを書き換える。パッチの更新でも 40.1.5 → 40.1.7、1.36 → 1.37 で 40 → 41）。全台の後は Traefik が全台で新しい定義になるのを待つ。`--measure` は台ごとの失敗の数と散らばった幅も出す（`ops.failures_per_segment`）。上げた後の `./lab up` は版の食い違いで止まり、配備済みの方が新しければ `K3S_IMAGE` を合わせる案内、古ければ `upgrade-k8s` の案内を出す（`vm.version_mismatch_message`） |
+| AMI の更新 | `./lab upgrade-ami [--measure]`（aws-ec2 の managed だけ。provided は担当部署への手順を出して止まる）。新しくする先は Canonical の Ubuntu 24.04 の最新（CPU の種類は `LAB_EC2_INSTANCE_TYPE` の `SupportedArchitectures`）。順は版上げと同じ。台ごとに drain → その台のディスクの PVC（local-path の PV の nodeAffinity）と使う Pod を消す → `kubectl delete node`（k3s がその台の etcd のメンバーとノードのパスワードを外す）→ Zabbix のホストを消す → 同じ番号・同じ内部 IP で作り直してロードバランサに戻し、`.env` の識別子を置き換える → その台だけ初期化（生きている server に参加）→ Ready → PostgreSQL 3 台と Valkey 3 台（CloudNativePG と StatefulSet が置き場を作り直して写す）→ Traefik の全台。途中で止まっても流し直せば、クラスタに無い台から続ける |
 | 障害の試験 | `worker-node`（LiteLLM が載った足す台を 120 秒止める）。足す台があるときだけ `all` に入る |
 
 配備と試験の結果（GCP、2026-10-31、検証の VM は全台 c4a-standard-2）:
@@ -1620,7 +1624,9 @@ spec 12.2 節。静的キーの権限は 21.5 節の表。GCS は「均一なバ
 
 - Barman Cloud Plugin はリーダーを 1 台選び（Kubernetes のリース）、待機の 1 台は ready にならない（gRPC の口を開かない）。リーダーの台が止まると、待機の 1 台がリースを取ってから動く。1 台ずつの入れ替えは古いリーダーが動いている間は新しい台が ready にならず進まないので `Recreate` にし、`./lab` は「全台が新しい版で、1 台以上が ready」を待つ（`stages.operators`）
 - `nodeTaintsPolicy: Honor` は、止まった台（`node.kubernetes.io/unreachable` などの taint）を散らす計算から外す。外さないと止まった台の分が偏りとみなされ、作り直す Pod を置けない
-- metrics-server（k3s に同梱）と local-path-provisioner は 1 台のまま。要求の経路には無い。metrics-server が止まった台に載っていると、その間は CPU とメモリの値が取れず、LiteLLM の自動増減も止まる
+- metrics-server（k3s に同梱）は 2 台（`stages.ensure_metrics_server`）。同梱の定義に無い台数と散らす指定（`kubernetes.io/hostname`、`DoNotSchedule`、maxSkew 1、`nodeTaintsPolicy: Honor`）を足し、PDB（`maxUnavailable: 1`）を付ける。同梱の定義に無い項目なので、k3s が定義を当て直しても残る（版上げの後も 2 台）。1 台だと、載った台が止まったとき CPU の値が取れず、LiteLLM の自動増減も止まる
+- local-path-provisioner は 1 台のまま。要求の経路には無い
+- LiteLLM の PDB は一度に追い出してよい数を 25%（切り上げ。2〜4 台なら 1、5〜8 台なら 2）にする。自動増減で増えた Pod の起動中は止まっている数に数えられるので、1 に固定すると drain が断られ続ける。一度に 2 つ以上が起動中の間は 25% でも断られ、受け手が戻るまで待つ
 - LiteLLM の readiness は DB だけを見る（LiteLLM の既定のまま）。PostgreSQL の primary を失った場面では、切り替えの間は全台が送り先から外れて 503 になる。DB に依存させない形にすると、その間 LiteLLM が覚えていない（60 秒以内に使っていない）キーの要求が 401（認証の失敗）になり、クライアントが再試行しないため採らない
 
 止まった台を外し、PostgreSQL を切り替えるまでの時間を決めるもの:

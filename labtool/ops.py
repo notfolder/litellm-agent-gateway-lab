@@ -67,6 +67,7 @@ def down(everything: bool = False) -> None:
             if env.egress_proxy_vm:
                 env.drop_mac_proxy()   # 中継の VM も消すので、消した後の API が中継越しだと届かない（2026-10-31）
             cloud.destroy(env)
+            vm.forget_alias("bastion")   # 中継の VM（踏み台）を消したので、次の踏み台の鍵と食い違わないように
             for key in vm.PROVISIONED_ENV_KEYS:
                 if env.get(key):
                     env.set(key, "")

@@ -231,9 +231,20 @@ def run_on(env: Env, node: Node, script: str, timeout: int = 120, input_bytes: b
 
 def forget_host(node: Node) -> None:
     """台を作り直したとき、known_hosts からその台の行を消す。"""
+    forget_alias(host_alias(node))
+
+
+def forget_alias(alias: str) -> None:
+    """known_hosts から、その名前（台の識別子か bastion）の行を消す。"""
     if KNOWN_HOSTS.exists():
-        lines = [line for line in KNOWN_HOSTS.read_text().splitlines() if not line.startswith(host_alias(node) + " ")]
+        lines = [line for line in KNOWN_HOSTS.read_text().splitlines() if not line.startswith(alias + " ")]
         KNOWN_HOSTS.write_text("\n".join(lines) + ("\n" if lines else ""))
+
+
+def changed_host_alias(stderr: str) -> str | None:
+    """ssh の「Host key for <名前> has changed」から、鍵が変わった相手の名前を取り出す（踏み台を経由すると、踏み台の鍵のこともある）。"""
+    m = re.search(r"Host key for (\S+) has changed", stderr)
+    return m.group(1) if m else None
 
 
 def _port_open(ip: str, port: int) -> bool:
@@ -357,8 +368,12 @@ def _ssh_ok(env: Env, node: Node) -> bool:
     except (subprocess.TimeoutExpired, OSError):
         return False
     if proc.returncode != 0 and b"Host key verification failed" in proc.stderr:
-        info(f"{node.id} のホスト鍵が変わっています（台の作り直し）。known_hosts の古い行を消します")
-        forget_host(node)
+        # 鍵が変わったのが踏み台なら踏み台の行を消す（managed の中継の VM を消した後に provided の踏み台を使うなど。台の行を消し続けて
+        # 止まらなかった。2026-11-08 の AWS で判明）
+        alias = changed_host_alias(proc.stderr.decode("utf-8", "replace")) or host_alias(node)
+        who = "踏み台" if alias == "bastion" else node.id
+        info(f"{who} のホスト鍵が変わっています（作り直し）。known_hosts の古い行を消します")
+        forget_alias(alias)
         proc = subprocess.run([*ssh_base(env, node), "true"], capture_output=True, timeout=30)
     return proc.returncode == 0
 
