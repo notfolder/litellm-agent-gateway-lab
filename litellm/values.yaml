@@ -108,7 +108,9 @@ migrationJob:
 ingress:
   enabled: false                       # k8s/ingress.yaml（Traefik）を使う
 
-# ノードの入れ替え（Kubernetes の版上げ、EKS Auto Mode の drain）で 2 台が同時に追い出されないようにする
+# ノードの入れ替え（Kubernetes の版上げ、EKS Auto Mode の drain）で一度に追い出す数を 25%（切り上げ。2〜4 台なら 1、5〜8 台なら 2）に
+# 抑える。1 台に固定すると、自動の台数調整で増えた Pod の起動中（準備に約 80 秒）は「止まっている 1 台」に数えられ、drain が断られ続ける
+# （2026-11-08 の AWS の版上げで約 75 秒。変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 8 章）
 pdb:
   enabled: true
-  maxUnavailable: 1
+  maxUnavailable: "25%"

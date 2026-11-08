@@ -37,11 +37,14 @@ spec:
     ports:
       web:
         hostPort: 80
-        redirections:
-          entryPoint:
-            to: websecure
-            scheme: https
-            permanent: true
+        # 転送の鍵の位置はチャート 39 から ports.web.http.redirections（それより前の ports.web.redirections はチャート 39〜41 では
+        # 黙って無視され、80 番は 404 になっていた。2026-11-08 に確認）
+        http:
+          redirections:
+            entryPoint:
+              to: websecure
+              scheme: https
+              permanent: true
         transport:
           respondingTimeouts:
             readTimeout: 600s

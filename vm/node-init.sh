@@ -281,6 +281,17 @@ alive() {  # 6443 が何か答えるか（k3s の server が起きているか�
 
 # 参加先を探す。誰か答えたらそこへ参加（1 台を作り直したときに、別のクラスタを作ってしまわない）。
 # 誰も答えないとき、1 番なら新しいクラスタを起こし、2 番と 3 番（と足す台）は 1 番が起きるまで待つ
+# k3s のインストールスクリプトを流す。取得の一時的な失敗（中継越しの GitHub。2026-11-08 の AWS で台の作り直しの 1 回目に
+# 「Download failed」）で止まらないよう、3 回まで 15 秒おきにやり直す。トークンは参加のときだけ渡す
+install_k3s() {
+  for i in 1 2 3; do
+    if curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" K3S_TOKEN="$K3S_TOKEN" sh -s - "$1"; then return 0; fi
+    echo "k3s のインストールに失敗しました（$i/3 回目）。15 秒後にやり直します" >&2
+    sleep 15
+  done
+  return 1
+}
+
 JOIN=""
 for ip in $PEER_IPS; do
   if alive "$ip"; then JOIN="$ip"; break; fi
@@ -306,7 +317,7 @@ if [ "$ROLE" = "worker" ]; then
   } > /etc/rancher/k3s/config.yaml
   chmod 600 /etc/rancher/k3s/config.yaml
   echo "joining the cluster as an agent via $JOIN"
-  curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" sh -s - agent
+  install_k3s agent
   unset K3S_TOKEN
   for _ in $(seq 1 60); do
     if systemctl is-active --quiet k3s-agent; then break; fi
@@ -333,7 +344,7 @@ else
   if [ -n "$JOIN" ]; then echo "joining the cluster via $JOIN"; else echo "initializing a new cluster"; fi
   # トークンは参加のときだけ環境変数で渡す（server/token に保存され、以後の再起動と版上げでは要らない）。
   # 中継の環境変数（HTTP_PROXY など）は、インストールスクリプトが k3s.service.env に写す
-  curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$K3S_VERSION" K3S_TOKEN="$K3S_TOKEN" sh -s - server
+  install_k3s server
   unset K3S_TOKEN
 
   for _ in $(seq 1 120); do

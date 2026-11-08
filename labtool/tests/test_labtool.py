@@ -393,7 +393,8 @@ class PricingAndPinningTest(unittest.TestCase):
         cfg = render.litellm_config(env(), has_chatgpt=True)
         terra = next(m for m in cfg["model_list"] if m["model_name"] == "gpt-5.6-terra")
         self.assertIn("model_info", terra)
-        self.assertEqual(cfg["litellm_settings"]["callbacks"], ["audit_log.audit_logger_instance"])
+        self.assertEqual(cfg["litellm_settings"]["callbacks"], ["audit_log.audit_logger_instance", "prometheus"])
+        self.assertIs(cfg["litellm_settings"]["require_auth_for_metrics_endpoint"], False)
         self.assertTrue(cfg["general_settings"]["disable_spend_logs"])
 
     def test_pin_deployments(self):
@@ -993,7 +994,7 @@ class CloudLayerTest(unittest.TestCase):
         w = vm.render_node_init(infra.workers[0], infra.nodes, "k", values)
         self.assertEqual(re.findall(r"@@[A-Z_0-9]+@@", w), [])
         for needle in ('ROLE="worker"', 'RESERVED="cpu=250m,memory=1Gi"', 'WORKER_LABEL="litellm-lab/role=worker"',
-                       'PEER_IPS="' + " ".join(n.private_ip for n in infra.nodes) + '"', "sh -s - agent", 'echo "token: ${K3S_TOKEN}"',
+                       'PEER_IPS="' + " ".join(n.private_ip for n in infra.nodes) + '"', "install_k3s agent\n", 'echo "token: ${K3S_TOKEN}"',
                        "k3s-agent.service.env", "60-lab-reserved.yaml", "system-reserved=${RESERVED}", 'rm -f "$METRICS_CONF"'):
             self.assertIn(needle, w, needle)
         srv = vm.render_node_init(infra.nodes[0], infra.nodes, "k", values)
@@ -1165,7 +1166,7 @@ class CloudLayerTest(unittest.TestCase):
             text = vm.render_node_init(node, infra.nodes, "ssh-ed25519 AAAA test", {**values, **fw, **vm.zabbix_values(e, node)})
             self.assertEqual(re.findall(r"@@[A-Z_0-9]+@@", text), [])
             for needle in ('NODE_INDEX="3"', "ssh-ed25519 AAAA test", "/etc/rancher/k3s/config.yaml", "cluster-init: true",
-                           "sh -s - server\n", 'K3S_VERSION="v1.35.5+k3s1"', 'K3S_TOKEN="tok"',
+                           "install_k3s server\n", "for i in 1 2 3; do", 'K3S_VERSION="v1.35.5+k3s1"', 'K3S_TOKEN="tok"',
                            'EGRESS_PROXY="http://10.60.0.20:3128"', "update-ca-certificates", "/etc/systemd/system/k3s.service.env",
                            "docker.io", "/var/lib/lab/ready", "table inet lab", "hook prerouting priority -150",
                            "tcp dport 22 ip saddr @admins accept", "tcp dport { 80, 443 } ip saddr @hc accept",
@@ -1264,10 +1265,10 @@ class CloudLayerTest(unittest.TestCase):
         self.assertIn("litellm-lab: Ready のノードが 3 台未満", mon.RETIRED_TRIGGERS)
         http_items = [i for i in s["items"] if i["type"] == mon.T_HTTP]
         for i in http_items:
-            self.assertTrue(i["url"].startswith("{$KUBE.API.URL}/apis/"))
+            self.assertTrue(i["url"].startswith(("{$KUBE.API.URL}/apis/", "{$KUBE.API.URL}/api/v1/")))
             self.assertEqual(i["headers"], mon.BEARER)
             self.assertNotIn("trends", i)   # 文字列のアイテムに trends は付けられない
-        d = s["discovery"]
+        d = s["discovery"][0]
         self.assertEqual(d["rule"]["master"], "lab.k8s.metrics.pods")
         pkeys = [i["key_"] for i in d["items"]]
         for tr in d["triggers"]:
@@ -1568,3 +1569,123 @@ class RemoteLoadTest(unittest.TestCase):
         text = failover.REMOTE_LOAD_SCRIPT.read_text()
         imports = set(re.findall(r"^import (\w+)", text, re.M)) | set(re.findall(r"^from (\w+)", text, re.M))
         self.assertLessEqual(imports, {"json", "sys", "threading", "time", "urllib"})
+
+
+class EcTwoCompletionTest(unittest.TestCase):
+    """変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 6〜10 章。"""
+
+    def _vm_values(self):
+        return yaml.safe_load(yaml.safe_load((ROOT / "k8s" / "traefik-config-vm.yaml").read_text())["spec"]["valuesContent"])
+
+    def test_redirect_is_under_http(self):
+        web = self._vm_values()["ports"]["web"]
+        self.assertNotIn("redirections", web)
+        self.assertEqual(web["http"]["redirections"]["entryPoint"], {"to": "websecure", "scheme": "https", "permanent": True})
+        # チャート 41 の鍵にしても転送は残る
+        after = yaml.safe_load(yaml.safe_load(render.traefik_config((ROOT / "k8s" / "traefik-config-vm.yaml").read_text(), 41))
+                               ["spec"]["valuesContent"])
+        self.assertEqual(after["ports"]["web"]["http"], web["http"])
+
+    def test_failures_per_segment(self):
+        from labtool import ops
+        from types import SimpleNamespace as S
+        samples = [S(start=t, status=s) for t, s in [(0, 200), (1, 502), (4, 0), (6, 200), (11, 502), (12, 200), (21, 200)]]
+        rows = ops.failures_per_segment(samples, [("node1", 0, 10), ("node2", 10, 20)])
+        self.assertEqual([(r["node"], r["requests"], r["failed"], r["failure_window_seconds"]) for r in rows],
+                         [("node1", 4, 2, 3.0), ("node2", 2, 1, 0.0), ("後", 1, 0, 0.0)])
+        self.assertEqual(ops.failures_per_segment(samples, []), [])
+
+    def test_metrics_server_two_spread(self):
+        patch = render.metrics_server_patch()
+        self.assertEqual(patch["spec"]["replicas"], 2)
+        tsc = patch["spec"]["template"]["spec"]["topologySpreadConstraints"][0]
+        self.assertEqual((tsc["topologyKey"], tsc["maxSkew"], tsc["labelSelector"]["matchLabels"]),
+                         ("kubernetes.io/hostname", 1, {"k8s-app": "metrics-server"}))
+        pdb = yaml.safe_load(render.metrics_server_pdb())
+        self.assertEqual((pdb["metadata"]["namespace"], pdb["spec"]["maxUnavailable"]), ("kube-system", 1))
+
+    def test_litellm_pdb_is_a_quarter(self):
+        values = yaml.safe_load((ROOT / "litellm" / "values.yaml").read_text())
+        self.assertEqual(values["pdb"], {"enabled": True, "maxUnavailable": "25%"})
+
+    def test_ami_pattern_follows_instance_arch(self):
+        from unittest import mock
+        from labtool.clouds import aws_ec2
+        env = Env({"LAB_TARGET": "aws-ec2", "LAB_EC2_INSTANCE_TYPE": "t3.large"})
+        fake = mock.MagicMock()
+        fake.describe_instance_types.return_value = {"InstanceTypes": [{"ProcessorInfo": {"SupportedArchitectures": ["x86_64"]}}]}
+        fake.describe_images.return_value = {"Images": [{"ImageId": "ami-1", "Name": "n", "CreationDate": "2026"}]}
+        with mock.patch.object(aws_ec2, "_ec2", return_value=fake):
+            self.assertEqual(aws_ec2.resolve_ami(env, []), "ami-1")
+            self.assertIn("24.04-amd64-server", fake.describe_images.call_args.kwargs["Filters"][0]["Values"][0])
+            self.assertEqual(aws_ec2.resolve_ami(env, [{"ImageId": "ami-old"}]), "ami-old")
+            fake.describe_instance_types.return_value = {"InstanceTypes": [{"ProcessorInfo": {"SupportedArchitectures": ["arm64"]}}]}
+            self.assertEqual(aws_ec2.instance_arch(env, "t4g.large"), "arm64")
+
+
+class UpgradeSnapshotNodeTest(unittest.TestCase):
+    def test_snapshot_on_last_server_not_worker(self):
+        from labtool import ops
+        self.assertEqual(ops.snapshot_node(["s2", "s3", "s1", "w1"], {"w1"}), "s1")
+        self.assertEqual(ops.snapshot_node(["s2", "s3", "s1"], set()), "s1")
+        with self.assertRaises(LabError):
+            ops.snapshot_node(["w1"], {"w1"})
+
+
+class VersionMismatchMessageTest(unittest.TestCase):
+    def test_direction(self):
+        from labtool import vm
+        newer = vm.version_mismatch_message("v1.37.2+k3s1", "v1.36.5+k3s1")
+        self.assertIn("K3S_IMAGE を rancher/k3s:v1.37.2-k3s1 に", newer)
+        self.assertNotIn("upgrade-k8s v1.36.5", newer)
+        older = vm.version_mismatch_message("v1.36.5+k3s1", "v1.37.2+k3s1")
+        self.assertIn("./lab upgrade-k8s v1.37.2+k3s1", older)
+
+
+class UpgradeAmiHelpersTest(unittest.TestCase):
+    def test_swap_id_keeps_order(self):
+        from labtool import ops
+        self.assertEqual(ops.swap_id("i-1,i-2,i-3", "i-2", "i-9"), "i-1,i-9,i-3")
+        self.assertEqual(ops.swap_id("i-1", "i-x", "i-9"), "i-1")
+
+    def test_node_local_claims(self):
+        from unittest import mock
+        from labtool import vm
+        pvs = {"items": [
+            {"spec": {"claimRef": {"namespace": "ns", "name": "pg-1"}, "nodeAffinity": {"required": {"nodeSelectorTerms": [
+                {"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "In", "values": ["n1"]}]}]}}}},
+            {"spec": {"claimRef": {"namespace": "ns", "name": "pg-2"}, "nodeAffinity": {"required": {"nodeSelectorTerms": [
+                {"matchExpressions": [{"key": "kubernetes.io/hostname", "operator": "In", "values": ["n2"]}]}]}}}},
+            {"spec": {"claimRef": {"namespace": "ns", "name": "efs"}}}]}
+        with mock.patch.object(vm, "output", return_value=json.dumps(pvs)):
+            self.assertEqual(vm.node_local_claims("n1"), [("ns", "pg-1")])
+
+    def test_provided_refuses(self):
+        from labtool import ops
+        env = Env({"LAB_TARGET": "aws-ec2", "LAB_INFRA": "provided"})
+        with self.assertRaises(LabError) as cm:
+            ops.upgrade_ami(env)
+        self.assertIn("用意する側", str(cm.exception))
+
+
+class LitellmMetricsZabbixTest(unittest.TestCase):
+    def test_specs(self):
+        from labtool import zabbix_monitors as mon
+        s = mon.k8s_specs()
+        lite = s["discovery"][1]
+        self.assertEqual(lite["rule"]["master"], "lab.litellm.pods")
+        self.assertIn("lab.litellm.pods", [i["key_"] for i in s["items"]])   # 発見ルールの元は先に作る
+        master = lite["items"][0]
+        self.assertEqual(master["url"], "http://{#PODIP}:4000/metrics")
+        req = next(i for i in lite["items"] if i["key_"] == "lab.litellm.req.rate[{#POD}]")
+        self.assertEqual(req["master"], master["key_"])
+        self.assertEqual([p["type"] for p in req["preprocessing"]], [mon.PP_PROMETHEUS, mon.PP_CHANGE_PER_SECOND])
+        self.assertEqual(req["preprocessing"][0]["error_handler_params"], "0")
+        after = {i["key_"]: i for i in s["items_after"]}
+        self.assertEqual(after["lab.litellm.req.rate"]["params"], "sum(last_foreach(/litellm-lab-k8s/lab.litellm.req.rate[*]))")
+        self.assertIn("+0.0001", after["lab.litellm.fail.pct"]["params"])
+        for t in s["triggers_after"]:
+            for ref in re.findall(r"/litellm-lab-k8s/([^,)]+)", t["expression"]):
+                self.assertIn(ref, after, t["description"])
+        self.assertIn("Running", mon.JS_LITELLM_PODS_LLD)
+        self.assertEqual(lite["rule"]["enabled_lifetime_type"], 2)

@@ -28,7 +28,7 @@ from . import (
 
 TAG_KEY = "lab:prefix"
 UBUNTU_OWNER = "099720109477"   # Canonical
-UBUNTU_AMI_PATTERN = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*"
+UBUNTU_AMI_PATTERN = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-{arch}-server-*"   # arch は arm64 / amd64（インスタンスの種類から）
 PROXY_AMI_PATTERN = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
 PROXY_INSTANCE_TYPE = "t3.small"            # 中継だけ
 PROXY_INSTANCE_TYPE_ZABBIX = "t3.medium"    # 中継 ＋ Zabbix サーバー（4 GiB）
@@ -464,11 +464,29 @@ def _ensure_keypair(env: Env, pubkey: str) -> str:
     return name
 
 
-def resolve_ami(env: Env, existing: list[dict], pattern: str = UBUNTU_AMI_PATTERN) -> str:
-    """配備済みの台があればその AMI（3 台が同時に置き換わらない）。初回は Canonical の Ubuntu 24.04 の最新。"""
+def instance_arch(env: Env, itype: str) -> str:
+    """インスタンスの種類の CPU の種類（arm64 / amd64）。Graviton（t4g など）は arm64、それ以外は x86_64 → amd64。"""
+    info_ = _ec2(env).describe_instance_types(InstanceTypes=[itype])["InstanceTypes"]
+    archs = info_[0]["ProcessorInfo"]["SupportedArchitectures"] if info_ else []
+    if "arm64" in archs:
+        return "arm64"
+    if "x86_64" in archs:
+        return "amd64"
+    raise LabError(f"インスタンスの種類 {itype} の CPU の種類が分かりません（{archs}）")
+
+
+def resolve_ami(env: Env, existing: list[dict], pattern: str | None = None) -> str:
+    """配備済みの台があればその AMI（3 台が同時に置き換わらない）。初回は Canonical の Ubuntu 24.04 の最新
+    （CPU の種類は LAB_EC2_INSTANCE_TYPE に合わせる）。"""
     for inst in existing:
         if inst.get("ImageId"):
             return inst["ImageId"]
+    return latest_ami(env, pattern)
+
+
+def latest_ami(env: Env, pattern: str | None = None) -> str:
+    """Canonical の Ubuntu 24.04 の最新の AMI（pattern が無ければ LAB_EC2_INSTANCE_TYPE の CPU の種類のもの）。"""
+    pattern = pattern or UBUNTU_AMI_PATTERN.format(arch=instance_arch(env, env.ec2_instance_type))
     images = _ec2(env).describe_images(Owners=[UBUNTU_OWNER], Filters=[
         {"Name": "name", "Values": [pattern]}, {"Name": "state", "Values": ["available"]}])["Images"]
     if not images:
@@ -494,7 +512,7 @@ def _to_node(inst: dict, index: int | None = None) -> Node:
                 state=str(inst.get("State", {}).get("Name", "")).lower())
 
 
-def ensure_nodes(env: Env, net: dict, pubkey: str) -> list[Node]:
+def ensure_nodes(env: Env, net: dict, pubkey: str, ami: str | None = None) -> list[Node]:
     """EC2 3 台（別サブネット、固定のプライベート IP、公開 IP（SSH 用）、Ubuntu 24.04 arm64、IMDSv2、キーペア、ロール無し）。
     無い台だけ作る。"""
     ec2 = _ec2(env)
@@ -502,7 +520,7 @@ def ensure_nodes(env: Env, net: dict, pubkey: str) -> list[Node]:
     keypair = _ensure_keypair(env, pubkey)
     existing = _instances(env)
     by_index = {_to_node(i).index: i for i in existing}
-    ami = resolve_ami(env, existing)
+    ami = ami or resolve_ami(env, existing)
     for n in plan["nodes"]:
         i = n["index"]
         if i in by_index:
@@ -531,7 +549,7 @@ def ensure_nodes(env: Env, net: dict, pubkey: str) -> list[Node]:
     return nodes
 
 
-def ensure_workers(env: Env, net: dict, pubkey: str, count: int) -> list[Node]:
+def ensure_workers(env: Env, net: dict, pubkey: str, count: int, ami: str | None = None) -> list[Node]:
     """足す台 1〜count（<接頭辞>-worker<番号>、今の 3 台と同じ種類と AMI、サブネットは 3 つを順に、そのサブネットの .30+番号）。
     無い番号だけ作る。count より大きい番号の台は消さない（vm.remove_leaving_workers が外した後に remove_workers で消す）。"""
     if count <= 0:
@@ -539,7 +557,7 @@ def ensure_workers(env: Env, net: dict, pubkey: str, count: int) -> list[Node]:
     ec2 = _ec2(env)
     keypair = _ensure_keypair(env, pubkey)
     existing = {_to_node(i).index for i in _instances(env, role="worker")}
-    ami = resolve_ami(env, _instances(env))
+    ami = ami or resolve_ami(env, _instances(env))
     for w in worker_plan(env.vm_cidr, True, count):
         if w["index"] in existing:
             continue
@@ -615,6 +633,29 @@ def describe_nodes(env: Env, ids: list[str], base: int = 0) -> list[Node]:
         node.role = "worker" if base >= WORKER_INDEX_BASE else "server"
         nodes.append(node)
     return nodes
+
+
+def node_image(env: Env, node: Node) -> str:
+    """その台の AMI の ID。"""
+    res = _ec2(env).describe_instances(InstanceIds=[node.id])["Reservations"]
+    return res[0]["Instances"][0].get("ImageId", "") if res else ""
+
+
+def replace_instance(env: Env, node: Node, ami: str, pubkey: str) -> Node:
+    """1 台を消し、同じ番号・同じ内部 IP で ami から作り直して、内部 NLB のターゲットに戻す（./lab upgrade-ami。managed だけ）。
+    新しい台の識別子を返す。"""
+    ec2 = _ec2(env)
+    ec2.terminate_instances(InstanceIds=[node.id])
+    ec2.get_waiter("instance_terminated").wait(InstanceIds=[node.id], WaiterConfig={"Delay": 10, "MaxAttempts": 60})
+    info(f"EC2 {node.id}（{node.private_ip}）を消しました")
+    net = ensure_network(env)
+    servers = ensure_nodes(env, net, pubkey, ami=ami)
+    workers = ensure_workers(env, net, pubkey, env.vm_workers, ami=ami) if node.role == "worker" else list_workers(env)
+    ensure_load_balancer(env, net, servers + workers)   # 作り直した台をターゲットに戻す
+    new = next((n for n in servers + workers if n.index == node.index), None)
+    if new is None:
+        raise LabError(f"作り直した台（番号 {node.index}）が見つかりません")
+    return new
 
 
 def recreate_node(env: Env, infra: Infra, index: int, pubkey: str) -> Node:

@@ -120,8 +120,12 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
 
     config: dict = {
         "model_list": model_list,
-        # 監査ログ（litellm/guardrails/audit_log.py。変更設計書 5 章）
-        "litellm_settings": {"callbacks": ["audit_log.audit_logger_instance"]},
+        # 監査ログ（litellm/guardrails/audit_log.py。変更設計書 5 章）と、Prometheus の指標（/metrics。無償版で出る。Zabbix が Pod ごとに
+        # 読む。変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 14 章）
+        # /metrics は既定で鍵が要る。Zabbix の proxy（クラスタの中）が鍵なしで読めるようにする。外からは Traefik が踏み台だけに絞る
+        # （render.ADMIN_PATH_PREFIXES）。クラスタの中の Pod からは鍵なしで読める
+        "litellm_settings": {"callbacks": ["audit_log.audit_logger_instance", "prometheus"],
+                             "require_auth_for_metrics_endpoint": False},
         "guardrails": [{
             "guardrail_name": "tool-call-review",
             "litellm_params": {
@@ -675,6 +679,27 @@ def barman_plugin_manifest(manifest_text: str, node_selector: dict, replicas: in
 # 台数だけを ./lab up でそろえる（変更設計書 .history/2026-11-05-1台だけの部品の冗長化/ 1 章）
 COREDNS_REPLICAS = 3
 
+
+# metrics-server（k3s に同梱、CPU の値を集める。自動の台数調整が使う）の台数。同梱の定義は 1 台で台数も散らす指定も書かないので、
+# 載った台を止めると CPU の値が取れず自動の台数調整も止まる。台数と散らす指定と PDB を ./lab up でそろえる。同梱の定義に無い項目なので、
+# k3s が定義を当て直しても残る（変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 7 章）
+METRICS_SERVER_REPLICAS = 2
+METRICS_SERVER_LABELS = {"k8s-app": "metrics-server"}
+
+
+def metrics_server_patch() -> dict:
+    """同梱の metrics-server の Deployment に重ねる差分（台数と、台ごとに 1 つずつ散らす指定）。"""
+    return {"spec": {"replicas": METRICS_SERVER_REPLICAS, "template": {"spec": {"topologySpreadConstraints": [{
+        "maxSkew": 1, "topologyKey": "kubernetes.io/hostname", "whenUnsatisfiable": "DoNotSchedule",
+        "nodeTaintsPolicy": "Honor", "labelSelector": {"matchLabels": dict(METRICS_SERVER_LABELS)}}]}}}}
+
+
+def metrics_server_pdb() -> str:
+    """drain で 2 台が同時に追い出されないようにする。"""
+    return yaml.safe_dump({"apiVersion": "policy/v1", "kind": "PodDisruptionBudget",
+                           "metadata": {"name": "metrics-server", "namespace": "kube-system"},
+                           "spec": {"maxUnavailable": 1, "selector": {"matchLabels": dict(METRICS_SERVER_LABELS)}}},
+                          sort_keys=False)
 
 # ---- 台の増減と LiteLLM のメモリ（変更設計書 .history/2026-10-31-台の増減とLiteLLMのメモリ/ 4 章） ----
 CONTROL_PLANE_SELECTOR = {"node-role.kubernetes.io/control-plane": "true"}

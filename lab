@@ -101,6 +101,7 @@ COMMANDS: dict[str, tuple[str, object]] = {
                               lambda: ops.provider_requirements(Env.load())),
     "upgrade": ("LiteLLM を別の版でローリング更新する（例: ./lab upgrade v1.104.3）", None),
     "upgrade-k8s": ("aws-ec2 / gcp-vm: k3s（Kubernetes）を 1 台ずつ上げる（例: ./lab upgrade-k8s v1.36.1+k3s1。マイナー版は 1 つずつ）", None),
+    "upgrade-ami": ("aws-ec2（managed）: 台の AMI を Ubuntu 24.04 の最新に、1 台ずつ作り直して新しくする", None),
     "clean-all": ("クラスタ、生成したクライアント設定、ビルドしたイメージを消す（.env とトークンは残す）", None),
     # 試験
     "test-unit": ("単体テスト（構築ツールと、LiteLLM のイメージの中でガードレール）", lambda: ops.test_unit(Env.load())),   # クラスタに届かなくてよい
@@ -128,6 +129,8 @@ def main(argv: list[str]) -> int:
     parsers["upgrade-k8s"].add_argument("version", help="k3s の版（例: v1.36.1+k3s1）")
     parsers["upgrade-k8s"].add_argument("--measure", action="store_true",
                                         help="上げている間、偽 LLM への要求を流し続けて失敗の数と時間を測る（test-failover と同じ測り方）")
+    parsers["upgrade-ami"].add_argument("--measure", action="store_true",
+                                        help="作り直している間、偽 LLM への要求を流し続けて失敗の数と時間を測る")
     parsers["clean-all"].add_argument("-y", "--yes", action="store_true", help="確認を出さずに消す")
     parsers["down"].add_argument("--all", action="store_true", dest="everything",
                                  help="LAB_INFRA=provided でも VM・浮動 IP・バケットまで消す（静的キーとネットワークは残る）")
@@ -164,6 +167,8 @@ def main(argv: list[str]) -> int:
                 ops.upgrade(loaded(), args.version)
             case "upgrade-k8s":
                 ops.upgrade_k8s(loaded(), args.version, args.measure)
+            case "upgrade-ami":
+                ops.upgrade_ami(loaded(), args.measure)
             case "clean-all":
                 ops.clean_all(args.yes)
             case "test-load":

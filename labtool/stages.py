@@ -206,6 +206,7 @@ def cluster(env: Env) -> None:
 
     wait_until(180, "全ノードの Ready", kc("wait", "--for=condition=Ready", "nodes", "--all", "--timeout=5s"))
     ensure_coredns()
+    ensure_metrics_server()
 
     apply_traefik_config(K8S / "traefik-config.yaml")
     wait_until(300, "Traefik の起動", kc("-n", "kube-system", "rollout", "status", "deploy/traefik", "--timeout=5s"))
@@ -290,6 +291,7 @@ def _cluster_vm(env: Env) -> None:
     want = len(infra.all_nodes())
     wait_until(600, f"全ノード（{want} 台）の Ready", lambda: _ready_nodes() >= want)
     ensure_coredns()
+    ensure_metrics_server()
     vm.label_entry_nodes(infra)
     apply_traefik_config(K8S / "traefik-config-vm.yaml")
     vm.wait_traefik(infra)
@@ -378,6 +380,45 @@ def apply_traefik_config(path: Path) -> bool:
     return changed
 
 
+class TraefikChartWatch:
+    """版上げの間、HelmChart kube-system/traefik のチャートの版を数秒ごとに読み、変わったらすぐ設定をそのチャートの鍵で当て直す。
+    k3s は上げた台が起動した時点でチャートを書き換え、helm-controller は古い鍵の設定のまま入れ替える。台ごとの当て直しを待つと、
+    その間（2026-11-08 の AWS で約 1.5 分）アクセスログの指定が無い定義になる（変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 6 章）。"""
+
+    def __init__(self, path: Path, interval: float = 3.0) -> None:
+        import threading
+        self.path, self.interval = path, interval
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.changes: list[tuple[str, str]] = []   # (前のチャート, 新しいチャート)
+
+    def _read(self) -> str:
+        return output(kc("-n", "kube-system", "get", "helmchart", "traefik", "-o", "jsonpath={.spec.chart}",
+                         "--request-timeout=5s"), check=False).strip()
+
+    def _run(self) -> None:
+        last = self._read()
+        while not self.stop_event.wait(self.interval):
+            now = self._read()
+            if now and last and now != last:
+                info(f"Traefik のチャートが変わりました（{last.rsplit('/', 1)[-1]} → {now.rsplit('/', 1)[-1]}）。すぐ当て直します")
+                try:
+                    apply_traefik_config(self.path)
+                except Exception as e:  # noqa: BLE001 当て直しは台ごとと最後にもある
+                    warn(f"Traefik の設定の当て直しに失敗しました（台ごとの当て直しで続けます）: {e}")
+                self.changes.append((last, now))
+            if now:
+                last = now
+
+    def __enter__(self) -> "TraefikChartWatch":
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=30)
+
+
 def ensure_coredns() -> None:
     """k3s に同梱の CoreDNS を render.COREDNS_REPLICAS 台にそろえる（Mac の k3d と VM の環境）。1 台だけだと、載った台が
     止まったとき名前解決が止まり、LiteLLM が DB に届かないと判断して全台が外れる（2026-11-05 の AWS で回復 102 秒。
@@ -389,6 +430,22 @@ def ensure_coredns() -> None:
         info(f"CoreDNS を {now or '?'} 台から {want} 台にしました")
     wait_until(300, f"CoreDNS（{want} 台）の起動", kc("-n", "kube-system", "rollout", "status", "deploy/coredns",
                                                    "--timeout=5s"))
+
+
+def ensure_metrics_server() -> None:
+    """k3s に同梱の metrics-server を render.METRICS_SERVER_REPLICAS 台にし、台ごとに散らし、PDB を付ける（Mac の k3d と VM の環境）。
+    1 台だけだと、載った台が止まったとき CPU の値が取れず、自動の台数調整が止まる。"""
+    want = render.METRICS_SERVER_REPLICAS
+    wait_until(180, "k3s の metrics-server", kc("-n", "kube-system", "get", "deploy", "metrics-server"))
+    now = output(kc("-n", "kube-system", "get", "deploy", "metrics-server", "-o",
+                    "jsonpath={.spec.replicas} {.spec.template.spec.topologySpreadConstraints}"), check=False).strip()
+    if not now.startswith(f"{want} ") or "kubernetes.io/hostname" not in now:
+        run(kc("-n", "kube-system", "patch", "deploy", "metrics-server", "--type=strategic",
+               "-p", json.dumps(render.metrics_server_patch())), quiet=True)
+        info(f"metrics-server を {want} 台にし、台ごとに散らしました")
+    kapply(manifest=render.metrics_server_pdb(), namespaced=False)
+    wait_until(300, f"metrics-server（{want} 台）の起動", kc("-n", "kube-system", "rollout", "status", "deploy/metrics-server",
+                                                         "--timeout=5s"))
 
 
 def operators(replicas: int = 1, env: Env | None = None) -> None:

@@ -89,6 +89,17 @@ def normalize_k3s_version(text: str) -> str:
     return text.strip().replace("-k3s", "+k3s")
 
 
+def version_mismatch_message(deployed: str, code: str) -> str:
+    """./lab up が配備済みの版とコードの版（K3S_IMAGE）の食い違いで止まるときの案内。向きで案内を変える
+    （配備済みが新しいときに「upgrade-k8s <古い版>」と出ていた。2026-11-08 の AWS で判明）。"""
+    head = f"配備済みの k3s の版（{deployed}）とコードの版（{code}）が違います（./lab up では版を変えません）。"
+    if parse_k3s_version(deployed) > parse_k3s_version(code):
+        return head + (f"upgrade-k8s で上げた後なら、core.py の K3S_IMAGE を rancher/k3s:{deployed.replace('+k3s', '-k3s')} に"
+                       "変えてコミットしてください（下げる操作は行いません）")
+    return head + (f"コードの版に上げるなら ./lab upgrade-k8s {code}、配備済みの版のまま使うなら core.py の K3S_IMAGE を "
+                   f"rancher/k3s:{deployed.replace('+k3s', '-k3s')} に戻してください")
+
+
 def check_upgrade_step(current: str, target: str) -> None:
     """Kubernetes の版の差の規則: マイナー版は 1 つずつ、下げない（同じマイナー版の中のパッチの更新は可）。"""
     cur, tgt = parse_k3s_version(current), parse_k3s_version(target)
@@ -516,9 +527,7 @@ def ensure_cluster_objects(env: Env) -> tuple[str, str]:
             s3.put_object(Bucket=bucket, Key=VERSION_KEY, Body=version.encode())
             info(f"k3s の版 {version} を {bucket}/{VERSION_KEY} に置きました")
         elif version != k3s_install_version():
-            raise LabError(f"配備済みの k3s の版（{version}）とコードの版（{k3s_install_version()}）が違います。"
-                           f"上げるなら ./lab upgrade-k8s {k3s_install_version()}、戻すなら core.py の K3S_IMAGE を "
-                           f"{version} に合わせてください（./lab up では版を変えません）")
+            raise LabError(version_mismatch_message(version, k3s_install_version()))
     return token, version
 
 
@@ -608,16 +617,24 @@ def init_nodes(env: Env, infra: Infra, pubkey: str) -> None:
     token, version = ensure_cluster_objects(env)
     wait_ssh(env, infra.all_nodes(), infra)
     check_worker_capacity(env, infra)
+    for node in [*sorted(infra.nodes, key=lambda n: n.index), *sorted(infra.workers, key=lambda n: n.index)]:
+        init_node(env, infra, node, pubkey, token, version)
+
+
+def init_node(env: Env, infra: Infra, node: Node, pubkey: str, token: str | None = None, version: str | None = None) -> None:
+    """1 台を SSH で初期化する（新しい台なら k3s に参加する。生きている server の台に参加するので、1 番を作り直しても
+    新しいクラスタは起こさない）。"""
+    if token is None or version is None:
+        token, version = ensure_cluster_objects(env)
     common = {"K3S_VERSION": version, "K3S_TOKEN": token, "SSH_USER": env.vm_ssh_user, **egress_values(env, infra),
               **firewall_values(env, infra)}
-    for node in [*sorted(infra.nodes, key=lambda n: n.index), *sorted(infra.workers, key=lambda n: n.index)]:
-        script = render_node_init(node, infra.nodes, pubkey, {**common, **zabbix_values(env, node)})
-        info(f"{node.id}（{'足す台' if node.role == 'worker' else 'node'}{node.index - clouds.WORKER_INDEX_BASE if node.role == 'worker' else node.index}）"
-             "を初期化します（SSH）")
-        out = run_on(env, node, script, timeout=1500)
-        tail = out.strip().splitlines()[-1] if out.strip() else ""
-        ok(f"{node.id}: {tail}")
-        refresh_public_ips(env, infra)   # 止めて起こした台の一時的な外部 IP が変わっていることがある
+    script = render_node_init(node, infra.nodes, pubkey, {**common, **zabbix_values(env, node)})
+    info(f"{node.id}（{'足す台' if node.role == 'worker' else 'node'}{node.index - clouds.WORKER_INDEX_BASE if node.role == 'worker' else node.index}）"
+         "を初期化します（SSH）")
+    out = run_on(env, node, script, timeout=1500)
+    tail = out.strip().splitlines()[-1] if out.strip() else ""
+    ok(f"{node.id}: {tail}")
+    refresh_public_ips(env, infra)   # 止めて起こした台の一時的な外部 IP が変わっていることがある
 
 
 def check_worker_capacity(env: Env, infra: Infra) -> None:
@@ -791,6 +808,26 @@ def node_for_k8s_name(infra: Infra, name: str) -> Node:
     raise LabError(f"ノード {name}（{internal}）に当たる VM が見つかりません")
 
 
+def node_internal_ips() -> list[str]:
+    """クラスタのノードの内部 IP。"""
+    nodes = json.loads(output(kc("get", "nodes", "-o", "json")))
+    return [a["address"] for n in nodes["items"] for a in n["status"]["addresses"] if a["type"] == "InternalIP"]
+
+
+def k8s_name_for_ip(ip: str) -> str | None:
+    """内部 IP に当たるノードの名前（無ければ None）。"""
+    nodes = json.loads(output(kc("get", "nodes", "-o", "json")))
+    for n in nodes["items"]:
+        if any(a["type"] == "InternalIP" and a["address"] == ip for a in n["status"]["addresses"]):
+            return n["metadata"]["name"]
+    return None
+
+
+def k8s_name_from_ip(ip: str) -> str:
+    """まだ参加していない台のノード名（AWS の既定のホスト名 ip-a-b-c-d。VM の初期化はホスト名を変えない）。"""
+    return "ip-" + ip.replace(".", "-")
+
+
 def k8s_name_for_node(node: Node) -> str:
     nodes = json.loads(output(kc("get", "nodes", "-o", "json")))
     for n in nodes["items"]:
@@ -904,6 +941,42 @@ def etcd_snapshot(env: Env, node: Node, name: str) -> None:
 def drain_node(node_name: str) -> None:
     run(kc("cordon", node_name), quiet=True)
     run(kc("drain", node_name, "--ignore-daemonsets", "--delete-emptydir-data", "--timeout=600s"))
+
+
+def node_local_claims(node_name: str) -> list[tuple[str, str]]:
+    """その台のディスクにある PVC（local-path の PV の nodeAffinity がその台）の (名前空間, 名前)。"""
+    pvs = json.loads(output(kc("get", "pv", "-o", "json"), check=False) or "{}").get("items", [])
+    claims = []
+    for pv in pvs:
+        terms = (((pv.get("spec") or {}).get("nodeAffinity") or {}).get("required") or {}).get("nodeSelectorTerms") or []
+        on = any(node_name in (e.get("values") or []) for t in terms for e in (t.get("matchExpressions") or []))
+        ref = (pv.get("spec") or {}).get("claimRef") or {}
+        if on and ref.get("name"):
+            claims.append((ref.get("namespace", ""), ref["name"]))
+    return sorted(claims)
+
+
+def forget_node(env: Env, node_name: str, ip: str) -> list[tuple[str, str]]:
+    """作り直す台をクラスタから外す（drain の後）: その台のディスクにある PVC と、それを使う Pod を消し、ノードを消す。
+    ノードを消すと k3s がその台の etcd のメンバーとノードのパスワードを外すので、同じ名前の新しい台が参加できる。
+    PostgreSQL（CloudNativePG）は消えた PVC の代わりに新しい番号のレプリカを作り、Valkey は StatefulSet が PVC を作り直して
+    primary から写す（変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 13 章）。消した PVC を返す。"""
+    claims = node_local_claims(node_name)
+    for ns, name in claims:
+        run(kc("-n", ns, "delete", "pvc", name, "--wait=false"), quiet=True, check=False)
+        pods = json.loads(output(kc("-n", ns, "get", "pods", "-o", "json"), check=False) or "{}").get("items", [])
+        for p in pods:
+            vols = (p.get("spec") or {}).get("volumes") or []
+            if any((v.get("persistentVolumeClaim") or {}).get("claimName") == name for v in vols):
+                run(kc("-n", ns, "delete", "pod", p["metadata"]["name"], "--wait=false"), quiet=True, check=False)
+        info(f"{ns}/{name}（{node_name} のディスク）を消しました")
+    run(kc("delete", "node", node_name, "--wait=true", "--timeout=120s"), quiet=True)
+    info(f"ノード {node_name} を消しました（etcd のメンバーとノードのパスワードも外れる）")
+    if env.zabbix_enabled:
+        from . import zabbix
+        for host in zabbix.delete_hosts_by_ip(env, load_infra(env), [ip]):
+            info(f"Zabbix のホスト {host} を消しました")
+    return claims
 
 
 def install_k3s(env: Env, node: Node, version: str) -> None:

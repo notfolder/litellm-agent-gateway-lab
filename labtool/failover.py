@@ -440,12 +440,40 @@ def trigger(env: Env, scenario: str, load: Load) -> str:
         if not workers:
             raise LabError("足す台がありません（LAB_VM_WORKERS か LAB_VM_WORKER_NODES で足してから流してください）")
         names = [w.split("/", 1)[1] for w in workers]
-        pods = json_output(kn("get", "pods", "-l", "app.kubernetes.io/name=litellm", "-o", "json"), default={}) or {}
-        on = [p["spec"].get("nodeName") for p in pods.get("items", [])]
-        node = next((n for n in names if n in on), names[0])
+        on = _litellm_nodes()
+        node = next((n for n in names if n in on), None)
+        if node is None:
+            raise LabError(f"足す台（{', '.join(names)}）に LiteLLM が載っていません（場面の前の入れ替えでも載らなかった）")
         _stop_node(node, load, env)
         return f"足す台 {node}（LiteLLM {on.count(node)} つ）を停止"
     raise LabError(f"知らない場面です: {scenario}")
+
+
+def _litellm_nodes() -> list[str]:
+    """LiteLLM の Pod（終了中を除く）が載っているノードの名前（Pod ごとに 1 つ）。"""
+    pods = json_output(kn("get", "pods", "-l", "app.kubernetes.io/name=litellm", "-o", "json"), default={}) or {}
+    return [p["spec"].get("nodeName") for p in pods.get("items", [])
+            if not p["metadata"].get("deletionTimestamp") and p["spec"].get("nodeName")]
+
+
+def _put_litellm_on_worker(attempts: int = 3) -> None:
+    """worker-node の前に、足す台に LiteLLM が載っているようにする。載っていなければ LiteLLM を入れ替え（rollout restart）、
+    散らす指定で足す台にも置かれるのを待つ（2026-11-04 の AWS では LiteLLM が 0 の足す台を止め、場面にならなかった。
+    変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 9 章）。負荷を流す前に行うので、入れ替えは場面の失敗に数えない。"""
+    from . import render
+    workers = [w.split("/", 1)[1] for w in
+               output(kc("get", "nodes", "-l", f"{render.WORKER_LABEL}=worker", "-o", "name"), check=False).split()]
+    if not workers:
+        return
+    for i in range(attempts):
+        on = _litellm_nodes()
+        if any(w in on for w in workers):
+            return
+        info(f"足す台に LiteLLM が載っていないので、LiteLLM を入れ替えます（{i + 1}/{attempts} 回目）")
+        run(kn("rollout", "restart", "deploy/litellm"), quiet=True)
+        run(kn("rollout", "status", "deploy/litellm", "--timeout=600s"), quiet=True)
+    if not any(w in _litellm_nodes() for w in workers):
+        raise LabError(f"足す台（{', '.join(workers)}）に LiteLLM が載りません（{attempts} 回入れ替えた）")
 
 
 def run_scenario(env: Env, scenario: str) -> dict:
@@ -456,6 +484,9 @@ def run_scenario(env: Env, scenario: str) -> dict:
         wait_healthy(env)
     if scenario == "valkey-node" and not env.is_vm:
         _move_valkey_primary_off_server(env)
+    if scenario == "worker-node":
+        _put_litellm_on_worker()
+        wait_healthy(env)
     restarts_before = litellm_restarts()
     with make_load(env) as load:
         time.sleep(10)  # 平常時の様子

@@ -41,7 +41,7 @@ NS = "litellm-lab"
 HELM_RELEASE = "litellm"
 LITELLM_CHART = "oci://ghcr.io/berriai/litellm-helm"
 DEFAULT_LITELLM_VERSION = "v1.104.2"
-K3S_IMAGE = "rancher/k3s:v1.36.5-k3s1"
+K3S_IMAGE = "rancher/k3s:v1.37.2-k3s1"
 
 # イメージの置き場（クラスタとは別に作り、クラスタを消しても残す）
 REGISTRY_NAME = "litellm-registry.localhost"  # 自作イメージを push する
