@@ -217,6 +217,7 @@ flowchart TB
 
 - `HelmChartConfig` で `ports.web.transport.respondingTimeouts` の `readTimeout` / `writeTimeout` / `idleTimeout` を 600 秒にする（長いストリーミングと判定待ちで切れないように）
 - アクセスログを有効にする。ヘッダーは記録しない（キーやトークンを残さないため）
+- 設定ファイルはチャート 40（k3s 1.36）の鍵で書き、`stages.apply_traefik_config` が HelmChart `kube-system/traefik` の `spec.chart` からチャートの主版を読んで当てる。41 以上（k3s 1.37）なら `render.traefik_config` が `logs.access` → `accessLog`、`logs.general` → `log`、`fields` の `defaultmode` → `defaultMode` に書き換える（チャート 41.0.0 の改名。どちらのチャートも知らない鍵を最上位に認めないので両方は書かない）。VM の環境も同じ
 - server ノードに置く（障害の試験で止めるのは agent ノードだけ）
 
 ### 5.3 公開する経路とパススルーの遮断（`k8s/ingress.yaml`）
@@ -1427,9 +1428,9 @@ flowchart TB
     P["preflight<br/>道具（kubectl、helm、ssh）、資格情報、ホスト名、provided の項目"] --> C
     subgraph C["cluster"]
         PR["provision（managed だけ）<br/>ネットワーク（通す規則だけ）→ 22 / 中継の許可 → バケット → 静的キー → VM 3 台 → 内部ロードバランサ → 中継（踏み台）の VM<br/>→ .env に書く → 中継の VM を SSH で初期化（mitmproxy、nftables、Zabbix サーバー）して CA を取る"]
-        LI["load_infra（.env の識別子 → API）→ ensure_access（managed は 22 の許可を直す）→ 減らした足す台を外す（21.12 節）"]
+        LI["load_infra（.env の識別子 → API）→ 止まっている台があれば止める → ensure_access（managed は 22 の許可を直す）→ 減らした足す台を外す（21.12 節）"]
         IN["init_nodes: cluster/k3s/token・version（無ければ作る）→ 足す台の CPU とメモリの確認 → 1 番 → 2 番 → 3 番 → 足す台 を SSH で初期化（nftables、agent 2、k3s）→ 6443 の転送"]
-        KS["全台の Ready → CoreDNS を 3 台に → 入口の印 → Traefik（全台に 1 つ、hostPort 80/443）→ 入口の 443 の転送（踏み台経由）→ namespace → NetworkPolicy → SA → 中継の CA → registry → cert-manager（中継と再帰リゾルバ）・CNPG・Barman（各 2 台）→ ClusterIssuer"]
+        KS["全台の Ready → CoreDNS を 3 台に → 入口の印 → Traefik（全台に 1 つ、hostPort 80/443、1 台ずつ入れ替え）→ 入口の 443 の転送（踏み台経由）→ namespace → NetworkPolicy → SA → 中継の CA → registry → cert-manager（中継と再帰リゾルバ）・CNPG・Barman（各 2 台）→ ClusterIssuer"]
         PR --> LI --> IN --> KS
     end
     C --> I["images<br/>VM の Docker でビルド（文脈は tar で SSH）→ 127.0.0.1:30500 に push"]
@@ -1437,6 +1438,7 @@ flowchart TB
     D --> M["mcp"] --> L["litellm（最大数の計算、優先度、admin-only の経路、A レコード 2 本 → Let's Encrypt（SAN 2 名））"] --> Z["zabbix（21.11 節）"] --> B["bootstrap"] --> AU["audit（検索アプリも admin-only）"] --> CL["clients（転送口の URL）"]
 ```
 
+- 止まっている台（AWS の `stopping` / `stopped`、GCP の `STOPPING` / `TERMINATED` / `SUSPENDING` / `SUSPENDED`）があれば、待たずに止める（`clouds.require_running`）。メッセージに台の番号と識別子・状態、起こすコマンド（AWS は `aws ec2 start-instances`、GCP は `gcloud compute instances start`）を出す。`./lab up` は止まった台を起こさない（一部の台にだけ設定を当てると、戻った台との食い違いが残るため）。managed の AWS は台の作成で `instance_running` を待つ前にも確かめる。`./lab down`・障害の試験・`upgrade-k8s` は確かめない
 - A レコードを作る前に、同じホスト名に CNAME があり、その注記が `litellm-agent-gateway-lab` で始まる（`./lab` が作った。EKS 版の ALB 向けなど）なら消す。注記の無い CNAME は消さずに止める（Cloudflare は同じ名前の CNAME と A レコードを並べられない）
 
 ### 21.4 VM の初期化（`vm/node-init.sh`、SSH で `sudo bash -s`）
@@ -1520,7 +1522,7 @@ AWS では、権限を IAM ユーザーと同じ名前のカスタマー管理�
 
 spec 12.2 節。静的キーの権限は 21.5 節の表。GCS は「均一なバケットレベルのアクセス」を有効にする（IAM の条件に必須）。registry 3.0 の S3 ドライバは ACL を付けて均一のバケットに書けないので、GCP の registry はサービスアカウントの JSON キーで GCS ドライバを使う（`LAB_VM_GCS_REGISTRY_KEY_JSON`）。VM にクラウドの権限は要らない。ロードバランサは L4 の素通しで送信元 IP を保つこと（管理系の経路の IPAllowList のため）。
 
-### 21.10 配備と試験の結果（GCP 2026-10-31、AWS 2026-11-04〜05）
+### 21.10 配備と試験の結果（GCP 2026-10-31、AWS 2026-11-04〜08）
 
 **GCP**: `LAB_TARGET=gcp-vm`、managed で中継（踏み台、Zabbix サーバー）の VM を作り（`LAB_EGRESS_PROXY_VM=true`、`LAB_ZABBIX_VM=true`）、Mac も中継経由。
 3 台の直接の外向きは nftables が遮断。障害の試験は 21.13 節の部品の冗長化より前の構成で流した。手戻りと詳細は `.history/2026-10-31-内部LBとVM側の防御とZabbix/変更設計書.md` 15 章
@@ -1548,10 +1550,12 @@ spec 12.2 節。静的キーの権限は 21.5 節の表。GCS は「均一なバ
 | `./lab up`（managed） | 4 回目で全段階を通過（手戻り 3 件: IAM のインラインポリシーの文字数の上限（21.5 節）、同じホスト名に残った CNAME（21.3 節）、Mac の転送口のポートの重なり）。初回の作成は約 29 分（EC2 の初期化は 1 台 70〜95 秒を順に、VM 上のビルド 2 本で 2 分 20 秒、PostgreSQL の準備 145 秒、LiteLLM の起動 82 秒） |
 | `test-smoke` | 75 件すべて OK |
 | `test-idempotency` | 64 項目を比較して 2 回目で変化なし |
-| `test-audit` | 32 件中 31 件 OK（NG は Gmail 未サインインの「MCP の記録」）。ローリング更新の間の要求 93 件は欠け 0 件 |
+| `test-audit` | 32 件中 31 件 OK（NG は Gmail 未サインインの「MCP の記録」）。ローリング更新の間の要求 93 件（2026-11-08 は 94 件）は欠け 0 件 |
 | `test-failover`（2026-11-05、21.13 節の構成、負荷は中継の VM から） | pg-switchover 失敗 0/1,222 件、pg-pod 0/1,210 件、pg-node 回復 90.9 秒（失敗 1,147/5,370 件）、valkey-pod 0/1,225 件、valkey-node 回復 83.6 秒（失敗 1,383/5,126 件）、entry-node 回復 66.3 秒（失敗 870/5,875 件）。全場面が目安 120 秒以内、監査ログの欠けは全場面 0 件。止めていない台の Traefik は再起動しなかった。台を止めた後、残りの 2 台の CPU は割り当て可能な量の 105〜133% に張り付き、その間も Traefik は 76〜114m の CPU を得ていた |
 | 足す台（`LAB_VM_WORKERS=1` → 0） | 追加: EC2 の作成から k3s への参加まで約 2 分 15 秒、ターゲットグループ 2 つに登録、LiteLLM の最大数 11 → 17。`worker-node`: 失敗 111/3,441 件、回復 29.6 秒（止めた足す台に LiteLLM が載っていなかった）。削除: drain、Zabbix のホストの削除、ターゲットグループからの解除、EC2 の削除、最大数 17 → 11 |
-| `./lab upgrade-k8s v1.37.1+k3s1 --measure`（v1.36.5 から） | 3 台が 332 秒で上がった（1 台 74〜131 秒）。要求 6,635 件のうち失敗 478 件（状態 0 / 502）、失敗が散らばった幅 274.4 秒（負荷は Mac から） |
+| `./lab upgrade-k8s v1.37.1+k3s1 --measure`（2026-11-08、v1.36.5 から、21.12 節の手順、負荷は中継の VM から） | 3 台が 351 秒で上がった（1 台 1.5〜2.5 分）。要求 6,912 件のうち失敗 176 件（状態 0 / 502）、失敗が散らばった幅 277.0 秒。Traefik は全台がチャート 41 の定義に入れ替わり、アクセスログの引数がある。上げた後も CoreDNS 3 台、Barman Cloud Plugin 2 台。上げた後の `test-smoke` は 75 件すべて OK |
+| `test-restore`（2026-11-08） | T までの行があり、T より後の行は無い（復元したクラスタの準備 53 秒） |
+| 1 台を止めたまま `./lab up`（2026-11-08） | 23 秒で、止めた台（番号・識別子・状態）と起こすコマンドを示して止まった。台を起こすと 42 秒で Ready |
 | `test-judge` | 未確認（審査官の API キーが利用の上限に達していた。VM から中継を通って Anthropic に届くことは確かめた） |
 | 片付け | `./lab down` 約 3 分（バケットの全版、IAM のポリシーと利用者、内部 NLB、EC2 4 台、VPC とネットワーク）。API で有料の資源が 0 件 |
 
@@ -1581,13 +1585,13 @@ spec 12.2 節。静的キーの権限は 21.5 節の表。GCS は「均一なバ
 | 台の種類 | 今の 3 台（server、`node-role.kubernetes.io/control-plane=true`）と足す台（agent、`litellm-lab/role=worker`）。`Node.role`、足す台の `Node.index` は 100 ＋ 番号。`Infra.workers`、`Infra.all_nodes()` |
 | 足す台の IP | GCP はサブネットの .30+番号、AWS は 3 つのサブネットを順に使ってそのサブネットの .30+番号（`clouds.worker_plan`）。同じ種類・イメージ、ゾーンは順に |
 | 加える前の確認 | まだ参加していない足す台に SSH で `nproc` と `/proc/meminfo` を読み、CPU − 0.25 が LiteLLM の CPU の予約以上、メモリ − 1 GiB が LiteLLM のメモリの上限以上でなければ止める（`render.worker_capacity_shortage`） |
-| 入口 | Traefik は DaemonSet（`k8s/traefik-config-vm.yaml`。`nodeSelector: litellm-lab/entry=true`）。`./lab cluster` が全台に入口の印を付け、DaemonSet の準備数が台数に届くまで待つ |
+| 入口 | Traefik は DaemonSet（`k8s/traefik-config-vm.yaml`。`nodeSelector: litellm-lab/entry=true`）。`./lab cluster` が全台に入口の印を付け、DaemonSet の準備数と更新済みの数が台数に届くまで待つ。更新は古い Pod を 1 台ずつ止めてから新しい Pod を置く（`updateStrategy.rollingUpdate` の `maxUnavailable: 1`、`maxSurge: 0`。チャートの既定の「先に 1 つ足す」では、台の 80 / 443 を古い Pod が持ったままなので足した Pod を置けず、更新が終わらない）。入れ替えている台の Traefik は、ロードバランサが外すまで要求を落としうる |
 | 減らす | 初期化の前に流す（外す台の IP は前回の nftables に残っているので、外し終わるまで Pod の通信は切れない）。その台の nftables にヘルスチェック（80）を落とす規則を足して 30 秒待つ → 入口の印を外す → cordon と drain（600 秒）→ `kubectl delete node` → SSH で k3s・Zabbix agent・nftables の表を外す → Zabbix のホストを消す → managed は `remove_workers`（ロードバランサの転送先から外して VM を消す）、provided は担当部署への依頼を出す。ヘルスチェックだけを先に落とすのは、Traefik を先に消すと外れるまでの約 10 秒の接続が拒否されるため |
 | DB の置き場所 | VM の環境では描画のときに `render.pin_to_servers` が CloudNativePG の Cluster（`spec.affinity.nodeSelector`）と Valkey・Sentinel の StatefulSet に `node-role.kubernetes.io/control-plane: "true"` を差し込む |
 | LiteLLM の資源 | Helm の上書きの値の `resources`（CPU の予約 250m、メモリは `.env`） |
 | 最大数 | Ready で cordon されていないノードごとに、割り当て可能な量から LiteLLM 以外の Pod（終わった Pod を除く）の予約を引き、`min(floor(CPU の空き ÷ 0.25), floor(メモリの空き ÷ メモリの上限))` を足す（`render.litellm_slots`）。`autoscaling.maxReplicas` に渡す。2 未満なら止めて台ごとの空きを出す。その時点の配置で数えるので、作ったばかりの 1 回目は後の段（Zabbix、監査ログの検索アプリ）の Pod を数える前で 1 つ多くなり、2 回目から落ち着く（最大数だけが変わる Helm の更新では Pod は作り直されない） |
 | 優先度 | PriorityClass `litellm-lab-scalable`（値 −100、`preemptionPolicy: Never`）。チャートに値が無く Helm 4 の後処理はプラグインが要るので、`helm upgrade` の後に Deployment に `priorityClassName` を付ける（違うときだけ。Helm はこの欄を描かないので次の upgrade でも残る） |
-| 版上げ | `vm.upgrade_order`: 今の 3 台（SSH の転送先は 3 台の最後）→ 足す台。足す台は `sh -s - agent` で入れ直す |
+| 版上げ | `vm.upgrade_order`: 今の 3 台（SSH の転送先は 3 台の最後）→ 足す台。足す台は `sh -s - agent` で入れ直す。台ごとに Ready と版を待って uncordon した後と、全台の後に、Traefik の設定を動いているチャートの鍵で当て直す（上げた台の k3s が同梱のチャートを書き換えることがある。1.36 → 1.37 で 40 → 41）。全台の後は Traefik が全台で新しい定義になるのを待つ |
 | 障害の試験 | `worker-node`（LiteLLM が載った足す台を 120 秒止める）。足す台があるときだけ `all` に入る |
 
 配備と試験の結果（GCP、2026-10-31、検証の VM は全台 c4a-standard-2）:
