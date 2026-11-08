@@ -1191,6 +1191,41 @@ def admin_only_manifest(env: Env) -> str:
     return yaml.safe_dump_all([middleware, route], sort_keys=False)
 
 
+def traefik_chart_major(chart: str) -> int | None:
+    """HelmChart kube-system/traefik の spec.chart（…/static/charts/traefik-41.4.2+up41.4.0.tgz）からチャートの主版を取り出す。"""
+    m = re.search(r"traefik-(\d+)\.\d+\.\d+", chart or "")
+    return int(m.group(1)) if m else None
+
+
+def _camel_default_mode(fields: dict) -> dict:
+    """アクセスログの fields の defaultmode を defaultMode に（チャート 41 の綴り）。headers の下も同じ。"""
+    out = {("defaultMode" if k == "defaultmode" else k): v for k, v in fields.items()}
+    if isinstance(out.get("headers"), dict):
+        out["headers"] = {("defaultMode" if k == "defaultmode" else k): v for k, v in out["headers"].items()}
+    return out
+
+
+def traefik_config(text: str, major: int | None) -> str:
+    """k3s の Traefik の HelmChartConfig（k8s/traefik-config*.yaml。チャート 40 の形で書く）を、動いているチャートの版に合わせる。
+    チャート 41 で logs.access → accessLog、logs.general → log、fields の defaultmode → defaultMode に改名された（チャートの Changelog
+    41.0.0。どちらのチャートも知らない鍵を最上位に認めないので両方は書かない。変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 2 章）。
+    40 以下か版が分からなければ変えない。"""
+    doc = yaml.safe_load(text)
+    if major is None or major < 41:
+        return yaml.safe_dump(doc, sort_keys=False, allow_unicode=True)
+    values = yaml.safe_load(doc["spec"]["valuesContent"]) or {}
+    logs = values.pop("logs", None) or {}
+    if "access" in logs:
+        access = dict(logs["access"])
+        if isinstance(access.get("fields"), dict):
+            access["fields"] = _camel_default_mode(access["fields"])
+        values["accessLog"] = access
+    if "general" in logs:
+        values["log"] = logs["general"]
+    doc["spec"]["valuesContent"] = yaml.safe_dump(values, sort_keys=False, allow_unicode=True)
+    return yaml.safe_dump(doc, sort_keys=False, allow_unicode=True)
+
+
 def without_traefik(manifest_text: str) -> str:
     """Traefik の資源（traefik.io の IngressRoute、Middleware など）を除く。EKS には Traefik が無く、入口は ALB の Ingress
     （alb_ingress_manifest）が受け持つ。"""

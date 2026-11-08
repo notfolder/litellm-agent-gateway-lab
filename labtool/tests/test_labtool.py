@@ -420,6 +420,76 @@ class PricingAndPinningTest(unittest.TestCase):
         self.assertNotIn("topologySpreadConstraints", d["spec"]["template"]["spec"])
 
 
+
+class TraefikUpdateAndStoppedNodeTest(unittest.TestCase):
+    """変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 4 章。"""
+
+    def test_vm_traefik_replaces_one_node_at_a_time(self):
+        cfg = yaml.safe_load(yaml.safe_load((ROOT / "k8s" / "traefik-config-vm.yaml").read_text())["spec"]["valuesContent"])
+        self.assertEqual(cfg["updateStrategy"], {"type": "RollingUpdate",
+                                                 "rollingUpdate": {"maxUnavailable": 1, "maxSurge": 0}})
+
+    def test_chart_major_from_helmchart(self):
+        self.assertEqual(render.traefik_chart_major("https://%{KUBERNETES_API}%/static/charts/traefik-41.4.2+up41.4.0.tgz"), 41)
+        self.assertEqual(render.traefik_chart_major("https://%{KUBERNETES_API}%/static/charts/traefik-40.1.5+up40.1.0.tgz"), 40)
+        self.assertIsNone(render.traefik_chart_major(""))
+        self.assertIsNone(render.traefik_chart_major("something-else.tgz"))
+
+    def _values(self, text):
+        return yaml.safe_load(yaml.safe_load(text)["spec"]["valuesContent"])
+
+    def test_chart_41_renames_access_log_keys(self):
+        for name in ("traefik-config-vm.yaml", "traefik-config.yaml"):
+            text = (ROOT / "k8s" / name).read_text()
+            before = self._values(text)
+            after = self._values(render.traefik_config(text, 41))
+            self.assertNotIn("logs", after, name)
+            self.assertEqual(after["accessLog"]["enabled"], True, name)
+            self.assertEqual(after["accessLog"]["fields"]["headers"], {"defaultMode": "drop"}, name)
+            self.assertEqual({k: v for k, v in after.items() if k != "accessLog"},
+                             {k: v for k, v in before.items() if k != "logs"}, name)
+
+    def test_chart_40_and_unknown_keep_the_file(self):
+        text = (ROOT / "k8s" / "traefik-config-vm.yaml").read_text()
+        for major in (40, None):
+            self.assertEqual(self._values(render.traefik_config(text, major)), self._values(text))
+            self.assertEqual(yaml.safe_load(render.traefik_config(text, major))["metadata"],
+                             {"name": "traefik", "namespace": "kube-system"})
+
+    def test_general_log_moves_to_log(self):
+        text = yaml.safe_dump({"apiVersion": "helm.cattle.io/v1", "kind": "HelmChartConfig",
+                               "metadata": {"name": "traefik", "namespace": "kube-system"},
+                               "spec": {"valuesContent": yaml.safe_dump({"logs": {"general": {"level": "DEBUG"}}})}})
+        self.assertEqual(self._values(render.traefik_config(text, 41)), {"log": {"level": "DEBUG"}})
+
+    def test_require_running_names_stopped_nodes(self):
+        from labtool import clouds
+        from labtool.clouds import Node, aws_ec2
+        e = VmTargetTest().vm("aws-ec2")
+        nodes = [Node("i-1", 1, "10.0.0.1", "", "a", state="running"),
+                 Node("i-2", 2, "10.0.1.1", "", "c", state="stopped"),
+                 Node("i-3", 3, "10.0.2.1", "", "d", state="pending")]
+        with self.assertRaises(LabError) as cm:
+            clouds.require_running(e, nodes, aws_ec2)
+        msg = str(cm.exception)
+        self.assertIn("node2（i-2、stopped）", msg)
+        self.assertIn("aws ec2 start-instances", msg)
+        self.assertIn("i-2", msg)
+        self.assertNotIn("i-1", msg)
+        self.assertNotIn("i-3", msg)
+        clouds.require_running(e, [nodes[0], nodes[2], Node("i-4", 4, "", "", "a")], aws_ec2)   # 動いている・作成中・不明は通す
+
+    def test_require_running_gcp_states(self):
+        from labtool import clouds
+        from labtool.clouds import Node, gcp
+        e = VmTargetTest().vm("gcp-vm")
+        with self.assertRaises(LabError) as cm:
+            clouds.require_running(e, [Node("asia-northeast1-a/w1", 101, "", "", "asia-northeast1-a", role="worker",
+                                             state="terminated")], gcp)
+        self.assertIn("worker1（asia-northeast1-a/w1、terminated）", str(cm.exception))
+        self.assertIn("gcloud compute instances start w1 --zone asia-northeast1-a", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
 

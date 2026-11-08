@@ -706,7 +706,8 @@ def _to_node(inst, index: int | None = None) -> Node:
     labels = inst.labels or {}
     return Node(id=f"{zone}/{inst.name}", index=index if index is not None else int(labels.get("lab-node-index", "0")),
                 private_ip=nic.network_i_p if nic else "", public_ip=public or "", zone=zone,
-                role="worker" if labels.get("lab-role") == "worker" else "server")
+                role="worker" if labels.get("lab-role") == "worker" else "server",
+                state=str(getattr(inst, "status", "") or "").lower())
 
 
 def _create_instance(env: Env, zone: str, name: str, machine_type: str, image: str, disk_type: str, disk_gb: int,
@@ -845,6 +846,12 @@ def recreate_node(env: Env, infra: Infra, index: int, pubkey: str) -> Node:
 def stop_node(env: Env, node: Node) -> None:
     zone, name = node.id.split("/", 1)
     _compute().InstancesClient().stop(project=env.gcp_project, zone=zone, instance=name).result()
+
+
+def start_command(env: Env, node: Node) -> str:
+    """止まった台を手で起こすコマンド（require_running の案内）。"""
+    zone, name = node.id.split("/", 1)
+    return f"gcloud compute instances start {name} --zone {zone} --project {env.gcp_project}"
 
 
 def start_node(env: Env, node: Node) -> None:

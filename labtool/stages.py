@@ -207,7 +207,7 @@ def cluster(env: Env) -> None:
     wait_until(180, "全ノードの Ready", kc("wait", "--for=condition=Ready", "nodes", "--all", "--timeout=5s"))
     ensure_coredns()
 
-    kapply(files=[K8S / "traefik-config.yaml"], namespaced=False)
+    apply_traefik_config(K8S / "traefik-config.yaml")
     wait_until(300, "Traefik の起動", kc("-n", "kube-system", "rollout", "status", "deploy/traefik", "--timeout=5s"))
     args = output(kc("-n", "kube-system", "get", "deploy", "traefik",
                      "-o", "jsonpath={.spec.template.spec.containers[0].args}"), check=False)
@@ -279,6 +279,8 @@ def _cluster_vm(env: Env) -> None:
     if not env.is_provided:
         _provision_vm(env, pubkey)
     infra = vm.load_infra(env)
+    # 止まっている台があれば、待たずに止める（managed と provided。変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 3 章）
+    clouds.require_running(env, infra.all_nodes(), clouds.for_env(env))
     vm.ensure_access(env, forward=False)   # 初期化の前は k3s が無いので転送は張らない
     # 減らした足す台を先に外す（外す台の IP は前回の nftables に残っているので、外し終わるまで Pod の通信は切れない。
     # 変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 3.2 節）
@@ -289,7 +291,7 @@ def _cluster_vm(env: Env) -> None:
     wait_until(600, f"全ノード（{want} 台）の Ready", lambda: _ready_nodes() >= want)
     ensure_coredns()
     vm.label_entry_nodes(infra)
-    kapply(files=[K8S / "traefik-config-vm.yaml"], namespaced=False)
+    apply_traefik_config(K8S / "traefik-config-vm.yaml")
     vm.wait_traefik(infra)
     vm.ensure_https_forward(env, infra)   # 踏み台経由で入口（内部ロードバランサの 443）へ
     kapply(files=[K8S / "namespace.yaml"], namespaced=False)
@@ -355,6 +357,25 @@ def _ensure_chart(release: str, namespace: str, spec: dict, values: dict) -> Non
     run(helm("upgrade", "--install", release, spec["chart"], "--repo", spec["repo"], "--version", spec["version"],
              "-n", namespace, "--create-namespace", "-f", str(values_file), "--description", mark,
              "--wait", "--timeout", "10m"))
+
+
+def traefik_chart() -> str:
+    """k3s が作る HelmChart kube-system/traefik の spec.chart（チャートの版が入る）。現れるまで待つ。"""
+    def chart() -> str:
+        return output(kc("-n", "kube-system", "get", "helmchart", "traefik", "-o", "jsonpath={.spec.chart}"),
+                      check=False).strip()
+    wait_until(180, "k3s の Traefik の HelmChart", lambda: bool(chart()))
+    return chart()
+
+
+def apply_traefik_config(path: Path) -> bool:
+    """k3s の Traefik の設定（HelmChartConfig）を、動いているチャートの版に合う鍵で当てる（変更設計書
+    .history/2026-11-08-Traefikの更新と止まった台/ 2 章）。変えたら True。"""
+    major = render.traefik_chart_major(traefik_chart())
+    changed = kapply(manifest=render.traefik_config(path.read_text(), major), namespaced=False)
+    if changed:
+        info(f"Traefik の設定を当てました（チャート {major if major is not None else '版不明'} の鍵）")
+    return changed
 
 
 def ensure_coredns() -> None:

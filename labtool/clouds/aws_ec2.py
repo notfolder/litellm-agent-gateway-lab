@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sys
 import time
 
 from .. import aws
@@ -22,7 +23,7 @@ from .. import render
 from ..core import Env, LabError, info, ok, warn
 from . import (
     AWS_DNS_IPS, AWS_META_IPS, KEY_ROLES, LEGACY_KEY_USERS, NODE_COUNT, PROXY_PORT, WORKER_INDEX_BASE, ZABBIX_SERVER_PORT, Infra, Node,
-    network_plan, s3_user_policies, worker_plan,
+    network_plan, require_running, s3_user_policies, worker_plan,
 )
 
 TAG_KEY = "lab:prefix"
@@ -489,7 +490,8 @@ def _to_node(inst: dict, index: int | None = None) -> Node:
     return Node(id=inst["InstanceId"], index=index if index is not None else int(tags.get("lab:node-index", "0")),
                 private_ip=inst.get("PrivateIpAddress", ""), public_ip=inst.get("PublicIpAddress", ""),
                 zone=inst.get("Placement", {}).get("AvailabilityZone", ""),
-                role="worker" if tags.get("lab:role") == "worker" else "server")
+                role="worker" if tags.get("lab:role") == "worker" else "server",
+                state=str(inst.get("State", {}).get("Name", "")).lower())
 
 
 def ensure_nodes(env: Env, net: dict, pubkey: str) -> list[Node]:
@@ -518,7 +520,10 @@ def ensure_nodes(env: Env, net: dict, pubkey: str) -> list[Node]:
                                         **{"lab:node-index": str(i), "lab:role": "node"}),
         )
         info(f"EC2 {res['Instances'][0]['InstanceId']}（{env.vm_prefix}-node{i}、{n['private_ip']}）を起こしました")
-    ids = [i["InstanceId"] for i in _instances(env)]
+    # 止まっている台は待っても動き出さないので、待つ前に止める（2026-11-08。変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 3 章）
+    current = _instances(env)
+    require_running(env, [_to_node(i) for i in current], sys.modules[__name__])
+    ids = [i["InstanceId"] for i in current]
     ec2.get_waiter("instance_running").wait(InstanceIds=ids, WaiterConfig={"Delay": 5, "MaxAttempts": 60})
     nodes = sorted((_to_node(i) for i in _instances(env)), key=lambda n: n.index)
     if len(nodes) != NODE_COUNT:
@@ -630,6 +635,11 @@ def stop_node(env: Env, node: Node) -> None:
     ec2 = _ec2(env)
     ec2.stop_instances(InstanceIds=[node.id])
     ec2.get_waiter("instance_stopped").wait(InstanceIds=[node.id], WaiterConfig={"Delay": 5, "MaxAttempts": 60})
+
+
+def start_command(env: Env, node: Node) -> str:
+    """止まった台を手で起こすコマンド（require_running の案内）。"""
+    return f"aws ec2 start-instances --region {env.vm_region} --instance-ids {node.id}"
 
 
 def start_node(env: Env, node: Node) -> None:

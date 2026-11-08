@@ -55,7 +55,8 @@ AWS_DNS_IPS = ["169.254.169.253"]
 FUNCTIONS = [
     # 共通
     "identity", "ensure_apis", "s3_endpoint", "describe_nodes", "describe_entry_ip", "lb_targets_healthy",
-    "health_check_ranges", "meta_ips", "dns_ips", "stop_node", "start_node", "check_bucket", "snapshot", "empty_bucket",
+    "health_check_ranges", "meta_ips", "dns_ips", "stop_node", "start_node", "start_command", "check_bucket", "snapshot",
+    "empty_bucket",
     # provision（managed だけ）
     "provision", "destroy", "allow_ssh_from", "allow_proxy_from", "recreate_node",
     # 足す台（managed だけ。変更設計書 2026-10-31-台の増減とLiteLLMのメモリ 2 章）
@@ -75,6 +76,7 @@ class Node:
     public_ip: str
     zone: str
     role: str = "server"
+    state: str = ""   # 小文字（AWS は State.Name、GCP は status）。分からなければ空
 
 
 @dataclass
@@ -105,6 +107,23 @@ class Infra:
 
     def node_ids(self) -> list[str]:
         return [n.id for n in sorted(self.nodes, key=lambda n: n.index)]
+
+
+# 止まっている（止まりかけの）台の状態。AWS: stopping / stopped、GCP: STOPPING / TERMINATED / SUSPENDING / SUSPENDED（小文字にして比べる）
+STOPPED_STATES = {"stopping", "stopped", "terminated", "suspending", "suspended"}
+
+
+def require_running(env: Env, nodes: list[Node], cloud: ModuleType) -> None:
+    """止まっている台があれば、台と起こすコマンドを示して止める（./lab up は止まった台を起こさない。変更設計書
+    .history/2026-11-08-Traefikの更新と止まった台/ 3 章）。作成中・起動中の台は止めない。"""
+    stopped = [n for n in nodes if n.state in STOPPED_STATES]
+    if not stopped:
+        return
+    names = "、".join(f"{'worker' if n.role == 'worker' else 'node'}{n.index if n.index < WORKER_INDEX_BASE else n.index - WORKER_INDEX_BASE}"
+                     f"（{n.id}、{n.state}）" for n in stopped)
+    commands = " / ".join(cloud.start_command(env, n) for n in stopped)
+    raise LabError(f"止まっている台があります: {names}。./lab up は止まった台を起こしません。台を起こしてから流し直してください"
+                   f"（managed: {commands}。provided は用意する側に依頼）。クラスタは残りの台で動き続けます")
 
 
 def for_env(env: Env) -> ModuleType:

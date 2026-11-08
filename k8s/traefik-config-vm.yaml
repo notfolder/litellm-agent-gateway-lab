@@ -16,6 +16,14 @@ spec:
   valuesContent: |-
     deployment:
       kind: DaemonSet
+    # 更新は古い Pod を 1 台ずつ止めてから新しい Pod を置く。チャートの既定（先に 1 つ足し、止めるのは 0）では、台の 80 / 443（hostPort）を
+    # 古い Pod が持ったままなので足した Pod を置けず、更新が終わらない（k3s 1.37 への版上げで判明 2026-11-08。変更設計書
+    # .history/2026-11-08-Traefikの更新と止まった台/ 1 章）
+    updateStrategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 1
+        maxSurge: 0
     nodeSelector:
       litellm-lab/entry: "true"
     service:

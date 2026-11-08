@@ -204,11 +204,17 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
             vm.install_k3s(env, node, target)
             vm.wait_node_version(name, target)
             vm.uncordon_node(name)
+            # 上げた台の k3s が同梱の Traefik のチャートを書き換えることがある（1.36 → 1.37 で 40 → 41）。設定の鍵をそのチャートに合わせる
+            # （変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 2 章）
+            stages.apply_traefik_config(stages.K8S / "traefik-config-vm.yaml")
             failover.wait_healthy(env)
             succeeds(["kubectl", "--context", vm.kube_context(env), "-n", "kube-system", "rollout", "status",
                       "ds/traefik", "--timeout=300s"], timeout=320)
             upgraded.append(name)
             ok(f"{name} を {target} にしました")
+        # 全台が新しい版になった後のチャートに合わせ、全台の Traefik が新しい定義で ready になるのを待つ
+        stages.apply_traefik_config(stages.K8S / "traefik-config-vm.yaml")
+        vm.wait_traefik(infra)
         if load is not None:
             _time.sleep(20)   # 最後の台の後の様子
     finally:
