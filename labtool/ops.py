@@ -9,7 +9,7 @@ import sys
 from . import stages
 from .core import (
     BUILD_DIR, CLUSTER, NS, ROOT, Env, LabError, cluster_exists, helm, http_ok,
-    info, kn, ok, output, run, step, succeeds, warn,
+    info, kc, kn, ok, output, run, step, succeeds, wait_until, warn,
 )
 
 
@@ -67,6 +67,7 @@ def down(everything: bool = False) -> None:
             if env.egress_proxy_vm:
                 env.drop_mac_proxy()   # 中継の VM も消すので、消した後の API が中継越しだと届かない（2026-10-31）
             cloud.destroy(env)
+            vm.forget_alias("bastion")   # 中継の VM（踏み台）を消したので、次の踏み台の鍵と食い違わないように
             for key in vm.PROVISIONED_ENV_KEYS:
                 if env.get(key):
                     env.set(key, "")
@@ -181,7 +182,8 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
     order = vm.upgrade_order(infra.node_ids(), [n.id for n in sorted(infra.workers, key=lambda n: n.index)], vm.forward_target())
     failover.wait_healthy(env)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    vm.etcd_snapshot(env, infra.node(order[-1]), f"lab-pre-upgrade-{stamp}")
+    # スナップショットは server の台で取る（足す台は agent で etcd を持たない。上げる順の最後は足す台になりうる。2026-11-08 の AWS で判明）
+    vm.etcd_snapshot(env, infra.node(snapshot_node(order, {n.id for n in infra.workers})), f"lab-pre-upgrade-{stamp}")
     todo = [i for i in order if versions.get(vm.k8s_name_for_node(infra.node(i))) != target]
     eta = datetime.now() + timedelta(minutes=8 * len(todo))
     info(f"{len(todo)} 台を {' → '.join(todo)} の順に上げます（今の 3 台が先、足す台が後）。"
@@ -190,28 +192,40 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
     restarts_before = failover.litellm_restarts()
     upgraded: list[str] = []
     t0 = _time.time()
-    load = failover.Load(env) if measure else None
+    load = failover.make_load(env) if measure else None
     if load is not None:
         load.__enter__()
         _time.sleep(10)   # 平常時の様子
+    segments: list[tuple[str, float, float]] = []   # (台の名前, 始め, 終わり)。失敗を台ごとに数える
+    watch = stages.TraefikChartWatch(stages.K8S / "traefik-config-vm.yaml")
+    watch.__enter__()
     try:
         for node_id in todo:
             node = infra.node(node_id)
             name = vm.k8s_name_for_node(node)
+            seg_start = _time.time()
             info(f"--- {name}（{node_id}）: {versions[name]} → {target}")
             vm.ensure_forward(env, infra, avoid=node_id)
             vm.drain_node(name)
             vm.install_k3s(env, node, target)
             vm.wait_node_version(name, target)
             vm.uncordon_node(name)
+            # 上げた台の k3s が同梱の Traefik のチャートを書き換えることがある（1.36 → 1.37 で 40 → 41）。設定の鍵をそのチャートに合わせる
+            # （変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 2 章）
+            stages.apply_traefik_config(stages.K8S / "traefik-config-vm.yaml")
             failover.wait_healthy(env)
             succeeds(["kubectl", "--context", vm.kube_context(env), "-n", "kube-system", "rollout", "status",
                       "ds/traefik", "--timeout=300s"], timeout=320)
             upgraded.append(name)
+            segments.append((name, seg_start, _time.time()))
             ok(f"{name} を {target} にしました")
+        # 全台が新しい版になった後のチャートに合わせ、全台の Traefik が新しい定義で ready になるのを待つ
+        stages.apply_traefik_config(stages.K8S / "traefik-config-vm.yaml")
+        vm.wait_traefik(infra)
         if load is not None:
             _time.sleep(20)   # 最後の台の後の様子
     finally:
+        watch.__exit__(None, None, None)
         if load is not None:
             load.__exit__(None, None, None)
     vm.set_version(env, target)
@@ -227,6 +241,11 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
                        "failure_window_seconds": round(max(s.start for s in fails) - min(s.start for s in fails), 1) if fails else 0.0})
         (ok if not fails else warn)(f"要求 {len(samples)} 件のうち失敗 {len(fails)} 件（状態 {result['statuses']}）、"
                                    f"失敗が散らばった幅 {result['failure_window_seconds']} 秒")
+        result["per_node"] = failures_per_segment(samples, segments)
+        for row in result["per_node"]:
+            info(f"  {row['node']}: {row['seconds']} 秒、要求 {row['requests']} 件のうち失敗 {row['failed']} 件、"
+                 f"失敗が散らばった幅 {row['failure_window_seconds']} 秒")
+    result["traefik_chart_changes"] = [f"{a.rsplit('/', 1)[-1]} → {b.rsplit('/', 1)[-1]}" for a, b in watch.changes]
     if result["litellm_restart_loops"]:
         warn(f"LiteLLM の Pod が繰り返し再起動しました: {result['litellm_restart_loops']}")
     ok(f"k3s を {target} に上げました（{result['seconds']} 秒）。バケットの版も更新しました")
@@ -234,6 +253,130 @@ def upgrade_k8s(env: Env, version: str, measure: bool = False) -> dict:
         warn(f"core.py の K3S_IMAGE を rancher/k3s:{target.replace('+k3s', '-k3s')} に変えてコミットしてください"
              "（変えないと、次の ./lab up が版の食い違いで止まります。Mac の k3d も同じ版になります）")
     return result
+
+
+def upgrade_ami(env: Env, measure: bool = False) -> dict:
+    """aws-ec2（managed）: 台の AMI を Canonical の Ubuntu 24.04 の最新に、1 台ずつ作り直して新しくする（変更設計書
+    .history/2026-11-08-Traefikの更新と止まった台/ 13 章）。順は版上げと同じ（今の 3 台が先、SSH の転送先が 3 台の最後、足す台が後）。
+    台ごとに「drain → その台のディスクの PVC とノードを消す → 新しい AMI で作り直す → 参加 → DB と Valkey がそろうのを待つ」。
+    途中で止まっても、もう一度流せば新しい AMI の台を飛ばして続きから進む。measure は upgrade_k8s と同じ。"""
+    import time as _time
+
+    from . import clouds, failover, vm
+    step("upgrade-ami 台の AMI を 1 台ずつ新しくする")
+    if env.target != "aws-ec2":
+        raise LabError("AMI を新しくする手順は LAB_TARGET=aws-ec2 だけです")
+    if env.is_provided:
+        raise LabError("LAB_INFRA=provided では VM は用意する側が作り直します。1 台ずつ「その台を drain → 新しい AMI で作り直してもらう"
+                       "（同じ内部 IP。インスタンス ID が変われば .env の LAB_VM_NODES / LAB_VM_WORKER_NODES を直す）→ ./lab up」を"
+                       "繰り返してください（docs/provider-requests.md 1 章）")
+    cloud = clouds.for_env(env)
+    infra = vm.load_infra(env)
+    vm.ensure_forward(env, infra)
+    pubkey = vm.ensure_ssh_key(env)
+    target = cloud.latest_ami(env)
+    expected = clouds.NODE_COUNT + len(infra.workers)
+    if len(vm.node_versions()) < expected - 1:
+        raise LabError(f"ノードが {len(vm.node_versions())} 台です（{expected} 台か、作り直しの途中で 1 台欠けた状態から流してください）")
+    order = vm.upgrade_order(infra.node_ids(), [n.id for n in sorted(infra.workers, key=lambda n: n.index)], vm.forward_target())
+    in_cluster = {ip for ip in vm.node_internal_ips()}
+    # 新しい AMI でない台と、作り直した後に参加できずに止まった台（クラスタにノードが無い）
+    todo = [i for i in order if cloud.node_image(env, infra.node(i)) != target or infra.node(i).private_ip not in in_cluster]
+    if not todo:
+        ok(f"{expected} 台とも AMI {target} です")
+        return {"ami": target, "replaced": []}
+    missing = [i for i in todo if infra.node(i).private_ip not in in_cluster]
+    if missing:
+        # 前の実行の続き: 欠けた台に DB と Valkey の 3 台目が戻るまでそろわないので、そろうのは作り直した後に待つ
+        info(f"クラスタに無い台 {', '.join(missing)} から続けます")
+        todo = missing + [i for i in todo if i not in missing]
+    else:
+        failover.wait_healthy(env)
+    vm.etcd_snapshot(env, infra.node(snapshot_node(order, {n.id for n in infra.workers})),
+                     f"lab-pre-ami-{_time.strftime('%Y%m%d-%H%M%S')}")
+    info(f"{len(todo)} 台を AMI {target} で作り直します（{' → '.join(todo)}。1 台 5〜8 分）")
+    replaced: list[str] = []
+    segments: list[tuple[str, float, float]] = []
+    t0 = _time.time()
+    load = failover.make_load(env) if measure else None
+    if load is not None:
+        load.__enter__()
+        _time.sleep(10)
+    try:
+        for node_id in todo:
+            node = infra.node(node_id)
+            name = vm.k8s_name_for_ip(node.private_ip)
+            seg_start = _time.time()
+            vm.ensure_forward(env, infra, avoid=node_id)
+            if cloud.node_image(env, node) != target:
+                info(f"--- {name or node.private_ip}（{node_id}）を作り直します")
+                if name:
+                    vm.drain_node(name)
+                    vm.forget_node(env, name, node.private_ip)
+                else:   # 前の実行で消した後、作り直す前に止まった
+                    info(f"{node.private_ip} はもうクラスタにありません（前の実行の続き）")
+                new = cloud.replace_instance(env, node, target, pubkey)
+                key = "LAB_VM_WORKER_NODES" if node.role == "worker" else "LAB_VM_NODES"
+                env.set(key, swap_id(env.get(key), node_id, new.id))   # 一覧の順（台の番号）は変えない
+                infra = vm.load_infra(env)
+            else:   # 前の実行で作り直した後、参加する前に止まった
+                info(f"--- {node_id}（{node.private_ip}）は新しい AMI です。クラスタへの参加から続けます")
+                new = node
+            name = name or vm.k8s_name_from_ip(node.private_ip)
+            vm.wait_ssh(env, [new], infra)
+            vm.init_node(env, infra, new, pubkey)
+            vm.ensure_forward(env, infra)
+            wait_until(600, f"{name} の Ready", kc("wait", "--for=condition=Ready", f"node/{name}", "--timeout=5s"))
+            vm.label_entry_nodes(infra)
+            failover.wait_healthy(env)
+            vm.wait_traefik(infra)
+            replaced.append(f"{node_id} → {new.id}")
+            segments.append((name, seg_start, _time.time()))
+            ok(f"{name} を作り直しました（{new.id}）")
+        if load is not None:
+            _time.sleep(20)
+    finally:
+        if load is not None:
+            load.__exit__(None, None, None)
+    result: dict = {"ami": target, "replaced": replaced, "seconds": round(_time.time() - t0)}
+    if load is not None:
+        samples = [s for s in load.samples if s.start >= t0]
+        fails = [s for s in samples if s.status != 200]
+        result.update({"requests": len(samples), "failed": len(fails), "per_node": failures_per_segment(samples, segments)})
+        (ok if not fails else warn)(f"要求 {len(samples)} 件のうち失敗 {len(fails)} 件")
+        for row in result["per_node"]:
+            info(f"  {row['node']}: {row['seconds']} 秒、要求 {row['requests']} 件のうち失敗 {row['failed']} 件、"
+                 f"失敗が散らばった幅 {row['failure_window_seconds']} 秒")
+    ok(f"AMI を {target} にしました（{len(replaced)} 台、{result['seconds']} 秒）")
+    return result
+
+
+def swap_id(ids: str, old: str, new: str) -> str:
+    """カンマ区切りの識別子の一覧で old を new に置き換える（順は保つ）。"""
+    return ",".join(new if i.strip() == old else i.strip() for i in ids.split(",") if i.strip())
+
+
+def snapshot_node(order: list[str], worker_ids: set[str]) -> str:
+    """版上げの前の etcd のスナップショットを取る台: 上げる順の server のうち最後（SSH の転送先。足す台は除く）。"""
+    servers = [i for i in order if i not in worker_ids]
+    if not servers:
+        raise LabError("上げる順に server の台がありません")
+    return servers[-1]
+
+
+def failures_per_segment(samples: list, segments: list[tuple[str, float, float]]) -> list[dict]:
+    """版上げの要求の記録（failover.Sample）を台ごとの区間に分け、区間ごとの失敗の数と散らばった幅を出す。
+    最後の区間の後（全台の Traefik の待ち）は「後」として数える。"""
+    rows: list[dict] = []
+    bounds = [(n, a, b) for n, a, b in segments]
+    if bounds:
+        bounds.append(("後", bounds[-1][2], max([s.start for s in samples] + [bounds[-1][2]]) + 1))
+    for name, a, b in bounds:
+        part = [s for s in samples if a <= s.start < b]
+        fails = [s for s in part if s.status != 200]
+        rows.append({"node": name, "seconds": round(b - a), "requests": len(part), "failed": len(fails),
+                     "failure_window_seconds": round(max(s.start for s in fails) - min(s.start for s in fails), 1) if fails else 0.0})
+    return rows
 
 
 def provider_requirements(env: Env) -> None:

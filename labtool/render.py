@@ -120,8 +120,12 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
 
     config: dict = {
         "model_list": model_list,
-        # 監査ログ（litellm/guardrails/audit_log.py。変更設計書 5 章）
-        "litellm_settings": {"callbacks": ["audit_log.audit_logger_instance"]},
+        # 監査ログ（litellm/guardrails/audit_log.py。変更設計書 5 章）と、Prometheus の指標（/metrics。無償版で出る。Zabbix が Pod ごとに
+        # 読む。変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 14 章）
+        # /metrics は既定で鍵が要る。Zabbix の proxy（クラスタの中）が鍵なしで読めるようにする。外からは Traefik が踏み台だけに絞る
+        # （render.ADMIN_PATH_PREFIXES）。クラスタの中の Pod からは鍵なしで読める
+        "litellm_settings": {"callbacks": ["audit_log.audit_logger_instance", "prometheus"],
+                             "require_auth_for_metrics_endpoint": False},
         "guardrails": [{
             "guardrail_name": "tool-call-review",
             "litellm_params": {
@@ -651,6 +655,51 @@ def pin_deployments(manifest_text: str, node_selector: dict) -> str:
     return yaml.safe_dump_all(docs, sort_keys=False)
 
 
+def barman_plugin_manifest(manifest_text: str, node_selector: dict, replicas: int) -> str:
+    """Barman Cloud Plugin の公式のマニフェストを server ノードに置き、replicas が 2 以上なら台数をそろえて台ごとに散らす。
+    1 台だけだと、載った台が止まったとき CloudNativePG が PostgreSQL の切り替えを始めない（2026-11-05 の AWS で約 60 秒遅れた。
+    変更設計書 .history/2026-11-05-1台だけの部品の冗長化/ 2 章）。プラグインはリーダーを 1 台選び、残りは待機する。
+    散らす指定は止まった台（taint の付いた台）を数えない（nodeTaintsPolicy: Honor）。数えると、止まった台の分だけ偏りと
+    みなされ、作り直す Pod が置けなくなる。止まった台からの退避（30 秒）は VM の kube-apiserver の既定（vm/node-init.sh）。"""
+    docs = [d for d in yaml.safe_load_all(pin_deployments(manifest_text, node_selector)) if d]
+    for d in docs:
+        if d.get("kind") == "Deployment" and d["metadata"].get("name") == "barman-cloud" and replicas > 1:
+            d["spec"]["replicas"] = replicas
+            # 待機の台は ready にならない（リーダーだけが gRPC の口を開く）。1 台ずつ入れ替える更新では、古いリーダーが
+            # 動いている間は新しい台が ready にならず先へ進めないので、全台を止めてから作り直す（2026-11-05 の AWS で判明）
+            d["spec"]["strategy"] = {"type": "Recreate"}
+            labels = d["spec"]["selector"]["matchLabels"]
+            d["spec"]["template"]["spec"]["topologySpreadConstraints"] = [{
+                "maxSkew": 1, "topologyKey": "kubernetes.io/hostname", "whenUnsatisfiable": "DoNotSchedule",
+                "nodeTaintsPolicy": "Honor", "labelSelector": {"matchLabels": dict(labels)}}]
+    return yaml.safe_dump_all(docs, sort_keys=False)
+
+
+# CoreDNS（k3s に同梱）の台数。同梱の定義は台数を書かず、台ごとに必ず散らす指定（DoNotSchedule）を持つので、
+# 台数だけを ./lab up でそろえる（変更設計書 .history/2026-11-05-1台だけの部品の冗長化/ 1 章）
+COREDNS_REPLICAS = 3
+
+
+# metrics-server（k3s に同梱、CPU の値を集める。自動の台数調整が使う）の台数。同梱の定義は 1 台で台数も散らす指定も書かないので、
+# 載った台を止めると CPU の値が取れず自動の台数調整も止まる。台数と散らす指定と PDB を ./lab up でそろえる。同梱の定義に無い項目なので、
+# k3s が定義を当て直しても残る（変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 7 章）
+METRICS_SERVER_REPLICAS = 2
+METRICS_SERVER_LABELS = {"k8s-app": "metrics-server"}
+
+
+def metrics_server_patch() -> dict:
+    """同梱の metrics-server の Deployment に重ねる差分（台数と、台ごとに 1 つずつ散らす指定）。"""
+    return {"spec": {"replicas": METRICS_SERVER_REPLICAS, "template": {"spec": {"topologySpreadConstraints": [{
+        "maxSkew": 1, "topologyKey": "kubernetes.io/hostname", "whenUnsatisfiable": "DoNotSchedule",
+        "nodeTaintsPolicy": "Honor", "labelSelector": {"matchLabels": dict(METRICS_SERVER_LABELS)}}]}}}}
+
+
+def metrics_server_pdb() -> str:
+    """drain で 2 台が同時に追い出されないようにする。"""
+    return yaml.safe_dump({"apiVersion": "policy/v1", "kind": "PodDisruptionBudget",
+                           "metadata": {"name": "metrics-server", "namespace": "kube-system"},
+                           "spec": {"maxUnavailable": 1, "selector": {"matchLabels": dict(METRICS_SERVER_LABELS)}}},
+                          sort_keys=False)
 
 # ---- 台の増減と LiteLLM のメモリ（変更設計書 .history/2026-10-31-台の増減とLiteLLMのメモリ/ 4 章） ----
 CONTROL_PLANE_SELECTOR = {"node-role.kubernetes.io/control-plane": "true"}
@@ -1165,6 +1214,41 @@ def admin_only_manifest(env: Env) -> str:
                                   "middlewares": [{"name": ADMIN_MIDDLEWARE}],
                                   "services": [{"name": "litellm", "port": 4000}]}]}}
     return yaml.safe_dump_all([middleware, route], sort_keys=False)
+
+
+def traefik_chart_major(chart: str) -> int | None:
+    """HelmChart kube-system/traefik の spec.chart（…/static/charts/traefik-41.4.2+up41.4.0.tgz）からチャートの主版を取り出す。"""
+    m = re.search(r"traefik-(\d+)\.\d+\.\d+", chart or "")
+    return int(m.group(1)) if m else None
+
+
+def _camel_default_mode(fields: dict) -> dict:
+    """アクセスログの fields の defaultmode を defaultMode に（チャート 41 の綴り）。headers の下も同じ。"""
+    out = {("defaultMode" if k == "defaultmode" else k): v for k, v in fields.items()}
+    if isinstance(out.get("headers"), dict):
+        out["headers"] = {("defaultMode" if k == "defaultmode" else k): v for k, v in out["headers"].items()}
+    return out
+
+
+def traefik_config(text: str, major: int | None) -> str:
+    """k3s の Traefik の HelmChartConfig（k8s/traefik-config*.yaml。チャート 40 の形で書く）を、動いているチャートの版に合わせる。
+    チャート 41 で logs.access → accessLog、logs.general → log、fields の defaultmode → defaultMode に改名された（チャートの Changelog
+    41.0.0。どちらのチャートも知らない鍵を最上位に認めないので両方は書かない。変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 2 章）。
+    40 以下か版が分からなければ変えない。"""
+    doc = yaml.safe_load(text)
+    if major is None or major < 41:
+        return yaml.safe_dump(doc, sort_keys=False, allow_unicode=True)
+    values = yaml.safe_load(doc["spec"]["valuesContent"]) or {}
+    logs = values.pop("logs", None) or {}
+    if "access" in logs:
+        access = dict(logs["access"])
+        if isinstance(access.get("fields"), dict):
+            access["fields"] = _camel_default_mode(access["fields"])
+        values["accessLog"] = access
+    if "general" in logs:
+        values["log"] = logs["general"]
+    doc["spec"]["valuesContent"] = yaml.safe_dump(values, sort_keys=False, allow_unicode=True)
+    return yaml.safe_dump(doc, sort_keys=False, allow_unicode=True)
 
 
 def without_traefik(manifest_text: str) -> str:

@@ -16,6 +16,14 @@ spec:
   valuesContent: |-
     deployment:
       kind: DaemonSet
+    # 更新は古い Pod を 1 台ずつ止めてから新しい Pod を置く。チャートの既定（先に 1 つ足し、止めるのは 0）では、台の 80 / 443（hostPort）を
+    # 古い Pod が持ったままなので足した Pod を置けず、更新が終わらない（k3s 1.37 への版上げで判明 2026-11-08。変更設計書
+    # .history/2026-11-08-Traefikの更新と止まった台/ 1 章）
+    updateStrategy:
+      type: RollingUpdate
+      rollingUpdate:
+        maxUnavailable: 1
+        maxSurge: 0
     nodeSelector:
       litellm-lab/entry: "true"
     service:
@@ -29,11 +37,14 @@ spec:
     ports:
       web:
         hostPort: 80
-        redirections:
-          entryPoint:
-            to: websecure
-            scheme: https
-            permanent: true
+        # 転送の鍵の位置はチャート 39 から ports.web.http.redirections（それより前の ports.web.redirections はチャート 39〜41 では
+        # 黙って無視され、80 番は 404 になっていた。2026-11-08 に確認）
+        http:
+          redirections:
+            entryPoint:
+              to: websecure
+              scheme: https
+              permanent: true
         transport:
           respondingTimeouts:
             readTimeout: 600s
@@ -46,6 +57,17 @@ spec:
             readTimeout: 600s
             writeTimeout: 600s
             idleTimeout: 600s
+    # CPU とメモリの要求を付ける（付けないと BestEffort になり、CPU が混むと真っ先に取り分を失う）。生存確認は時間切れ 5 秒・
+    # 6 回失敗（約 1 分応答しなければ再起動）に緩める。台を 1 台止めた場面で、止めていない台の Traefik が生存確認（2 秒・3 回）に
+    # 応答できずに再起動させられ、起動直後の証明書を読み込む前の応答で失敗が続いた（2026-11-05 の AWS。変更設計書
+    # .history/2026-11-05-入口のTraefikの資源と生存確認/）
+    resources:
+      requests:
+        cpu: 100m
+        memory: 64Mi
+    livenessProbe:
+      timeoutSeconds: 5
+      failureThreshold: 6
     # アクセスログ（入口で返した状態コードと、どの Pod に送ったかを残す。502 などの切り分けに使う）
     logs:
       access:

@@ -17,7 +17,10 @@ metadata:
   name: fake-llm
   namespace: litellm-lab
 spec:
-  replicas: 1
+  # 障害の試験で止めた台に偽 LLM が 1 台だけ載っていると、台が戻るまで要求がほぼ全部失敗し、LiteLLM 側の回復を測れない
+  # （2026-11-04 の aws-ec2 の valkey-node の 179.5 秒。変更設計書 2026-10-31 の 15.2.1 節）。本番の LLM の相手先は
+  # 止めた台に載らないので、2 台を別の台に置き、止まった台からは 30 秒で移す（偽 LLM は状態を持たない）
+  replicas: 2
   selector:
     matchLabels:
       app: fake-llm
@@ -28,6 +31,22 @@ spec:
       annotations:
         lab/server-hash: "${FAKE_LLM_HASH}"
     spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: fake-llm
+      tolerations:
+        - key: node.kubernetes.io/unreachable
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
+        - key: node.kubernetes.io/not-ready
+          operator: Exists
+          effect: NoExecute
+          tolerationSeconds: 30
       containers:
         - name: fake-llm
           image: python:3.13-alpine

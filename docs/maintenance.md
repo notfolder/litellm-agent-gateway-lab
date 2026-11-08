@@ -24,6 +24,7 @@
 | Gmail の MCP（google_workspace_mcp） | 1 | 新しい Pod が立ってから古い Pod を止める（maxSurge 1） | 状態を持たない設定（`WORKSPACE_MCP_STATELESS_MODE=true`） |
 | 検索アプリ | 2 | ローリング更新 | — |
 | Traefik、cert-manager、CNPG のオペレーター、barman-cloud | 各 1 | — | — |
+| CoreDNS（名前解決。k3s に同梱） | 3 | Deployment のローリング更新。`./lab up` が台数をそろえる | 台ごとに 1 つずつ散らす |
 | モデル、ガードレール、MCP のサーバー | — | `config.yaml`（ConfigMap）を変え、LiteLLM の Pod を作り直して反映する | DB には持たない（`store_model_in_db` は使わない） |
 | キー、ユーザー、チーム、請求の単位、予算 | — | DB に持つ | 管理用の API か管理画面で即時に反映する |
 
@@ -104,6 +105,7 @@
 | LiteLLM のメモリを変える | `.env` の `LAB_LITELLM_MEMORY_REQUEST` / `LAB_LITELLM_MEMORY_LIMIT` を変えて `./lab up`（か `./lab litellm`）。1 つずつ入れ替わり（要求の失敗 0 件、試験済み）、自動増減の最大数は台ごとの空き ÷ メモリの上限で数え直す。最低の 2 つを置けない値なら変えずに止まる。合図は Zabbix の「メモリが上限の 90% を超えた」と「OOM で落ちたコンテナがある」 |
 | 管理画面と検索アプリ、DB への接続 | 管理系の経路（`/ui`、`/lab-audit/`）は踏み台からだけ通る。Mac からは `./lab forward` で踏み台経由の転送を張り `https://<LAB_LOCAL_HOSTNAME>:18443/ui`。DB は踏み台から SSH で入り `kubectl port-forward svc/litellm-pg-pooler-rw 5432` |
 | 監視（Zabbix） | `./lab zabbix` がホスト・テンプレート・入口の HTTP 監視を API で揃える（冪等）。web は `http://127.0.0.1:18080/`（踏み台経由の転送。Admin のパスワードは `.env` の `LAB_ZABBIX_ADMIN_PASSWORD`）。VM が増えたら agent 2 の自動登録で入る。本番は既存サーバーの宛先と API トークンを `.env` に |
+| 台が 1 台止まったとき（保守での停止、障害） | 要求の経路に 1 台だけの部品は無い（CoreDNS 3 台、CNPG のオペレーターと barman-cloud 2 台、Traefik は全台に 1 つで CPU とメモリの予約付き）。入口と止めた台の Pod が外れるまでの約 40 秒と、PostgreSQL の primary を失ったときの切り替えの間の 503 が出る。AWS の障害の試験で回復まで 66〜91 秒（[design.md](design.md) 21.10 節、21.13 節）。metrics-server は 1 台のままで、止まった台に載っていると、その間は CPU の値と LiteLLM の自動増減が止まる |
 | 操作者の回線が変わった | managed は `./lab up`（か `./lab cluster`）で 22 の許可（クラウドと nftables）が直る。provided は踏み台から入るので変更不要 |
 | 既存資源（`LAB_INFRA=provided`）での注意 | 構築ツールはネットワーク・ロードバランサ・権限・バケットの設定を変えない。守りは各 VM の nftables と Traefik の送信元制限と NetworkPolicy で、クラウドのファイアウォールは無くてもよい |
 | 出口プロキシ（Zscaler）の CA の更新 | `.env` の `LAB_EGRESS_CA_FILE` を新しい CA にして `./lab up`。VM の信頼店（SSH で直す）、Pod の ConfigMap、`./lab` 自身の環境変数が揃う |

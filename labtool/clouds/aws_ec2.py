@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import sys
 import time
 
 from .. import aws
@@ -22,12 +23,12 @@ from .. import render
 from ..core import Env, LabError, info, ok, warn
 from . import (
     AWS_DNS_IPS, AWS_META_IPS, KEY_ROLES, LEGACY_KEY_USERS, NODE_COUNT, PROXY_PORT, WORKER_INDEX_BASE, ZABBIX_SERVER_PORT, Infra, Node,
-    network_plan, s3_user_policies, worker_plan,
+    network_plan, require_running, s3_user_policies, worker_plan,
 )
 
 TAG_KEY = "lab:prefix"
 UBUNTU_OWNER = "099720109477"   # Canonical
-UBUNTU_AMI_PATTERN = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*"
+UBUNTU_AMI_PATTERN = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-{arch}-server-*"   # arch は arm64 / amd64（インスタンスの種類から）
 PROXY_AMI_PATTERN = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
 PROXY_INSTANCE_TYPE = "t3.small"            # 中継だけ
 PROXY_INSTANCE_TYPE_ZABBIX = "t3.medium"    # 中継 ＋ Zabbix サーバー（4 GiB）
@@ -381,6 +382,51 @@ def _iam_user_name(env: Env, user: str) -> str:
     return f"{env.vm_prefix}-{user}"
 
 
+def _policy_arn(env: Env, name: str) -> str:
+    return f"arn:aws:iam::{identity(env)['account']}:policy/{name}"
+
+
+def _ensure_user_policy(env: Env, iam, name: str, policy: dict) -> None:
+    """利用者の権限を、利用者と同じ名前のカスタマー管理ポリシーにして付ける。インラインポリシーは利用者ごとに合計 2,048 文字までで、
+    lab-app の権限が収まらない（2026-11-04 の aws-ec2 の配備で LimitExceeded）。管理ポリシーは 6,144 文字まで。
+    前の版のインラインポリシー（lab）が残っていれば外す。"""
+    arn = _policy_arn(env, name)
+    doc = json.dumps(policy, sort_keys=True)
+    try:
+        default = iam.get_policy(PolicyArn=arn)["Policy"]["DefaultVersionId"]
+        current = iam.get_policy_version(PolicyArn=arn, VersionId=default)["PolicyVersion"]["Document"]
+        if json.dumps(current, sort_keys=True) != doc:
+            versions = [v for v in iam.list_policy_versions(PolicyArn=arn)["Versions"] if not v["IsDefaultVersion"]]
+            if len(versions) >= 4:   # 版は 5 つまで。古いものから消す
+                oldest = min(versions, key=lambda v: v["CreateDate"])
+                iam.delete_policy_version(PolicyArn=arn, VersionId=oldest["VersionId"])
+            iam.create_policy_version(PolicyArn=arn, PolicyDocument=doc, SetAsDefault=True)
+            info(f"IAM ポリシー {name} を更新しました")
+    except iam.exceptions.NoSuchEntityException:
+        iam.create_policy(PolicyName=name, PolicyDocument=doc, Tags=[{"Key": TAG_KEY, "Value": env.vm_prefix}])
+        info(f"IAM ポリシー {name} を作りました")
+    attached = [p["PolicyArn"] for p in iam.list_attached_user_policies(UserName=name)["AttachedPolicies"]]
+    if arn not in attached:
+        iam.attach_user_policy(UserName=name, PolicyArn=arn)
+        info(f"IAM ユーザー {name} に権限を付けました")
+    for pol in iam.list_user_policies(UserName=name)["PolicyNames"]:
+        iam.delete_user_policy(UserName=name, PolicyName=pol)
+        info(f"IAM ユーザー {name} の前の版のインラインポリシー {pol} を外しました")
+
+
+def _delete_user_policy(env: Env, iam, name: str) -> None:
+    """_ensure_user_policy で作った管理ポリシーを、付けている利用者から外してから消す（版も含めて）。"""
+    arn = _policy_arn(env, name)
+    with contextlib.suppress(iam.exceptions.NoSuchEntityException):
+        for ent in iam.list_entities_for_policy(PolicyArn=arn, EntityFilter="User")["PolicyUsers"]:
+            iam.detach_user_policy(UserName=ent["UserName"], PolicyArn=arn)
+        for v in iam.list_policy_versions(PolicyArn=arn)["Versions"]:
+            if not v["IsDefaultVersion"]:
+                iam.delete_policy_version(PolicyArn=arn, VersionId=v["VersionId"])
+        iam.delete_policy(PolicyArn=arn)
+        info(f"IAM ポリシー {name} を消しました")
+
+
 def ensure_static_keys(env: Env, bucket: str) -> dict[str, tuple[str, str]]:
     """役割ごとの IAM ユーザーと静的キー。権限は毎回そろえ、キーは .env に無い利用者だけ作り直す（秘密は作った瞬間にしか取れない）。"""
     iam = aws.client(env, "iam")
@@ -392,12 +438,7 @@ def ensure_static_keys(env: Env, bucket: str) -> dict[str, tuple[str, str]]:
         except iam.exceptions.NoSuchEntityException:
             iam.create_user(UserName=name, Tags=[{"Key": TAG_KEY, "Value": env.vm_prefix}])
             info(f"IAM ユーザー {name} を作りました")
-        current = None
-        with contextlib.suppress(iam.exceptions.NoSuchEntityException):
-            current = iam.get_user_policy(UserName=name, PolicyName="lab")["PolicyDocument"]
-        if json.dumps(current, sort_keys=True) != json.dumps(policy, sort_keys=True):
-            iam.put_user_policy(UserName=name, PolicyName="lab", PolicyDocument=json.dumps(policy))
-            info(f"IAM ユーザー {name} の権限を更新しました")
+        _ensure_user_policy(env, iam, name, policy)
         key_name, secret_name = render.s3_env_names(user, env)
         if env.get(key_name) and env.get(secret_name):
             continue
@@ -423,11 +464,29 @@ def _ensure_keypair(env: Env, pubkey: str) -> str:
     return name
 
 
-def resolve_ami(env: Env, existing: list[dict], pattern: str = UBUNTU_AMI_PATTERN) -> str:
-    """配備済みの台があればその AMI（3 台が同時に置き換わらない）。初回は Canonical の Ubuntu 24.04 の最新。"""
+def instance_arch(env: Env, itype: str) -> str:
+    """インスタンスの種類の CPU の種類（arm64 / amd64）。Graviton（t4g など）は arm64、それ以外は x86_64 → amd64。"""
+    info_ = _ec2(env).describe_instance_types(InstanceTypes=[itype])["InstanceTypes"]
+    archs = info_[0]["ProcessorInfo"]["SupportedArchitectures"] if info_ else []
+    if "arm64" in archs:
+        return "arm64"
+    if "x86_64" in archs:
+        return "amd64"
+    raise LabError(f"インスタンスの種類 {itype} の CPU の種類が分かりません（{archs}）")
+
+
+def resolve_ami(env: Env, existing: list[dict], pattern: str | None = None) -> str:
+    """配備済みの台があればその AMI（3 台が同時に置き換わらない）。初回は Canonical の Ubuntu 24.04 の最新
+    （CPU の種類は LAB_EC2_INSTANCE_TYPE に合わせる）。"""
     for inst in existing:
         if inst.get("ImageId"):
             return inst["ImageId"]
+    return latest_ami(env, pattern)
+
+
+def latest_ami(env: Env, pattern: str | None = None) -> str:
+    """Canonical の Ubuntu 24.04 の最新の AMI（pattern が無ければ LAB_EC2_INSTANCE_TYPE の CPU の種類のもの）。"""
+    pattern = pattern or UBUNTU_AMI_PATTERN.format(arch=instance_arch(env, env.ec2_instance_type))
     images = _ec2(env).describe_images(Owners=[UBUNTU_OWNER], Filters=[
         {"Name": "name", "Values": [pattern]}, {"Name": "state", "Values": ["available"]}])["Images"]
     if not images:
@@ -449,10 +508,11 @@ def _to_node(inst: dict, index: int | None = None) -> Node:
     return Node(id=inst["InstanceId"], index=index if index is not None else int(tags.get("lab:node-index", "0")),
                 private_ip=inst.get("PrivateIpAddress", ""), public_ip=inst.get("PublicIpAddress", ""),
                 zone=inst.get("Placement", {}).get("AvailabilityZone", ""),
-                role="worker" if tags.get("lab:role") == "worker" else "server")
+                role="worker" if tags.get("lab:role") == "worker" else "server",
+                state=str(inst.get("State", {}).get("Name", "")).lower())
 
 
-def ensure_nodes(env: Env, net: dict, pubkey: str) -> list[Node]:
+def ensure_nodes(env: Env, net: dict, pubkey: str, ami: str | None = None) -> list[Node]:
     """EC2 3 台（別サブネット、固定のプライベート IP、公開 IP（SSH 用）、Ubuntu 24.04 arm64、IMDSv2、キーペア、ロール無し）。
     無い台だけ作る。"""
     ec2 = _ec2(env)
@@ -460,7 +520,7 @@ def ensure_nodes(env: Env, net: dict, pubkey: str) -> list[Node]:
     keypair = _ensure_keypair(env, pubkey)
     existing = _instances(env)
     by_index = {_to_node(i).index: i for i in existing}
-    ami = resolve_ami(env, existing)
+    ami = ami or resolve_ami(env, existing)
     for n in plan["nodes"]:
         i = n["index"]
         if i in by_index:
@@ -478,7 +538,10 @@ def ensure_nodes(env: Env, net: dict, pubkey: str) -> list[Node]:
                                         **{"lab:node-index": str(i), "lab:role": "node"}),
         )
         info(f"EC2 {res['Instances'][0]['InstanceId']}（{env.vm_prefix}-node{i}、{n['private_ip']}）を起こしました")
-    ids = [i["InstanceId"] for i in _instances(env)]
+    # 止まっている台は待っても動き出さないので、待つ前に止める（2026-11-08。変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 3 章）
+    current = _instances(env)
+    require_running(env, [_to_node(i) for i in current], sys.modules[__name__])
+    ids = [i["InstanceId"] for i in current]
     ec2.get_waiter("instance_running").wait(InstanceIds=ids, WaiterConfig={"Delay": 5, "MaxAttempts": 60})
     nodes = sorted((_to_node(i) for i in _instances(env)), key=lambda n: n.index)
     if len(nodes) != NODE_COUNT:
@@ -486,7 +549,7 @@ def ensure_nodes(env: Env, net: dict, pubkey: str) -> list[Node]:
     return nodes
 
 
-def ensure_workers(env: Env, net: dict, pubkey: str, count: int) -> list[Node]:
+def ensure_workers(env: Env, net: dict, pubkey: str, count: int, ami: str | None = None) -> list[Node]:
     """足す台 1〜count（<接頭辞>-worker<番号>、今の 3 台と同じ種類と AMI、サブネットは 3 つを順に、そのサブネットの .30+番号）。
     無い番号だけ作る。count より大きい番号の台は消さない（vm.remove_leaving_workers が外した後に remove_workers で消す）。"""
     if count <= 0:
@@ -494,7 +557,7 @@ def ensure_workers(env: Env, net: dict, pubkey: str, count: int) -> list[Node]:
     ec2 = _ec2(env)
     keypair = _ensure_keypair(env, pubkey)
     existing = {_to_node(i).index for i in _instances(env, role="worker")}
-    ami = resolve_ami(env, _instances(env))
+    ami = ami or resolve_ami(env, _instances(env))
     for w in worker_plan(env.vm_cidr, True, count):
         if w["index"] in existing:
             continue
@@ -572,6 +635,29 @@ def describe_nodes(env: Env, ids: list[str], base: int = 0) -> list[Node]:
     return nodes
 
 
+def node_image(env: Env, node: Node) -> str:
+    """その台の AMI の ID。"""
+    res = _ec2(env).describe_instances(InstanceIds=[node.id])["Reservations"]
+    return res[0]["Instances"][0].get("ImageId", "") if res else ""
+
+
+def replace_instance(env: Env, node: Node, ami: str, pubkey: str) -> Node:
+    """1 台を消し、同じ番号・同じ内部 IP で ami から作り直して、内部 NLB のターゲットに戻す（./lab upgrade-ami。managed だけ）。
+    新しい台の識別子を返す。"""
+    ec2 = _ec2(env)
+    ec2.terminate_instances(InstanceIds=[node.id])
+    ec2.get_waiter("instance_terminated").wait(InstanceIds=[node.id], WaiterConfig={"Delay": 10, "MaxAttempts": 60})
+    info(f"EC2 {node.id}（{node.private_ip}）を消しました")
+    net = ensure_network(env)
+    servers = ensure_nodes(env, net, pubkey, ami=ami)
+    workers = ensure_workers(env, net, pubkey, env.vm_workers, ami=ami) if node.role == "worker" else list_workers(env)
+    ensure_load_balancer(env, net, servers + workers)   # 作り直した台をターゲットに戻す
+    new = next((n for n in servers + workers if n.index == node.index), None)
+    if new is None:
+        raise LabError(f"作り直した台（番号 {node.index}）が見つかりません")
+    return new
+
+
 def recreate_node(env: Env, infra: Infra, index: int, pubkey: str) -> Node:
     """1 台を消して作り直す（AMI を新しくするとき。managed だけ）。"""
     ec2 = _ec2(env)
@@ -590,6 +676,11 @@ def stop_node(env: Env, node: Node) -> None:
     ec2 = _ec2(env)
     ec2.stop_instances(InstanceIds=[node.id])
     ec2.get_waiter("instance_stopped").wait(InstanceIds=[node.id], WaiterConfig={"Delay": 5, "MaxAttempts": 60})
+
+
+def start_command(env: Env, node: Node) -> str:
+    """止まった台を手で起こすコマンド（require_running の案内）。"""
+    return f"aws ec2 start-instances --region {env.vm_region} --instance-ids {node.id}"
 
 
 def start_node(env: Env, node: Node) -> None:
@@ -659,6 +750,7 @@ def destroy(env: Env) -> None:
     _delete_bucket(env, _bucket_name(env, identity(env)))
     for user in [*KEY_ROLES, *LEGACY_KEY_USERS]:   # 前の版の名前も残っていれば消す
         name = _iam_user_name(env, user)
+        _delete_user_policy(env, iam, name)
         with contextlib.suppress(iam.exceptions.NoSuchEntityException):
             for k in iam.list_access_keys(UserName=name)["AccessKeyMetadata"]:
                 iam.delete_access_key(UserName=name, AccessKeyId=k["AccessKeyId"])

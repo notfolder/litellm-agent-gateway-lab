@@ -81,11 +81,12 @@ flowchart TB
             subgraph NODES["VM × 3（Ubuntu 24.04、k3s server × 3、組み込み etcd、nftables、Zabbix agent 2）"]
                 DK["Docker（自作イメージのビルド）"]
                 subgraph K3S["k3s（PVC は local-path）"]
-                    TR["Traefik × 全台に 1 つ（hostPort 80/443）<br/>80 → 443、admin-only（踏み台だけ）"]
+                    TR["Traefik × 全台に 1 つ（hostPort 80/443、CPU の予約 100m）<br/>80 → 443、admin-only（踏み台だけ）"]
+                    DNS["CoreDNS × 3（台ごとに 1 つ）"]
                     CM["cert-manager × 2<br/>Let's Encrypt DNS-01（確認はクラウドの DNS）"]
                     REG["registry × 2（保存先は images/）<br/>NodePort 30500、各台が自分の IP から引く"]
                     LL["LiteLLM × 2〜最大数（台ごとの空きから数える）<br/>優先度は低め（足りなければ退く）"]
-                    PG[("PostgreSQL × 3 ＋ Pooler × 2<br/>オペレーター × 2")]
+                    PG[("PostgreSQL × 3 ＋ Pooler × 2<br/>オペレーター × 2、Barman Cloud Plugin × 2")]
                     VK[("Valkey × 3 ＋ Sentinel × 3")]
                     AV["検索アプリ × 2、整形の CronJob<br/>google_workspace_mcp"]
                     ZP["zabbix-proxy ＋ kube-state-metrics（monitoring）"]
@@ -116,6 +117,7 @@ flowchart TB
 ```
 
 - 1 台が落ちても処理が続く（etcd、PostgreSQL、Sentinel はいずれも 3 台の多数決）。Traefik は全台に 1 つずつで、台が落ちるとロードバランサがヘルスチェック（5〜10 秒 × 2 回）で外す（障害の試験 `--scenario entry-node`、足す台は `worker-node`）。IP の付け替えは無い（VM はクラウドの API を呼ばない）
+- 要求の経路に 1 台だけの部品を置かない。名前解決（CoreDNS）は 3 台、PostgreSQL のオペレーターとバックアップのプラグイン（Barman Cloud Plugin）は 2 台。入口の Traefik には CPU とメモリの予約を付け、台が止まって残りの台の CPU が混んでも応答し続けるようにする。AWS で台を 1 台止めた 3 場面は、回復まで 66〜91 秒（目安 120 秒。design 21.10 節、21.13 節）
 - 足す台（k3s の agent）は `.env` で増減して `./lab up`。LiteLLM と入口だけを動かし、PostgreSQL と Valkey は今の 3 台だけに置くので、減らしても DB のデータは失わない。減らすときはヘルスチェックを先に落として新しい接続を止めてから、Pod を逃がしてクラスタから外す（経緯は `.history/2026-10-31-台の増減とLiteLLMのメモリ/`）
 - データは各台の PVC（local-path）に置き、PostgreSQL のバックアップと監査ログはバケットに出る
 - 守りは 3 層: 各 VM の nftables（入りは踏み台・VPC・ヘルスチェックの送信元・全台の間の内部通信だけ。出は中継と内側だけ）、Traefik の送信元制限（管理系の経路は踏み台だけ）、NetworkPolicy（PostgreSQL・Pooler・Valkey は必要な Pod だけ）
@@ -203,4 +205,4 @@ Mac の RustFS は従来の 4 バケットとバケット既定の保持のま�
 | 監視 | なし | Zabbix（agent 2、公式 Helm チャート、API での登録） | `labtool/zabbix.py` |
 | 審査官 / Claude のモデル | ChatGPT / Anthropic API（トークン転送） | Anthropic API キーの Haiku 4.5 / 同じ | `render.litellm_config()` |
 | 構築ツールの経路 | localhost | SSH の転送 3 本（6443 はノード経由、443 と Zabbix の web は踏み台経由。`litellm-lab-ec2` / `litellm-lab-gcp` のコンテキスト） | `labtool/vm.py` |
-| 障害の試験 | DB・Redis・LiteLLM の場面 | 同じ ＋ `entry-node`（Traefik の台）＋ `worker-node`（足す台） | `labtool/failover.py` |
+| 障害の試験 | DB・Redis・LiteLLM の場面 | 同じ ＋ `entry-node`（Traefik の台）＋ `worker-node`（足す台）。managed は負荷を中継の VM から送る | `labtool/failover.py`、`tests/failover-load/remote_load.py` |

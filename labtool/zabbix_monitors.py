@@ -29,6 +29,7 @@ ZABBIX_SERVER_DROP_TEMPLATE = "Linux by Zabbix agent"
 PP_JSONPATH = 12
 PP_JS = 21
 PP_PROMETHEUS = 22
+PP_CHANGE_PER_SECOND = 10
 # エラーのときの扱い: 0 = 既定（アイテムを取得できない扱い）、2 = 値を入れる
 ON_FAIL_SET = 2
 # アイテムの種類と値の型
@@ -129,6 +130,67 @@ for (var i = 0; i < items.length; i++) {
   }
 }
 throw 'container not found';"""
+
+
+# ---- LiteLLM の指標（変更設計書 .history/2026-11-08-Traefikの更新と止まった台/ 14 章） ----
+# 指標は Pod ごとに別に数えられる（入口から読むと 1 つの Pod の値になる）。クラスタの中の zabbix-proxy が LiteLLM の Pod を見つけ、
+# 各 Pod の /metrics（4000 番）を直接読む。数え上げ（counter）は毎秒の変化にして Pod ごとに持ち、ホストの計算アイテムで足す。
+# Pod が入れ替わって数え直しが起きても、毎秒の変化は小さくなった値を捨てる（Zabbix の仕様）ので崩れない
+LITELLM_PODS_PATH = "/api/v1/namespaces/litellm-lab/pods?labelSelector=app.kubernetes.io%2Fname%3Dlitellm"
+LITELLM_METRICS_PORT = 4000
+JS_LITELLM_PODS_LLD = """var d = JSON.parse(value), out = [];
+(d.items || []).forEach(function (p) {
+  var st = p.status || {};
+  if (st.phase === 'Running' && st.podIP && !p.metadata.deletionTimestamp) {
+    out.push({'{#POD}': p.metadata.name, '{#PODIP}': st.podIP});
+  }
+});
+return JSON.stringify(out);"""
+LITELLM_FAIL_PCT = 5          # 失敗の割合（%）の警報の線
+# (キーの名前, 表示名, 指標, 単位)。すべて数え上げの合計を毎秒の変化にする
+LITELLM_COUNTERS = [
+    ("req", "要求の数（毎秒）", "litellm_proxy_total_requests_metric_total", "req/s"),
+    ("fail", "失敗した要求の数（毎秒）", "litellm_proxy_failed_requests_metric_total", "req/s"),
+    ("latency_sum", "待ち時間の合計（毎秒）", "litellm_request_total_latency_metric_sum", "s"),
+    ("latency_count", "待ち時間の数（毎秒）", "litellm_request_total_latency_metric_count", ""),
+    ("deploy_fail", "LLM の送り先の失敗の数（毎秒）", "litellm_deployment_failure_responses_total", "req/s"),
+]
+
+
+def litellm_specs() -> dict:
+    """LiteLLM の指標: Pod の発見（Kubernetes の API）、Pod ごとの /metrics と毎秒の変化、クラスタの合計、失敗の割合と平均の待ち時間、警報。"""
+    h = f"/{HOST}/"
+    pod = "[{#POD}]"
+    master = f"lab.litellm.metrics{pod}"
+    items = [http("lab.litellm.pods", "litellm-lab: LiteLLM の Pod の一覧", LITELLM_PODS_PATH)]
+    prototypes = [{"key_": master, "name": "{#POD}: LiteLLM の指標（/metrics）", "type": T_HTTP,
+                   "url": f"http://{{#PODIP}}:{LITELLM_METRICS_PORT}/metrics", "delay": "1m", "timeout": "10s",
+                   "value_type": V_TEXT, "history": "0"}]
+    for key, label, metric, units in LITELLM_COUNTERS:
+        # 一度も数えていない指標は出てこない（失敗が無い間など）ので 0 にする
+        prototypes.append(dep(f"lab.litellm.{key}.rate{pod}", f"{{#POD}}: {label}", master,
+                              prom(metric, "sum", on_fail="0") + [{"type": PP_CHANGE_PER_SECOND, "params": "",
+                                                                   "error_handler": 0, "error_handler_params": ""}], units=units))
+    for key, label, _metric, units in LITELLM_COUNTERS:
+        items.append(calc(f"lab.litellm.{key}.rate", f"litellm-lab: LiteLLM の{label}（全 Pod）",
+                          f"sum(last_foreach({h}lab.litellm.{key}.rate[*]))", units))
+    # 0 で割らないよう分母に小さな値を足す（要求が無い間は 0 % / 0 秒）
+    items += [
+        calc("lab.litellm.fail.pct", "litellm-lab: LiteLLM の失敗した要求の割合",
+             f"100*last({h}lab.litellm.fail.rate)/(last({h}lab.litellm.req.rate)+0.0001)", "%"),
+        calc("lab.litellm.latency.avg", "litellm-lab: LiteLLM の平均の待ち時間",
+             f"last({h}lab.litellm.latency_sum.rate)/(last({h}lab.litellm.latency_count.rate)+0.0001)", "s"),
+    ]
+    triggers = [
+        trig(f"litellm-lab: LiteLLM の失敗した要求の割合が 5 分続けて {LITELLM_FAIL_PCT}% を超えた",
+             f"min({h}lab.litellm.fail.pct,5m)>{LITELLM_FAIL_PCT}", WARN),
+        trig("litellm-lab: LiteLLM の LLM の送り先の失敗が 5 分続いている", f"min({h}lab.litellm.deploy_fail.rate,5m)>0", WARN),
+    ]
+    rule = {"key_": "lab.litellm.pods.discovery", "name": "litellm-lab: LiteLLM の Pod の発見", "type": T_DEPENDENT,
+            "master": "lab.litellm.pods", "lifetime": "1h", "preprocessing": js(JS_LITELLM_PODS_LLD),
+            # 自動の台数調整で Pod はよく入れ替わる。見えなくなった Pod のアイテムはすぐ止め（読みに行って 401 / 届かないの誤りを出さない）、1 時間後に消す
+            "enabled_lifetime_type": 2}
+    return {"items": items, "triggers": triggers, "discovery": {"rule": rule, "items": prototypes, "triggers": []}}
 
 
 def k8s_specs() -> dict:
@@ -238,7 +300,10 @@ def k8s_specs() -> dict:
             trig(f"litellm-lab: {name} の CPU が上限の 90% を 15 分超えた", f"avg({h}lab.pod.cpu.pct{key},15m)>90", WARN),
         ],
     }
-    return {"items": items, "triggers": triggers, "discovery": discovery}
+    lite = litellm_specs()
+    # LiteLLM の計算アイテムは Pod ごとのアイテム（発見ルールのプロトタイプ）を足すので、発見ルールの後に作る（items_after）
+    return {"items": items + lite["items"][:1], "triggers": triggers, "discovery": [discovery, lite["discovery"]],
+            "items_after": lite["items"][1:], "triggers_after": lite["triggers"]}
 
 
 # ---- API で作る（冪等） ----
@@ -293,17 +358,27 @@ def ensure_specs(client, specs: dict | None = None) -> dict[str, int]:
         if stale:
             client.call("trigger.delete", [t["triggerid"] for t in stale])
             changed["triggers"] += 1
-    d = specs["discovery"]
-    rule_body = {**_item_payload(d["rule"], ids), "hostid": hostid}
-    ruleid, did = _ensure(client, "discoveryrule", {"hostids": hostid}, {"key_": d["rule"]["key_"]}, rule_body, "description")
-    changed["discovery"] += did
-    for spec in d["items"]:
-        body = {**_item_payload(spec, ids), "hostid": hostid, "ruleid": ruleid}
-        _, did = _ensure(client, "itemprototype", {"discoveryids": ruleid}, {"key_": spec["key_"]}, body, "description")
+    rules = specs["discovery"] if isinstance(specs["discovery"], list) else [specs["discovery"]]
+    for d in rules:
+        rule_body = {**_item_payload(d["rule"], ids), "hostid": hostid}
+        ruleid, did = _ensure(client, "discoveryrule", {"hostids": hostid}, {"key_": d["rule"]["key_"]}, rule_body, "description")
         changed["discovery"] += did
-    for spec in d["triggers"]:
-        _, did = _ensure(client, "triggerprototype", {"discoveryids": ruleid}, {"description": spec["description"]}, spec, "comments")
-        changed["discovery"] += did
+        for spec in d["items"]:
+            body = {**_item_payload(spec, ids), "hostid": hostid, "ruleid": ruleid}
+            itemid, did = _ensure(client, "itemprototype", {"discoveryids": ruleid}, {"key_": spec["key_"]}, body, "description")
+            ids[spec["key_"]] = itemid   # 同じルールの従属のプロトタイプが元にする
+            changed["discovery"] += did
+        for spec in d["triggers"]:
+            _, did = _ensure(client, "triggerprototype", {"discoveryids": ruleid}, {"description": spec["description"]}, spec, "comments")
+            changed["discovery"] += did
+    for spec in specs.get("items_after", []):
+        body = {**_item_payload(spec, ids), "hostid": hostid}
+        itemid, did = _ensure(client, "item", {"hostids": hostid}, {"key_": spec["key_"]}, body, "description")
+        ids[spec["key_"]] = itemid
+        changed["items"] += did
+    for spec in specs.get("triggers_after", []):
+        _, did = _ensure(client, "trigger", {"hostids": hostid}, {"description": spec["description"]}, spec, "comments")
+        changed["triggers"] += did
     total = sum(changed.values())
     (info if total else ok)(f"Zabbix の追加の監視（{HOST}）: " + (f"作り直し {changed}" if total else "最新です"))
     return changed

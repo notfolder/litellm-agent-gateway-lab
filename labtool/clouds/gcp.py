@@ -706,7 +706,8 @@ def _to_node(inst, index: int | None = None) -> Node:
     labels = inst.labels or {}
     return Node(id=f"{zone}/{inst.name}", index=index if index is not None else int(labels.get("lab-node-index", "0")),
                 private_ip=nic.network_i_p if nic else "", public_ip=public or "", zone=zone,
-                role="worker" if labels.get("lab-role") == "worker" else "server")
+                role="worker" if labels.get("lab-role") == "worker" else "server",
+                state=str(getattr(inst, "status", "") or "").lower())
 
 
 def _create_instance(env: Env, zone: str, name: str, machine_type: str, image: str, disk_type: str, disk_gb: int,
@@ -730,8 +731,8 @@ def _create_instance(env: Env, zone: str, name: str, machine_type: str, image: s
     compute.InstancesClient().insert(project=env.gcp_project, zone=zone, instance_resource=inst).result()
 
 
-def ensure_nodes(env: Env, net: dict, pubkey: str) -> list[Node]:
-    """Compute Engine 3 台（別ゾーン、固定の内部 IP、一時的な外部 IP（SSH 用）、Ubuntu 24.04 arm64、Hyperdisk、サービスアカウント無し）。
+def ensure_nodes(env: Env, net: dict, pubkey: str, ami: str | None = None) -> list[Node]:
+    """（ami は aws-ec2 の upgrade-ami 用。GCP では使わない）Compute Engine 3 台（別ゾーン、固定の内部 IP、一時的な外部 IP（SSH 用）、Ubuntu 24.04 arm64、Hyperdisk、サービスアカウント無し）。
     無い台だけ作る。初期化は SSH（labtool/vm.py）なので startup-script は無い。"""
     plan, zones, names = net["plan"], net["zones"], _names(env)
     existing = _instances(env)
@@ -753,8 +754,8 @@ def ensure_nodes(env: Env, net: dict, pubkey: str) -> list[Node]:
     return nodes
 
 
-def ensure_workers(env: Env, net: dict, pubkey: str, count: int) -> list[Node]:
-    """足す台 1〜count（<接頭辞>-worker<番号>、今の 3 台と同じ種類とイメージ、ゾーンは順に、サブネットの .30+番号）。無い番号だけ作る。
+def ensure_workers(env: Env, net: dict, pubkey: str, count: int, ami: str | None = None) -> list[Node]:
+    """（ami は aws-ec2 の upgrade-ami 用。GCP では使わない）足す台 1〜count（<接頭辞>-worker<番号>、今の 3 台と同じ種類とイメージ、ゾーンは順に、サブネットの .30+番号）。無い番号だけ作る。
     count より大きい番号の台は消さない（vm.remove_leaving_workers がクラスタから外した後に remove_workers で消す）。"""
     if count <= 0:
         return []
@@ -845,6 +846,12 @@ def recreate_node(env: Env, infra: Infra, index: int, pubkey: str) -> Node:
 def stop_node(env: Env, node: Node) -> None:
     zone, name = node.id.split("/", 1)
     _compute().InstancesClient().stop(project=env.gcp_project, zone=zone, instance=name).result()
+
+
+def start_command(env: Env, node: Node) -> str:
+    """止まった台を手で起こすコマンド（require_running の案内）。"""
+    zone, name = node.id.split("/", 1)
+    return f"gcloud compute instances start {name} --zone {zone} --project {env.gcp_project}"
 
 
 def start_node(env: Env, node: Node) -> None:
