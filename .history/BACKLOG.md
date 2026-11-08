@@ -46,9 +46,8 @@
 - [ ] Bedrock の Claude のモデル: Claude Code の枠は 2026-11-04 に Sonnet 4.6・Haiku 5.5・Opus 5.5（すべて `jp.`）に替えた（Sonnet 5.5 は東京の `jp.` に無い。ユーザー回答 2026-11-04 の 1C・2A）。残り: (1) 次の EKS 構成（`LAB_TARGET=aws`）の配備で 3 つを実際に呼んで確かめる（EC2 構成は Bedrock を通らない。ユーザー回答 2026-11-04 の 3B）（初めて呼ぶと AWS Marketplace の利用の申し込みが自動で行われる） (2) `jp.` に Sonnet 5.5 が出たら移す (3) 審査官（Bedrock と VM の Anthropic の API キー）は Haiku 4.5 のまま。EOL が通知されたら、審査の試験（`test-judge`）とあわせて替える。Sonnet 4.5 は 2027-04-08 に EOL（AWS Health の通知 2026-11-04）。今後新しく指定するモデルは 5.5 系にする（ユーザー指示 2026-11-04）（追加 2026-11-04、期限 2027-01-08、重要 中）
 
 ## VM 3 台構成（`LAB_TARGET=aws-ec2` / `gcp-vm`）
-概要: .history/2026-11-06-1702-aws-ec2の配備と障害試験の直し/summary.md
+概要: .history/2026-11-09-0122-EC2の仕上げ/summary.md
 
-- [ ] プルリクエスト #9（`fix/aws-ec2-deploy`。aws-ec2 の配備の直し、1 台だけの部品の冗長化、障害の試験の負荷、入口の Traefik、docs/ への反映）をレビューしてマージする（追加 2026-11-06、重要 高）
 - [ ] CoreDNS 3 台、metrics-server 2 台、Traefik の当て方、`K3S_IMAGE` v1.37.2（Traefik のチャート 41）などの変更の後の `./lab up` と `test-failover` を、Mac の k3d と `gcp-vm` で流して通ることを確かめる（確かめたのは `aws-ec2` だけ。.history/2026-11-05-1台だけの部品の冗長化/ の R1、.history/2026-11-08-Traefikの更新と止まった台/）（追加 2026-11-06、重要 低）
 - [ ] 審査官を Claude Haiku 4.5 にしたときの事例試験の不一致 14 事例（社内宛てを止める、設定ファイルを求めない）を見て、審査官の指示文を詰めるか期待値を見直す（`tests/review-scenarios/`。`./lab test-judge` の記録）（追加 2026-10-30、重要 低）
 - [ ] Zscaler の実物での確認: 明示プロキシの URL と CA を `.env` に入れて `./lab up` が通るか。大きなダウンロード（k3s、コンテナのイメージ）が通る速さも先に確かめる（ためてから流すプロキシでは台の初期化とイメージの取得が遅れた。2026-11-09）（検証は mitmproxy。Zscaler 固有の挙動（SNI の検査、特定の宛先の除外、認証付きのプロキシ）は未確認。本番は明示プロキシと確認済み（2026-11-02））（追加 2026-10-31、重要 中） 本物の Zscaler では cert-manager の DNS-01 の伝搬確認（クラウドの再帰リゾルバに向けてある）と、Zabbix のリポジトリ・Helm チャートの取得が中継を通るかも確かめる
