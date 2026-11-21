@@ -13,6 +13,9 @@ from .core import CHATGPT_TOKEN_IN_NODE, ROOT, Env
 
 FAKE_LLM_BASE = "http://fake-llm.litellm-lab.svc.cluster.local:8000/v1"
 WORKSPACE_MCP_URL = "http://workspace-mcp.litellm-lab.svc.cluster.local:8000/mcp"
+# ECS 構成では Service Connect の名前で届く（ecs/ecs-lab.sh の render_config と同じ）
+ECS_FAKE_LLM_BASE = "http://fake-llm:8000/v1"
+ECS_WORKSPACE_MCP_URL = "http://workspace-mcp:8000/mcp"
 DEFAULT_S3_ENDPOINT = "http://rustfs:9000"
 DEFAULT_ISOLATED_POLICY = "litellm/guardrails/policies/confidential.md"
 SENTINEL_NODES = json.dumps([[f"valkey-sentinel-{i}.valkey-sentinel-headless.litellm-lab.svc.cluster.local", 26379]
@@ -52,8 +55,9 @@ def model_prices(env: Env, model_name: str, chatgpt_model: str) -> dict | None:
             "cache_read_input_token_cost": values[2]}
 
 
-def _fake_params() -> dict:
-    return {"model": "openai/fake-tools", "api_key": "sk-fake", "api_base": FAKE_LLM_BASE}
+def _fake_params(env: Env | None = None) -> dict:
+    base = ECS_FAKE_LLM_BASE if env is not None and env.is_aws_ecs else FAKE_LLM_BASE
+    return {"model": "openai/fake-tools", "api_key": "sk-fake", "api_base": base}
 
 
 def litellm_config(env: Env, has_chatgpt: bool) -> dict:
@@ -89,7 +93,7 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
         model_list.append(entry)
     # 審査の試験用の偽 LLM（tests/fake-llm）。ツールコールを返す
     # 試験用の単価（1 百万トークンあたり 1 / 2 USD）。精算の按分を試すには、概算（A）が 0 でないことが要るため
-    model_list.append({"model_name": "fake-tools", "litellm_params": _fake_params(),
+    model_list.append({"model_name": "fake-tools", "litellm_params": _fake_params(env),
                        "model_info": {"input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6}})
     # 二次判定（審査官）。Mac は ChatGPT Plus のモデル、EKS 版は Bedrock の Claude Haiku 4.5（日本内で処理するプロファイル）、
     # VM の環境は Anthropic の API キーで Claude Haiku 4.5（キーの環境変数は ANTHROPIC_API_KEY ではない名前。
@@ -97,11 +101,11 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
     def judge_params(model_name: str, chatgpt_model: str) -> tuple[dict, dict | None]:
         if env.is_aws:
             return bedrock_params(env, aws_judge_model(env)), None
-        if env.is_vm:
+        if env.is_vm or env.is_aws_ecs:
             return {"model": f"anthropic/{vm_judge_model(env)}", "api_key": f"os.environ/{JUDGE_KEY_ENV}"}, None
         if has_chatgpt:
             return {"model": f"chatgpt/{chatgpt_model}"}, model_prices(env, model_name, chatgpt_model)
-        return _fake_params(), None
+        return _fake_params(env), None
 
     params, prices = judge_params("review-judge", judge_model)
     judge: dict = {"model_name": "review-judge", "litellm_params": params}
@@ -165,7 +169,7 @@ def litellm_config(env: Env, has_chatgpt: bool) -> dict:
 
     if env.has_google():
         config["mcp_servers"] = {"gmail": {
-            "url": WORKSPACE_MCP_URL,
+            "url": ECS_WORKSPACE_MCP_URL if env.is_aws_ecs else WORKSPACE_MCP_URL,
             "transport": "http",
             "auth_type": "oauth2",
             "oauth2_flow": "authorization_code",
@@ -627,8 +631,8 @@ def initial_contracts(env: Env) -> dict:
              "models": ["claude-*", "review-judge", "isolated-judge"], "fees": {}},
             {"id": "chatgpt-plus", "name": "ChatGPT Plus", "kind": "subscription", "currency": "USD",
              "models": [codex], "fees": {month: 20.0}}]}
-    if env.is_vm:
-        # VM の環境: Claude Code は Mac と同じ Claude Max の定額、審査官は Anthropic の API の従量（chatgpt/ は置かない）
+    if env.is_vm or env.is_aws_ecs:
+        # VM の環境と ECS 構成: Claude Code は Mac と同じ Claude Max の定額、審査官は Anthropic の API の従量（chatgpt/ は置かない）
         return {"schema": 1, "contracts": [
             {"id": "claude-max", "name": "Claude Max", "kind": "subscription", "currency": "USD",
              "models": ["anthropic/*", "claude-*"], "fees": {month: 100.0}},
@@ -810,6 +814,8 @@ def store_location(env: Env, logical: str) -> tuple[str, str]:
         return env.vm_bucket, logical + "/"
     if env.is_aws:
         return env.get("LAB_AWS_BUCKET_PREFIX", "") + logical, ""
+    if env.is_aws_ecs:
+        return env.get("LAB_ECS_BUCKET_PREFIX", "") + logical, ""   # ecs-lab.sh と同じ <接頭辞>-<アカウント>-<論理名>
     return logical, ""
 
 

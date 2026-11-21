@@ -26,12 +26,15 @@ PG_CLUSTER = "litellm-pg"
 SCENARIOS = ["pg-switchover", "pg-pod", "pg-node", "valkey-pod", "valkey-node"]
 # AWS（EKS 版）の場面（変更仕様書 2026-10-24-AWS構成 7.2 節）: LiteLLM のノードの drain、Aurora と ElastiCache のフェイルオーバー
 SCENARIOS_AWS = ["litellm-drain", "aurora-failover", "valkey-failover"]
+# ECS 構成（変更設計書 .history/2026-11-21-ECS構成/ 11 章）。タスクを止める場面は、ALB が外すまでの要求も別のタスクに届くので失敗 0 件
+SCENARIOS_ECS = ["litellm-task", "pgbouncer-task", "rds-failover", "valkey-primary", "sentinel-task"]
 # VM 3 台の場面: Mac と同じ場面（ノードの停止は VM の停止）＋ 入口（Traefik の Pod が載る台）の停止。内部ロードバランサが
 # その台を外し、Traefik が別の台に移るまで（変更仕様書 2026-10-31 R22。前は浮動 IP を持つ台の停止）
 SCENARIOS_VM = [*SCENARIOS, "entry-node", "worker-node"]   # worker-node: LiteLLM が載った足す台の停止（足す台があるときだけ）
 SCENARIO_ALIASES = {"eip-node": "entry-node"}   # EC2 版の名前
 # 回復までの時間の合格の目安（秒）。ノードを止める場面は長め（変更仕様書 9.3 節）
-LIMITS = {"pg-switchover": 60, "pg-pod": 60, "pg-node": 120, "valkey-pod": 60, "valkey-node": 120,
+LIMITS = {"litellm-task": 0, "pgbouncer-task": 120, "rds-failover": 120, "valkey-primary": 120, "sentinel-task": 0,
+          "pg-switchover": 60, "pg-pod": 60, "pg-node": 120, "valkey-pod": 60, "valkey-node": 120,
           "litellm-drain": 60, "aurora-failover": 90, "valkey-failover": 90, "entry-node": 120, "worker-node": 120}
 # 直結（比較用）のときだけ、PostgreSQL の primary の切り替えと Pod の削除は 90 秒にする。Pooler は切り替えの間の要求を
 # 待たせて吸収する（2026-10-12 の実測で、どちらも失敗 0 件）が、直結では新しい primary が立つまでの 15〜50 秒が
@@ -243,6 +246,9 @@ def _redis_error_times(env: Env, since: str) -> list[float]:
     from datetime import datetime, timezone
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     times: list[float] = []
+    if env.is_aws_ecs:
+        from . import ecs
+        return ecs.redis_error_times(env, datetime.fromisoformat(since.replace("Z", "+00:00")).timestamp(), REDIS_ERROR)
     for pod in output(kn("get", "pods", "-l", "app.kubernetes.io/name=litellm", "-o", "name"), check=False).split():
         for line in output(kn("logs", pod, f"--since-time={since}"), check=False).splitlines():
             m = re.match(r"(\d{2}:\d{2}:\d{2}) ", line)
@@ -272,13 +278,18 @@ def wait_redis_clean(env: Env, t0: float) -> dict:
             return {"lines": len(times), "last_error_seconds": round(last - t0, 1), "clean": False}
 
 
-def litellm_restarts() -> dict[str, int]:
+def litellm_restarts(env: Env | None = None) -> dict[str, int]:
+    if env is not None and env.is_aws_ecs:
+        return {}   # ECS のタスクは再起動しない（落ちれば作り直される）。作り直しの繰り返しは止まったタスクの数で見る
     pods = json_output(kn("get", "pods", "-l", "app.kubernetes.io/name=litellm", "-o", "json"), default={}) or {}
     return {p["metadata"]["name"]: sum(c.get("restartCount", 0) for c in p["status"].get("containerStatuses", []))
             for p in pods.get("items", [])}
 
 
 def healthy(env: Env) -> bool:
+    if env.is_aws_ecs:
+        from . import ecs
+        return ecs.healthy(env)
     if env.is_aws:
         from . import aws
         out = aws.load_outputs(env)
@@ -300,6 +311,9 @@ def healthy(env: Env) -> bool:
 
 
 def wait_healthy(env: Env, timeout: int = 600) -> None:
+    if env.is_aws_ecs:
+        wait_until(timeout, "RDS が available、全サービスのタスクがそろい、Valkey の primary が 1 台・replica が 2 台", lambda: healthy(env))
+        return
     desc = "Aurora と ElastiCache が available" if env.is_aws else "PostgreSQL 3 台と Valkey 3 台がそろい、primary が 1 台"
     wait_until(timeout, desc, lambda: healthy(env))
     run(kn("rollout", "status", "deploy/litellm", "--timeout=300s"), quiet=True)
@@ -376,6 +390,9 @@ def _stop_node(node: str, load: Load, env: Env | None = None) -> None:
 
 def trigger(env: Env, scenario: str, load: Load) -> str:
     """場面を起こす。何をしたかの説明を返す。"""
+    if scenario in SCENARIOS_ECS:
+        from . import ecs
+        return ecs.trigger(env, scenario)
     if scenario in SCENARIOS_AWS:
         from . import aws
         out = aws.load_outputs(env)
@@ -487,7 +504,7 @@ def run_scenario(env: Env, scenario: str) -> dict:
     if scenario == "worker-node":
         _put_litellm_on_worker()
         wait_healthy(env)
-    restarts_before = litellm_restarts()
+    restarts_before = litellm_restarts(env)
     with make_load(env) as load:
         time.sleep(10)  # 平常時の様子
         baseline_fail = len(load.failures_after(0))
@@ -510,13 +527,21 @@ def run_scenario(env: Env, scenario: str) -> dict:
             load.cleanup()
     wait_healthy(env)
     redis = wait_redis_clean(env, t0)
-    restarts_after = litellm_restarts()
+    restarts_after = litellm_restarts(env)
     fails = [s for s in samples if s.start >= t0 and s.status != 200]
     recovery = (max(s.start for s in fails) - t0) if fails else 0.0
     window = (max(s.start for s in fails) - min(s.start for s in fails)) if fails else 0.0
     repeated = {p: restarts_after[p] - restarts_before.get(p, 0) for p in restarts_after
                 if restarts_after[p] - restarts_before.get(p, 0) > 1}
-    if env.is_aws:
+    if env.is_aws_ecs:
+        from . import ecs
+        # LiteLLM のタスクが場面の後にも落ち続けていないか（自分で止めた 1 つは除く）
+        extra = len(ecs.crashed_since(env, "litellm", t0))
+        if extra > 0:
+            repeated = {"litellm": extra}
+        roles = list(ecs.valkey_roles(env).values())
+        masters, pg_after, vk_after = roles.count("master"), ecs.rds_status(env)["AvailabilityZone"], ecs.valkey_primary(env)
+    elif env.is_aws:
         from . import aws
         out = aws.load_outputs(env)
         masters, pg_after, vk_after = 1, aws.aurora_writer(env, out), aws.valkey_primary(env, out)
@@ -552,6 +577,8 @@ def run_scenario(env: Env, scenario: str) -> dict:
 
 
 def scenarios_for(env: Env) -> list[str]:
+    if env.is_aws_ecs:
+        return SCENARIOS_ECS
     if env.is_aws:
         return SCENARIOS_AWS
     if env.is_vm:
@@ -568,7 +595,7 @@ def failover(env: Env, scenarios: list[str], audit_check=None) -> None:
     if bad:
         raise LabError(f"LAB_TARGET={env.target} では使えない場面です: {', '.join(bad)}"
                        f"（使える場面: {', '.join(allowed)}）")
-    where = "AWS: Aurora に直結" if env.is_aws else f"DB の接続先: {env.get('LAB_DB_POOLER', 'pooler')}" + (
+    where = "ECS: RDS（マルチ AZ）、PgBouncer、Valkey" if env.is_aws_ecs else "AWS: Aurora に直結" if env.is_aws else f"DB の接続先: {env.get('LAB_DB_POOLER', 'pooler')}" + (
         f"、{env.target} の VM 3 台" if env.is_vm else "")
     step(f"test-failover 障害の試験（{where}）")
     results = [run_scenario(env, s) for s in scenarios]

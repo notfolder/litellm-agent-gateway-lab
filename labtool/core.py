@@ -36,7 +36,7 @@ AWS_KUBE_CONTEXT = "litellm-lab-aws"      # aws eks update-kubeconfig --alias �
 EC2_KUBE_CONTEXT = "litellm-lab-ec2"      # EC2 3 台の k3s（SSH のポート転送の先。labtool/vm.py が書く）
 GCP_KUBE_CONTEXT = "litellm-lab-gcp"      # Compute Engine 3 台の k3s（同上）
 VM_KUBE_CONTEXTS = {"aws-ec2": EC2_KUBE_CONTEXT, "gcp-vm": GCP_KUBE_CONTEXT}
-TARGETS = ("local", "aws", "aws-ec2", "gcp-vm")
+TARGETS = ("local", "aws", "aws-ec2", "gcp-vm", "aws-ecs")
 NS = "litellm-lab"
 HELM_RELEASE = "litellm"
 LITELLM_CHART = "oci://ghcr.io/berriai/litellm-helm"
@@ -128,7 +128,7 @@ class Env:
             raise LabError(f"LAB_TARGET は {' / '.join(TARGETS)} のどれかです（{env.target}）")
         # kubectl / helm が向くクラスタを環境に合わせる（変更仕様書 2026-10-24-AWS構成 2.3 節）
         set_kube_context({"aws": AWS_KUBE_CONTEXT, **VM_KUBE_CONTEXTS}.get(env.target, f"k3d-{CLUSTER}"))
-        if env.is_vm:
+        if env.is_vm or env.is_aws_ecs:
             env.apply_mac_proxy()   # 操作者の Mac も出口プロキシ（Zscaler）の中にあるとき、./lab 自身の通信を中継に通す
         # 設定は .env だけから読む。コマンドの前に付けた値は効かないので、食い違えば知らせる
         shell = os.environ.get("LAB_NOREVIEW_KEYS", "").strip()
@@ -176,6 +176,12 @@ class Env:
         return self.target == "gcp-vm"
 
     @property
+    def is_aws_ecs(self) -> bool:
+        """ECS 構成（Fargate、内部 ALB、RDS）。構築は ecs/ecs-lab.sh が行い、./lab は試験だけを流す
+        （変更仕様書 .history/2026-11-21-ECS構成/ 0.2 節）。"""
+        return self.target == "aws-ecs"
+
+    @property
     def is_vm(self) -> bool:
         """VM 3 台の k3s（aws-ec2 と gcp-vm）か。Kubernetes の中は Mac と同じ構成で、基盤と入口とバケットだけがクラウド。
         クラウドの違いは labtool/clouds/ に閉じ、段階のコードはこの判定だけで分岐する。"""
@@ -184,12 +190,12 @@ class Env:
     @property
     def on_aws(self) -> bool:
         """AWS のどちらか（boto3 の資格情報、リージョン）。"""
-        return self.is_aws or self.is_aws_ec2
+        return self.is_aws or self.is_aws_ec2 or self.is_aws_ecs
 
     @property
     def on_cloud(self) -> bool:
         """Mac 以外（HTTPS のホスト名、バケット名の接頭辞、Jev を使わない）。"""
-        return self.is_aws or self.is_vm
+        return self.is_aws or self.is_vm or self.is_aws_ecs
 
     @property
     def data_dir(self) -> Path:
@@ -219,6 +225,18 @@ class Env:
         return self.hostname if self.on_cloud else f"localhost:{self.http_port}"
 
     @property
+    def ecs_local_hostname(self) -> str:
+        """ECS 構成の端末の別名（ecs-lab.sh の local_hostname と同じ。既定はホスト名の最初の名前に -local）。"""
+        if self.get("LAB_ECS_LOCAL_HOSTNAME"):
+            return self.get("LAB_ECS_LOCAL_HOSTNAME")
+        first, _, rest = self.hostname.partition(".")
+        return f"{first}-local.{rest}"
+
+    @property
+    def ecs_prefix(self) -> str:
+        return self.get("LAB_ECS_PREFIX", "litellm-ecs")
+
+    @property
     def local_hostname(self) -> str:
         """Mac 用の別名（空なら使わない）。"""
         return self.get("LAB_LOCAL_HOSTNAME", "").strip()
@@ -227,7 +245,7 @@ class Env:
     @property
     def hostname(self) -> str:
         """HTTPS のホスト名（LAB_HOSTNAME。EKS 版・EC2 版の LAB_AWS_HOSTNAME も読む）。"""
-        host = self.get("LAB_HOSTNAME") or self.get("LAB_AWS_HOSTNAME")
+        host = self.get("LAB_ECS_HOSTNAME") if self.is_aws_ecs else (self.get("LAB_HOSTNAME") or self.get("LAB_AWS_HOSTNAME"))
         if not host:
             raise LabError(f"LAB_TARGET={self.target} には LAB_HOSTNAME（HTTPS のホスト名）が要ります")
         return host
@@ -427,6 +445,8 @@ class Env:
     @property
     def egress_ca_file(self) -> Path | None:
         value = self.get("LAB_EGRESS_CA_FILE")
+        if self.is_aws_ecs and not value and (ROOT / ".build" / "ecs" / "relay-ca.pem").exists():
+            return ROOT / ".build" / "ecs" / "relay-ca.pem"   # ecs-lab.sh が作る検証の中継の CA
         if not value:
             return None
         p = Path(value).expanduser()
@@ -435,6 +455,10 @@ class Env:
     @property
     def egress_proxy_mac(self) -> str:
         """./lab 自身（操作者の Mac）が使う中継の URL（空なら Mac は中継を使わない）。"""
+        if self.is_aws_ecs and not self.get("LAB_EGRESS_PROXY_MAC"):
+            # ECS 構成の検証: 端末は検証の中継（監視の台の mitmproxy）を通って内部 ALB に届く。ecs-lab.sh up が書く
+            f = ROOT / ".build" / "ecs" / "relay-proxy"
+            return f.read_text().strip() if f.exists() else ""
         return self.get("LAB_EGRESS_PROXY_MAC")
 
     @property
