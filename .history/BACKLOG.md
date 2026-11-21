@@ -48,7 +48,7 @@
 ## ECS 構成（`LAB_TARGET=aws-ecs`）
 概要: .history/2026-11-21-ECS構成/変更仕様書.md
 
-- [ ] ECS 構成（Fargate、内部 ALB、RDS のマルチ AZ、自前の Valkey、社内プロキシの中）を、1 ファイルの構築スクリプト（`ecs/ecs-lab.sh`）と `./lab` の試験の分岐で作り、AWS で全試験を通す。変更仕様書と変更設計書は 2026-11-21 に作成（ブランチ `feature/aws-ecs`）。ヒアリングは 7 回で全部決まった（未決なし）。2026-11-22: 実装し、AWS で managed と provided の両方を配備して試験した（結果は変更設計書 15 章）。残り: (1) `./lab test-judge`（審査官の Anthropic の API キーが 2026-12-01 00:00 UTC まで利用の上限） (2) `test-audit` の MCP の記録（ユーザー 1 の Gmail へのサインインが要る） (3) managed の `down`（自動判定で止められ、ユーザーの判断待ち） (4) 全部通ったら `docs/spec.md` と `docs/design.md` に反映する（追加 2026-11-21、重要 高）
+- [ ] ECS 構成（Fargate、内部 ALB、RDS のマルチ AZ、自前の Valkey、社内プロキシの中）を、1 ファイルの構築スクリプト（`ecs/ecs-lab.sh`）と `./lab` の試験の分岐で作り、AWS で全試験を通す。変更仕様書と変更設計書は 2026-11-21 に作成（ブランチ `feature/aws-ecs`）。ヒアリングは 7 回で全部決まった（未決なし）。2026-11-22: 実装し、AWS で managed と provided の両方を配備して試験し、全部消した（結果は変更設計書 15 章、ブランチ `feature/aws-ecs`）。残り: (1) `./lab test-load` を ECS 構成で流す（負荷で LiteLLM のタスクが自動で増える。k6 を中継越しに動かす作りが要る） (2) `test-restore` の ECS 構成向けの作り（RDS の任意の時点への復元） (3) `test-judge`（今回は流さない: ユーザー回答 2026-11-22。審査官のキーが 2026-12-01 まで利用の上限） (4) `test-audit` の MCP の記録（今回は不要: ユーザー回答 2026-11-22） (5) 試験が済んだら `docs/spec.md` と `docs/design.md` に反映し、プルリクエストにする（追加 2026-11-21、重要 高）
 
 ## VM 3 台構成（`LAB_TARGET=aws-ec2` / `gcp-vm`）
 概要: .history/2026-11-09-0122-EC2の仕上げ/summary.md

@@ -780,16 +780,19 @@ cmd_up() {
 }
 
 empty_bucket() {  # 版と削除マーカーを全部消す（GOVERNANCE の保持は回避する。COMPLIANCE は消せない）
-  local b="$1" batch bypass=()
+  local b="$1" batch bypass
+  bypass=()
   awsc s3api head-bucket --bucket "$b" >/dev/null 2>&1 || return 0
   # 保持の回避は Object Lock のあるバケットにだけ付けられる（無いバケットに付けると InvalidArgument。2026-11-22 に判明）
   if awsc s3api get-object-lock-configuration --bucket "$b" >/dev/null 2>&1; then bypass=(--bypass-governance-retention); fi
   while :; do
     batch=$(awsc s3api list-object-versions --bucket "$b" --max-items 500 \
-              --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId}, DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}' --output json)
+              --query '{Objects: [Versions || `[]`, DeleteMarkers || `[]`][][].{Key:Key,VersionId:VersionId}}' --output json)
     printf '%s' "$batch" | grep -q '"Key"' || break
     printf '%s' "$batch" > "$BUILD/delete.json"
-    awsc s3api delete-objects --bucket "$b" "${bypass[@]+"${bypass[@]}"}" --delete "file://$BUILD/delete.json" >/dev/null || return 1
+    # 削除マーカーが無いと、問い合わせが空の値を混ぜて全体が失敗していた（2026-11-22）。失敗した物があれば止める
+    awsc s3api delete-objects --bucket "$b" "${bypass[@]+"${bypass[@]}"}" --delete "file://$BUILD/delete.json" \
+      --query 'length(Errors || `[]`)' --output text | grep -qx 0 || return 1
   done
   awsc s3api delete-bucket --bucket "$b" && ok "バケットを消しました: $b"
 }
