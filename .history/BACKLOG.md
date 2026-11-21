@@ -46,7 +46,7 @@
 - [ ] Bedrock の Claude のモデル: Claude Code の枠は 2026-11-04 に Sonnet 4.6・Haiku 5.5・Opus 5.5（すべて `jp.`）に替えた（Sonnet 5.5 は東京の `jp.` に無い。ユーザー回答 2026-11-04 の 1C・2A）。残り: (1) 次の EKS 構成（`LAB_TARGET=aws`）の配備で 3 つを実際に呼んで確かめる（EC2 構成は Bedrock を通らない。ユーザー回答 2026-11-04 の 3B）（初めて呼ぶと AWS Marketplace の利用の申し込みが自動で行われる） (2) `jp.` に Sonnet 5.5 が出たら移す (3) 審査官（Bedrock と VM の Anthropic の API キー）は Haiku 4.5 のまま。EOL が通知されたら、審査の試験（`test-judge`）とあわせて替える。Sonnet 4.5 は 2027-04-08 に EOL（AWS Health の通知 2026-11-04）。今後新しく指定するモデルは 5.5 系にする（ユーザー指示 2026-11-04）（追加 2026-11-04、期限 2027-01-08、重要 中）
 
 ## ECS 構成（`LAB_TARGET=aws-ecs`）
-概要: .history/2026-11-21-ECS構成/変更仕様書.md
+概要: .history/2026-11-22-0835-ECS構成の実装と試験/summary.md
 
 - [ ] ECS 構成（Fargate、内部 ALB、RDS のマルチ AZ、自前の Valkey、社内プロキシの中）を、1 ファイルの構築スクリプト（`ecs/ecs-lab.sh`）と `./lab` の試験の分岐で作り、AWS で全試験を通す。変更仕様書と変更設計書は 2026-11-21 に作成（ブランチ `feature/aws-ecs`）。ヒアリングは 7 回で全部決まった（未決なし）。2026-11-22: 実装し、AWS で managed と provided の両方を配備して試験し、全部消した（結果は変更設計書 15 章、ブランチ `feature/aws-ecs`）。残り: (1) `./lab test-load` を ECS 構成で流す（負荷で LiteLLM のタスクが自動で増える。k6 を中継越しに動かす作りが要る） (2) `test-restore` の ECS 構成向けの作り（RDS の任意の時点への復元） (3) `test-judge`（今回は流さない: ユーザー回答 2026-11-22。審査官のキーが 2026-12-01 まで利用の上限） (4) `test-audit` の MCP の記録（今回は不要: ユーザー回答 2026-11-22） (5) 試験が済んだら `docs/spec.md` と `docs/design.md` に反映し、プルリクエストにする（追加 2026-11-21、重要 高）
 
