@@ -93,6 +93,9 @@ def ensure_access(env: Env) -> None:
     （切れていれば）張り直す。段階を単独で流すときも、./lab up でも、最初に呼ぶ（基盤が無ければ何もしない）。"""
     if env.is_vm:
         vm.ensure_access(env)
+    elif env.is_aws_ecs:
+        from . import ecs
+        ecs.ensure_access(env)
     elif env.is_aws:
         # preflight を通らない単独のコマンド（試験など）でも、アカウントとバケットの接頭辞を Env に載せる
         if not env.values.get("LAB_AWS_ACCOUNT"):

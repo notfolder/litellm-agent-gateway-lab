@@ -49,6 +49,8 @@ def test_failover(pooler: str | None, scenario: str) -> None:
     stages.ensure_access(env)
     scenarios = failover.scenarios_for(env) if scenario == "all" else [scenario]
     original = env.get("LAB_DB_POOLER", "pooler")
+    if pooler is not None and env.is_aws_ecs:
+        raise LabError("ECS 構成では --pooler は使えません（.env の LAB_DB_POOLER を変えて ecs/ecs-lab.sh up を流してください）")
     switch = pooler is not None and pooler != original and not env.is_aws
     if switch:
         env.set("LAB_DB_POOLER", pooler)
@@ -111,6 +113,7 @@ COMMANDS: dict[str, tuple[str, object]] = {
     "test-judge": ("審査官の事例試験（本物の審査官を呼ぶ。ChatGPT の利用枠を使う）", None),
     "test-failover": ("障害の試験（PostgreSQL と Valkey の primary を切り替える・消す・ノードを止める）", None),
     "test-restore": ("PostgreSQL をバックアップから任意の時点に戻す試験", stage(failover.restore)),
+    "test-ecs": ("ECS 構成の守りと更新（中継、管理系の経路、DB と Valkey の分離、配備の遮断器）", stage(lambda env: __import__("labtool.ecs", fromlist=["checks"]).checks(env))),
     "test-audit": ("監査ログの試験（記録、整形、検索アプリ、精算、改ざんの防止、退避と再送）", stage(audit_test.audit_test)),
     "audit-synth": ("検索の速さの試験用の合成データを作る（audit-derived/synth/）", None),
     "audit-bench": ("検索の速さの試験（合成データと実際の記録で、目標の操作の時間を測る）", None),
@@ -145,9 +148,11 @@ def main(argv: list[str]) -> int:
     parsers["test-failover"].add_argument("--pooler", choices=["pooler", "direct"],
                                           help="この接続先に切り替えて試す（終わったら元に戻す）")
     parsers["test-failover"].add_argument("--scenario", default="all",
-                                          choices=["all", *failover.SCENARIOS_VM, *failover.SCENARIO_ALIASES, *failover.SCENARIOS_AWS],
+                                          choices=["all", *failover.SCENARIOS_VM, *failover.SCENARIO_ALIASES, *failover.SCENARIOS_AWS,
+                                                   *failover.SCENARIOS_ECS],
                                           help="場面（Mac: pg-*, valkey-*。aws-ec2 / gcp-vm: 同じ ＋ entry-node（eip-node でも可）。"
-                                               "aws: litellm-drain, aurora-failover, valkey-failover）")
+                                               "aws: litellm-drain, aurora-failover, valkey-failover。"
+                                               "aws-ecs: litellm-task, pgbouncer-task, rds-failover, valkey-primary, sentinel-task）")
     parsers["audit-synth"].add_argument("--days", type=int, default=7)
     parsers["audit-synth"].add_argument("--per-day", type=int, default=1_000_000)
     parsers["audit-compact"].add_argument("--hour", help="日本時間の時間（YYYY-MM-DDTHH）。省くと締まった時間をすべて")

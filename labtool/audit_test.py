@@ -80,6 +80,9 @@ def raw_records(s3, since: str) -> list[dict]:
 
 def run_audit_job(env: Env, name: str, args: list[str], secret: str, memory: str = "2Gi", timeout: int = 900) -> str:
     """監査のイメージで 1 回限りの Job を流し、ログを返す（整形、合成データ、速さの試験）。"""
+    if env.is_aws_ecs:
+        from . import ecs
+        return ecs.run_task(env, "audit-compactor", args, timeout=timeout)   # 整形のタスク定義（同じロールと接続先）
     from .stages import load_audit_image
     image = load_audit_image()
     s3cfg = render.audit_s3_settings(env)
@@ -131,9 +134,13 @@ def compact_now(env: Env) -> None:
                       "audit-compactor-s3")
 
 
-def viewer_session(email: str) -> tuple[dict, dict]:
+def viewer_session(email: str, env: Env | None = None) -> tuple[dict, dict]:
     """検索アプリの試験用のセッション（Cookie と CSRF の値の見出し）。"""
-    out = output(kn("exec", "deploy/audit-viewer", "--", "python", "-m", "audit.testing", email))
+    if env is not None and env.is_aws_ecs:
+        from . import ecs   # 検索アプリと同じタスク定義（同じ署名の鍵と管理者の一覧）を単発で動かす
+        out = ecs.run_task(env, "audit-viewer", ["python", "-m", "audit.testing", email], timeout=300)
+    else:
+        out = output(kn("exec", "deploy/audit-viewer", "--", "python", "-m", "audit.testing", email))
     data = json.loads(out.strip().splitlines()[-1])
     return {"Cookie": f"lab_audit_session={data['cookie']}"}, {"x-csrf-token": data["csrf"]}
 
@@ -176,7 +183,12 @@ def audit_test(env: Env) -> None:
     global TEST_USER
     step("test-audit 監査ログの試験")
     TEST_USER = f"audit-test-{time.strftime('%Y%m%d%H%M%S')}@example.com"
-    if not succeeds(kn("get", "deploy", "audit-viewer")):
+    if env.is_aws_ecs:
+        from . import ecs
+        has_viewer = ecs.service_desired(env, "audit-viewer") > 0
+    else:
+        has_viewer = succeeds(kn("get", "deploy", "audit-viewer"))
+    if not has_viewer:
         raise LabError("検索アプリ（audit-viewer）がありません。サインインの設定をしてから ./lab up を流してください")
     base = env.base_url
     master = env.get("LITELLM_MASTER_KEY")
@@ -286,7 +298,13 @@ def audit_test(env: Env) -> None:
             key0 = PREFIXES["raw"] + by_id[ids["chat"]]["body"]["key"]   # 記録の鍵は論理の鍵。実際の鍵はディレクトリ付き
             raw_bucket = BUCKETS["raw"]
             ver = objstore.object_version(s3, raw_bucket, key0)
-            if env.is_aws:
+            if env.is_aws_ecs:
+                # ECS 構成: 書き込み用（LiteLLM）と検索アプリのタスクロールで、VPC の中から消そうとする
+                from . import ecs
+                c.check("原本は、書き込み用・検索アプリのタスクロールでは消せない",
+                        lambda: ecs.delete_denied(env, "litellm", raw_bucket, key0, ver)
+                        and ecs.delete_denied(env, "audit-viewer", raw_bucket, key0, ver))
+            elif env.is_aws:
                 # EKS 版の利用者は IAM ロール（Pod Identity）で、Mac からは借りられない。ロールごとの検査はクラスタの中で
                 # 行う（変更仕様書 2026-10-24-AWS構成 7.2 節。別の試験）。ここでは管理者の資格情報だけで確かめる
                 warn("AWS: 書き込み用・検索アプリのロールで消せないことの検査は、クラスタの中の試験で行います（省略）")
@@ -301,9 +319,9 @@ def audit_test(env: Env) -> None:
 
             # 整形と検索アプリ
             compact_now(env)
-            sess, csrf = viewer_session(TEST_USER)
-            other, _ = viewer_session(env.get("LAB_USER2_EMAIL") or "someone-else@example.com")
-            admin_sess, admin_csrf = viewer_session(env.get("LAB_AUDIT_ADMINS") or env.get("LAB_USER1_EMAIL"))
+            sess, csrf = viewer_session(TEST_USER, env)
+            other, _ = viewer_session(env.get("LAB_USER2_EMAIL") or "someone-else@example.com", env)
+            admin_sess, admin_csrf = viewer_session(env.get("LAB_AUDIT_ADMINS") or env.get("LAB_USER1_EMAIL"), env)
             today = datetime.now(JST).date().isoformat()
             at = quote(by_id[ids["chat"]]["ts_start"])
             st, _, lst = call("GET", f"{base}/lab-audit/api/requests?start={today}&end={today}", sess)
@@ -378,14 +396,23 @@ def audit_test(env: Env) -> None:
             # Pod の普通の停止（ローリング更新）で記録を失わない
             info("要求を流しながら LiteLLM をローリング更新します")
             roll_ids: list[str] = []
-            run(kn("rollout", "restart", "deploy/litellm"), quiet=True)
+            if env.is_aws_ecs:
+                import threading
+                from . import ecs
+                rolling = threading.Thread(target=ecs.restart_service, args=(env, "litellm"), daemon=True)
+                rolling.start()
+            else:
+                run(kn("rollout", "restart", "deploy/litellm"), quiet=True)
             end = time.time() + 60
             while time.time() < end:
                 cid = send("chat", "rolling")
                 if sent[cid]["status"] == 200:
                     roll_ids.append(cid)
                 time.sleep(0.5)
-            run(kn("rollout", "status", "deploy/litellm", "--timeout=300s"), quiet=True)
+            if env.is_aws_ecs:
+                rolling.join(timeout=900)
+            else:
+                run(kn("rollout", "status", "deploy/litellm", "--timeout=300s"), quiet=True)
             time.sleep(flush * 2 + 5)
             got = {r.get("call_id") for r in raw_records(s3, since)}
             missing = [x for x in roll_ids if x not in got]

@@ -550,4 +550,6 @@ def failover_audit_check(env: Env):
     """障害の試験の監査ログの欠けの照合（検索アプリと監査ログが入っていれば有効）。"""
     from . import audit_test
     from .core import succeeds as _succeeds, kn as _kn
+    if env.is_aws_ecs:
+        return audit_test.failover_audit_check(env)
     return audit_test.failover_audit_check(env) if _succeeds(_kn("get", "cronjob", "audit-compactor")) else None
