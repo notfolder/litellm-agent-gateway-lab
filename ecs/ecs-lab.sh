@@ -610,7 +610,7 @@ wait_relay() {  # 端末が検証の中継を通しているとき、スタッ�
     [ "$i" = 1 ] && say "中継の台が作り直されたので、中継が戻るのを待ちます"
     sleep 10
   done
-  die "中継（$OPERATOR_RELAY）が戻りません"
+  die "中継（${OPERATOR_RELAY}）が戻りません"
 }
 
 # ---------------------------------------------------------------- DB 移行
@@ -796,6 +796,24 @@ empty_bucket() {  # 版と削除マーカーを全部消す（GOVERNANCE の保�
   done
   awsc s3api delete-bucket --bucket "$b" && ok "バケットを消しました: $b"
 }
+delete_orphan_namespace() {  # スタックを消したあとに残った Cloud Map の名前空間（${NS}）を消す
+  # 構築の巻き戻しで、CloudFormation が作り終わる前の名前空間を消そうとして NamespaceNotFound になり、
+  # 作り終わった名前空間（と、それが持つ月 0.5 ドルの非公開のホストゾーン）がどのスタックにも属さず残った（2026-11-25 に判明）
+  local id op st i
+  for id in $(awsc servicediscovery list-namespaces --filters "Name=NAME,Values=${NS},Condition=EQ" \
+      --query 'Namespaces[].Id' --output text); do
+    op=$(awsc servicediscovery delete-namespace --id "$id" --query OperationId --output text) \
+      || { warn "Cloud Map の名前空間を消せませんでした: ${NS}（${id}）"; continue; }
+    st=""
+    for i in $(seq 1 40); do
+      st=$(awsc servicediscovery get-operation --operation-id "$op" --query Operation.Status --output text)
+      [ "$st" = SUCCESS ] || [ "$st" = FAIL ] && break
+      sleep 3
+    done
+    [ "$st" = SUCCESS ] && ok "残っていた Cloud Map の名前空間を消しました: ${NS}（${id}）" \
+      || warn "Cloud Map の名前空間の削除が終わりませんでした: ${NS}（${id}、状態 ${st:-不明}）"
+  done
+}
 cmd_down() {
   preflight
   say "削除（${STACK}）"
@@ -811,6 +829,7 @@ cmd_down() {
     awsc cloudformation wait stack-delete-complete --stack-name "$STACK" || die "スタックの削除に失敗しました"
     ok "スタックを消しました"
   fi
+  delete_orphan_namespace
   local n kept=""
   for n in audit-raw audit-access audit-derived; do
     empty_bucket "$(bucket "$n")" || kept="$kept $(bucket "$n")"
